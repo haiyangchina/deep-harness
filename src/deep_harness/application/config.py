@@ -14,6 +14,12 @@ class ModelSettings(BaseModel):
     base_url: str | None = None
     request_timeout_seconds: float = Field(gt=0, le=1800)
     context_window_tokens: int = Field(default=32768, ge=4096, le=1_000_000)
+    # Thinking-enabled Ollama models (qwen3.5 and friends) put the answer in a
+    # separate `thinking` field when reasoning is on. langchain-ollama does not
+    # surface that streamed text in AIMessageChunk.content, so the adapter sees
+    # an empty final answer while the provider still bills output tokens. Keep
+    # reasoning off by default; set `reasoning = true` in [model] to opt in.
+    reasoning: bool = False
 
 
 class ExecutionSettings(BaseModel):
@@ -21,7 +27,11 @@ class ExecutionSettings(BaseModel):
     max_model_calls: int = Field(default=16, ge=1, le=128)
     max_tool_calls: int = Field(default=64, ge=1, le=1024)
     max_run_tokens: int = Field(default=100_000, ge=100, le=10_000_000)
-    max_context_characters: int = Field(default=24_000, ge=2000, le=1_000_000)
+    # A single `read` page can return OUTPUT_CHARS (24_000) characters. Leave room for
+    # several such pages plus prompt, tool schemas and summary instead of letting one
+    # full-page read consume the entire budget. The provider byte budget from
+    # context_window_tokens remains the effective cap for small windows.
+    max_context_characters: int = Field(default=96_000, ge=2000, le=1_000_000)
     summary_characters: int = Field(default=2000, ge=256, le=4000)
     wall_seconds: float = Field(default=600, ge=1, le=3600)
 

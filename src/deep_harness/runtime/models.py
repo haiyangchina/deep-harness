@@ -48,6 +48,30 @@ def to_langchain(message: dict):
     return factories[role]()
 
 
+def checked_response(response: dict) -> dict:
+    """Refuse a silent empty answer from a model that actually generated tokens.
+
+    Thinking-capable Ollama models (for example qwen3.5) emit the whole answer
+    into a separate ``thinking`` field when reasoning is enabled. LangChain does
+    not expose that streamed text in ``AIMessage.content`` or ``tool_calls``, so
+    without this guard a run is recorded as ``completed`` with an empty result
+    and the desktop UI renders nothing but tool output.
+    """
+    content = response.get("content")
+    text = content.strip() if isinstance(content, str) else content
+    if text or response.get("tool_calls"):
+        return response
+    produced = (response.get("usage") or {}).get("output_tokens") or 0
+    if not produced:
+        return response
+    raise DomainError(
+        "empty_model_response",
+        "Model generated tokens but returned no answer text or tool calls. "
+        "Thinking/reasoning output is not readable by this adapter; keep "
+        "[model] reasoning = false (the default), or use a non-thinking model.",
+    )
+
+
 class LangChainModel:
     def __init__(self, model, request_timeout: float = 90, *, identity=None, tool_specs=None):
         self.model = model
@@ -60,8 +84,13 @@ class LangChainModel:
     @property
     def context_budget_bytes(self):
         window = self.identity.get("context_window_tokens")
-        # Conservative UTF-8 byte budget, leaving space for output and chat framing.
-        return window - 2048 if window else None
+        if not window:
+            return None
+        # num_ctx counts tokens, not bytes. Reserve 2048 tokens for the response and
+        # chat framing, then convert the remainder with the usual ~4 UTF-8 bytes per
+        # token approximation. Returning ``window - 2048`` treated tokens as bytes and
+        # shrank the usable context threefold for multilingual content.
+        return (window - 2048) * 4
 
     def with_tool_specs(self, definitions):
         return LangChainModel(
@@ -75,14 +104,16 @@ class LangChainModel:
             response = await bound.ainvoke(
                 [SystemMessage(content=prompt), *(to_langchain(row) for row in messages)]
             )
-        return {
-            "role": "assistant",
-            "content": response.content,
-            "tool_calls": response.tool_calls,
-            "provider_extensions": response.additional_kwargs,
-            "usage": response.usage_metadata,
-            "response_metadata": response.response_metadata,
-        }
+        return checked_response(
+            {
+                "role": "assistant",
+                "content": response.content,
+                "tool_calls": response.tool_calls,
+                "provider_extensions": response.additional_kwargs,
+                "usage": response.usage_metadata,
+                "response_metadata": response.response_metadata,
+            }
+        )
 
     async def stream(self, prompt, messages, tools):
         definitions = self.tool_specs if self.tool_specs is not None else tool_definitions(tools)
@@ -98,14 +129,16 @@ class LangChainModel:
         if accumulated is not None:
             yield {
                 "kind": "result",
-                "response": {
-                    "role": "assistant",
-                    "content": accumulated.content,
-                    "tool_calls": accumulated.tool_calls,
-                    "provider_extensions": accumulated.additional_kwargs,
-                    "usage": accumulated.usage_metadata,
-                    "response_metadata": accumulated.response_metadata,
-                },
+                "response": checked_response(
+                    {
+                        "role": "assistant",
+                        "content": accumulated.content,
+                        "tool_calls": accumulated.tool_calls,
+                        "provider_extensions": accumulated.additional_kwargs,
+                        "usage": accumulated.usage_metadata,
+                        "response_metadata": accumulated.response_metadata,
+                    }
+                ),
             }
 
 
@@ -163,9 +196,16 @@ def ollama_model(
     base_url: str,
     request_timeout: float = 180,
     context_window_tokens: int = 32768,
+    reasoning: bool = False,
 ):
     from langchain_ollama import ChatOllama
 
+    # ChatOllama defaults reasoning=None, which follows the model template and
+    # turns thinking ON for qwen3.5. In that mode the answer lives in Ollama's
+    # `message.thinking` field, which langchain-ollama drops from streamed chunks;
+    # the adapter then sees content="" and the run silently completes with no text.
+    # Guard the kwarg so older langchain-ollama releases stay usable.
+    options = {"reasoning": reasoning} if "reasoning" in ChatOllama.model_fields else {}
     return LangChainModel(
         ChatOllama(
             model=model,
@@ -173,6 +213,7 @@ def ollama_model(
             temperature=0,
             num_ctx=context_window_tokens,
             client_kwargs={"timeout": request_timeout},
+            **options,
         ),
         request_timeout,
         identity={

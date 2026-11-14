@@ -1,11 +1,20 @@
 """Context projection, usage accounting and streamed model evidence."""
 
+from types import SimpleNamespace
+
+import pytest
 from sqlalchemy import select
 
 from deep_harness.application.config import ExecutionSettings
 from deep_harness.bootstrap import ProjectHost
+from deep_harness.domain.models import DomainError
 from deep_harness.infrastructure import schema as s
-from deep_harness.runtime.models import DiagnosticModel
+from deep_harness.runtime.context import (
+    TRUNCATION_MARKER,
+    ContextProjector,
+    serialized_size,
+)
+from deep_harness.runtime.models import DiagnosticModel, LangChainModel
 
 
 class ObservedModel(DiagnosticModel):
@@ -108,3 +117,86 @@ async def test_stream_deltas_and_provider_usage_are_durable(tmp_path):
         }
     finally:
         await host.close()
+
+
+class _EmptyHeadResult:
+    def mappings(self):
+        return self
+
+    def first(self):
+        return None
+
+
+class _Connection:
+    async def execute(self, *args, **kwargs):
+        return _EmptyHeadResult()
+
+
+class _ConnectionContext:
+    async def __aenter__(self):
+        return _Connection()
+
+    async def __aexit__(self, *args):
+        return False
+
+
+class _Engine:
+    def connect(self):
+        return _ConnectionContext()
+
+
+class _Store:
+    engine = _Engine()
+
+
+def _claim():
+    return SimpleNamespace(admission=SimpleNamespace(session_id="s1", id="a1"))
+
+
+def test_token_window_is_converted_to_bytes_not_treated_as_bytes():
+    model = LangChainModel(None, identity={"context_window_tokens": 32768})
+    assert model.context_budget_bytes == (32768 - 2048) * 4
+    assert LangChainModel(None, identity={}).context_budget_bytes is None
+
+
+async def test_default_character_budget_accepts_a_full_read_page(tmp_path):
+    (tmp_path / "big.txt").write_text("line-of-text\n" * 2000, encoding="utf-8")
+    host = ProjectHost(tmp_path / "state", tmp_path, lambda scope: DiagnosticModel())
+    try:
+        app = await host.application("one")
+        session = await app.create_session("create", "Read", tools=("read",))
+        admission = await app.submit(session.id, "input", "/read big.txt")
+        await app.wait_idle()
+        assert (await app.store.get_admission(admission.id, session.id)).status == "completed"
+    finally:
+        await host.close()
+
+
+async def test_current_turn_tool_output_is_clipped_not_rejected():
+    limits = ExecutionSettings(max_context_characters=6000, summary_characters=256)
+    projector = ContextProjector(_Store(), None, limits)
+    original = "汉" * 30_000
+    messages = [
+        {"id": "a1:user", "role": "user", "content": "read the file"},
+        {"id": "a1:model:0", "role": "assistant", "content": ""},
+        {"id": "a1:tool:1", "role": "tool", "tool_call_id": "1", "content": original},
+    ]
+    projected = await projector.project(
+        _claim(), "prompt", [], messages, max_context_bytes=122_880
+    )
+    tool = next(row for row in projected if row["role"] == "tool")
+    assert TRUNCATION_MARKER in tool["content"]
+    assert len(tool["content"]) < len(original)
+    # Clipping only rewrites the projected view; the persisted transcript is intact.
+    assert messages[-1]["content"] == original
+    available = limits.max_context_characters - (len("prompt") + serialized_size([]) + 256)
+    assert serialized_size(projected) <= available
+
+
+async def test_oversize_user_input_still_fails_explicitly():
+    limits = ExecutionSettings(max_context_characters=2000, summary_characters=256)
+    projector = ContextProjector(_Store(), None, limits)
+    messages = [{"id": "a1:user", "role": "user", "content": "x" * 20_000}]
+    with pytest.raises(DomainError) as error:
+        await projector.project(_claim(), "prompt", [], messages)
+    assert error.value.code == "context_budget_exhausted"

@@ -35,6 +35,47 @@ def summarize(previous, messages, limit):
     return summary
 
 
+MIN_TOOL_CHARS = 512
+TRUNCATION_MARKER = (
+    "\n[... tool output truncated to fit the context budget; "
+    "re-read with a smaller limit ...]\n"
+)
+
+
+def _content(message):
+    value = message.get("content", "")
+    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+
+
+def clip_tool_outputs(messages, fits):
+    """Shrink tool results until the projected view fits.
+
+    Only the projected view is rewritten; the persisted transcript keeps the complete
+    tool output. Returns None when clipping cannot free enough room, in which case the
+    caller must still fail explicitly rather than send an oversized request.
+    """
+    clipped = [dict(message) for message in messages]
+    for _ in range(64):
+        if fits(clipped):
+            return clipped
+        candidates = [
+            (len(_content(clipped[index])), index)
+            for index in range(len(clipped))
+            if clipped[index]["role"] == "tool" and len(_content(clipped[index])) > MIN_TOOL_CHARS
+        ]
+        if not candidates:
+            return None
+        _, index = max(candidates)
+        content = _content(clipped[index])
+        keep = max(MIN_TOOL_CHARS, int(len(content) * 0.6))
+        head = int(keep * 0.7)
+        tail = keep - head - len(TRUNCATION_MARKER)
+        if tail <= 0:
+            return None
+        clipped[index]["content"] = content[:head] + TRUNCATION_MARKER + content[-tail:]
+    return None
+
+
 class ContextProjector:
     def __init__(self, store, executions, limits):
         self.store = store
@@ -59,32 +100,51 @@ class ContextProjector:
         revision = head["revision"] if head else 0
         remaining = [message for message in messages if message["id"] not in dropped]
         archived = []
-        available = self.limits.max_context_characters - (
-            len(prompt) + serialized_size(tools) + self.limits.summary_characters + 256
+        fixed_chars = len(prompt) + serialized_size(tools) + 256
+        fixed_bytes = (
+            len(prompt.encode("utf-8")) + serialized_size(tools, utf8=True) + 256
+            if max_context_bytes is not None
+            else 0
         )
-        # Enforce the provider byte budget independently; four bytes per summary character
-        # covers multilingual summaries without changing the configured character limit.
-        byte_available = None
-        if max_context_bytes is not None:
-            byte_available = max_context_bytes - (
-                len(prompt.encode("utf-8"))
-                + serialized_size(tools, utf8=True)
-                + self.limits.summary_characters * 4
-                + 256
+
+        def budgets():
+            # Only a summary that actually exists consumes room. Reserving
+            # summary_characters * 4 bytes unconditionally wasted 8 KB on every
+            # projection, even when no compaction had ever happened.
+            available = self.limits.max_context_characters - fixed_chars - len(summary)
+            byte_available = (
+                max_context_bytes - fixed_bytes - len(summary.encode("utf-8"))
+                if max_context_bytes is not None
+                else None
             )
+            return available, byte_available
+
+        def over(rows):
+            available, byte_available = budgets()
+            return serialized_size(rows) > available or (
+                byte_available is not None
+                and serialized_size(rows, utf8=True) > byte_available
+            )
+
+        available, byte_available = budgets()
         if available < 256 or (byte_available is not None and byte_available < 256):
             raise DomainError(
                 "context_budget_exhausted", "Prompt and tools exceed the configured context budget"
             )
-        while serialized_size(remaining) > available or (
-            byte_available is not None and serialized_size(remaining, utf8=True) > byte_available
-        ):
+        while over(remaining):
             turn, rest = first_turn(remaining)
             if not turn or any(message["id"] == f"{claim.admission.id}:user" for message in turn):
-                raise DomainError(
-                    "context_budget_exhausted",
-                    "Current turn exceeds the context budget; use smaller tool output or input",
-                )
+                # No completed turn is left to archive. Clip oversized tool results in the
+                # projection instead of leaving the session permanently stuck: previously
+                # every further model call failed with context_budget_exhausted.
+                clipped = clip_tool_outputs(remaining, lambda rows: not over(rows))
+                if clipped is None:
+                    raise DomainError(
+                        "context_budget_exhausted",
+                        "Current turn exceeds the context budget; use smaller tool output or input",
+                    )
+                remaining = clipped
+                break
             if turn[-1]["role"] != "assistant" or turn[-1].get("tool_calls"):
                 raise DomainError(
                     "context_incomplete_turn", "Cannot compact an incomplete tool exchange"

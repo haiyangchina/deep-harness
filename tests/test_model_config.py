@@ -29,8 +29,18 @@ async def test_default_cli_routes_to_local_ollama_without_cloud_secret(tmp_path,
         assert app.model.model.model == "qwen3.5:9b"
         assert app.model.model.base_url == "http://127.0.0.1:11434"
         assert app.model.request_timeout == 180
+        # qwen3.5 is a thinking model; reasoning must be explicitly off or the
+        # answer lands in Ollama's `thinking` field and content comes back empty.
+        assert app.model.model.reasoning is False
     finally:
         await host.close()
+
+
+def test_reasoning_defaults_off_and_is_explicitly_opt_in(tmp_path):
+    assert load_model_settings().reasoning is False
+    path = tmp_path / "model.toml"
+    path.write_text("[model]\nreasoning = true\n", encoding="utf-8")
+    assert load_model_settings(path).reasoning is True
 
 
 async def test_offline_diagnostic_remains_an_explicit_opt_in(tmp_path):

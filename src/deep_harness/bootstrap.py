@@ -306,7 +306,13 @@ class ProfileApplication:
                 logger.exception("Execution stopped; preserving uncertain outcomes")
             status = (
                 "interrupted"
-                if category in {"budget_exhausted", "context_budget_exhausted", "harness_output"}
+                if category
+                in {
+                    "budget_exhausted",
+                    "context_budget_exhausted",
+                    "harness_output",
+                    "empty_model_response",
+                }
                 else "unknown"
             )
             failure = f"Execution stopped [{category}]"
@@ -318,6 +324,13 @@ class ProfileApplication:
                     "Use smaller reads/input or a new session; for Ollama configure "
                     "--context-window (model.context_window_tokens in TOML) within "
                     "the model and memory limits."
+                )
+            if category == "empty_model_response":
+                failure += (
+                    ": The model produced tokens but no readable answer. Thinking/"
+                    "reasoning output is not supported by this adapter; set "
+                    "[model] reasoning = false (the default) or use a non-thinking "
+                    "model, then retry in a new session."
                 )
             await self.executions.settle(claim, status, failure)
             await self.delegations.settle_background(session.id, status, failure)

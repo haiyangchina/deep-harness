@@ -159,3 +159,53 @@ async def test_runtime_state_cannot_be_read_by_model_tools(tmp_path):
         assert "private credential" not in outcome.result
     finally:
         await host.close()
+
+
+class TwoWriteModel(DiagnosticModel):
+    """One assistant turn requests two approval-gated writes, then completes."""
+
+    async def complete(self, prompt, messages, tools):
+        if any(row["role"] == "tool" for row in messages):
+            return {"role": "assistant", "content": "done"}
+        return {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "w1", "name": "write", "args": {"path": "a.txt", "content": "A"}},
+                {"id": "w2", "name": "write", "args": {"path": "b.txt", "content": "B"}},
+            ],
+        }
+
+
+async def test_approval_resume_does_not_replay_committed_tool_calls(tmp_path):
+    """An interrupt resume replays the whole tools node; committed results must be reused.
+
+    Without the guard, the second resume re-executes the first write (now failing with
+    file_conflict) and the changed payload trips message_conflict. Worse, a write with
+    a deterministic side effect would run twice.
+    """
+    host = ProjectHost(tmp_path / "state", tmp_path, lambda scope: TwoWriteModel())
+    try:
+        app = await host.application("one")
+        session = await app.create_session(
+            "create", "Frozen", ("write",), permission_mode="ask"
+        )
+        admission = await app.submit(session.id, "send", "go")
+        await app.wait_idle()
+        for _ in range(4):
+            pending = await app.store.get_admission(admission.id, session.id)
+            if pending.status != "waiting_approval":
+                break
+            approvals = (await app.sessions.status(session.id))["approvals"]
+            assert approvals
+            await app.approve(session.id, approvals[0]["id"], pending.generation, "approve")
+            await app.wait_idle()
+        done = await app.store.get_admission(admission.id, session.id)
+        assert done.status == "completed", done.result
+        assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "A"
+        assert (tmp_path / "b.txt").read_text(encoding="utf-8") == "B"
+        tools = [row for row in await app.store.history(session.id) if row["role"] == "tool"]
+        assert len(tools) == 2
+        assert all("Tool refused" not in row["content"] for row in tools)
+    finally:
+        await host.close()

@@ -377,6 +377,20 @@ class BusinessStore:
             raise DomainError("admission_not_found", "Admission is not accessible")
         return admission_from(row)
 
+    async def committed_message(self, message_id: str) -> dict | None:
+        """Return an already committed message payload, if one exists.
+
+        LangGraph replays a node from the start after an interrupt is resumed; the
+        tools node uses this to reuse committed results instead of re-executing a
+        tool call (which would also risk replaying a side effect).
+        """
+        async with self.engine.connect() as conn:
+            return (
+                await conn.execute(
+                    select(s.messages.c.payload).where(s.messages.c.id == message_id)
+                )
+            ).scalar_one_or_none()
+
     async def history(self, session_id: str) -> list[dict]:
         async with self.engine.connect() as conn:
             rows = await conn.execute(

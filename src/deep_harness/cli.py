@@ -179,7 +179,11 @@ def build_host(args):
             "request_timeout": settings.request_timeout_seconds,
         }
         if settings.provider == "ollama":
-            return ollama_model(**common, context_window_tokens=settings.context_window_tokens)
+            return ollama_model(
+                **common,
+                context_window_tokens=settings.context_window_tokens,
+                reasoning=settings.reasoning,
+            )
         return openai_model(**common, api_key=api_key)
 
     return ProjectHost(

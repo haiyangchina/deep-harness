@@ -122,8 +122,14 @@ class StandardRuntime:
                 permission_mode=self.session.permission_mode,
                 permission_revision=self.session.permission_revision,
             )
-        decision = await self.receipts.interaction(self.claim, key, digest, proposal)
-        if decision is None:
+        # An interrupt resume replays this node from the beginning. Keep waiting for
+        # the durable decision instead of turning a still-pending approval into a
+        # permanent "Tool refused" tool result: on the next resume the same tool call
+        # would then produce different content and trip message_conflict.
+        for _ in range(16):
+            decision = await self.receipts.interaction(self.claim, key, digest, proposal)
+            if decision is not None:
+                return decision == "approve"
             interrupt(
                 {
                     "id": key,
@@ -134,10 +140,7 @@ class StandardRuntime:
                 }
             )
             # Only the durable decision is authoritative; a raw resume payload is not.
-            decision = await self.receipts.interaction(self.claim, key, digest, proposal)
-        if decision is None:
-            raise DomainError("approval_missing", "No durable approval decision exists")
-        return decision == "approve"
+        raise DomainError("approval_missing", "No durable approval decision exists")
 
     async def _tools(self, state: State) -> dict:
         results = []
@@ -146,6 +149,14 @@ class StandardRuntime:
             raise DomainError("budget_exhausted", "Per-run tool call budget exhausted")
         for raw in state["messages"][-1]["tool_calls"]:
             call = ToolCall(raw["id"], raw["name"], raw["args"])
+            message_id = f"{self.claim.admission.id}:tool:{call.id}"
+            # An approval resume replays this node from the start. Reuse the committed
+            # result so no tool (especially a write) runs twice and a replay cannot
+            # change a message that is already durable.
+            committed = await self.store.committed_message(message_id)
+            if committed is not None:
+                results.append(committed)
+                continue
             try:
                 self.gateway.validate(call)
                 approval_required = self.gateway.approval_reason(call) is not None
@@ -154,11 +165,16 @@ class StandardRuntime:
             except (ValidationError, OSError, UnicodeError) as exc:
                 content = f"Tool error: {type(exc).__name__}: {exc}"
             except DomainError as exc:
-                if exc.code in {"unknown_effect", "lease_lost", "effect_conflict"}:
+                if exc.code in {
+                    "unknown_effect",
+                    "lease_lost",
+                    "effect_conflict",
+                    "approval_missing",
+                }:
                     raise
                 content = f"Tool refused [{exc.code}]: {exc}"
             message = {
-                "id": f"{self.claim.admission.id}:tool:{call.id}",
+                "id": message_id,
                 "role": "tool",
                 "tool_call_id": call.id,
                 "content": content,

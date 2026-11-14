@@ -16,6 +16,8 @@ export function TaskComposer({ draft, pending, updateDraft, send }: TaskComposer
   const status = conversation?.status
   const latest = status?.latest_admission
   const running = status?.active_admissions.some(a => ['queued', 'started', 'waiting_approval'].includes(a.status))
+  // Also block after a deterministic interruption: the worker stops on a non-completed
+  // admission, so the user must start a fresh session (see the Chat notice).
   const unknown = status?.active_admissions.some(a => ['unknown', 'interrupted', 'reconciled'].includes(a.status))
   const childRunning = conversation?.delegations.some(row => row !== null && typeof row === 'object'
     && 'status' in row && !['completed', 'failed', 'cancelled', 'stopped'].includes(String(row.status)))

@@ -117,9 +117,13 @@ deep-harness --state-dir .state --workspace . repl --engine deep --harness codin
 Ollama 请求现在明确设置 `num_ctx=32768`，避免依赖服务端较小的默认窗口。
 可通过全局参数 `--context-window 16384` 或 TOML 的
 `[model] context_window_tokens = 16384` 调整；窗口应符合模型支持范围和本机内存。
-运行时同时检查字符预算和保守的 UTF-8 字节预算，计入系统 prompt、工具 schema、
-历史及摘要，并为回复预留空间。当前回合无法容纳时返回可操作的
-`context_budget_exhausted`，不会自动重试；服务端仍可能因模型限制拒绝请求。
+运行时同时检查字符预算与按模型窗口换算的 UTF-8 字节预算，计入系统 prompt、工具 schema、
+历史和实际存在的摘要，并为回复预留 2048 tokens。字符预算默认 96000 字符，可容纳多次完整
+`read` 页（每页最多 24000 字符）；字节预算由 `context_window_tokens` 按每 token 约 4 字节
+换算，缩小 `--context-window` 时它会先于字符预算生效。当当前回合的工具输出过大、又没有
+已完成整轮可归档时，只把发送给模型的投影做头尾保留式截断（附明确标记），落库的完整
+transcript 不变，会话不会因此永久卡住；只有连用户输入本身都超限时才返回可操作的
+`context_budget_exhausted`，不会自动重试。服务端仍可能因模型限制拒绝请求。
 Deep 模式同样执行预算检查，但尚不支持 Standard 的整轮自动压缩归档。
 
 ## 权限与批准模式
@@ -218,7 +222,7 @@ python scripts/dependencies.py add "alembic>=1.16,<2"
 
 ## 默认使用本机 Ollama
 
-项目默认配置位于 src/deep-harness/defaults.toml：
+项目默认配置位于 src/deep_harness/defaults.toml：
 
 ~~~toml
 [model]
@@ -226,7 +230,15 @@ provider = "ollama"
 name = "qwen3.5:9b"
 base_url = "http://127.0.0.1:11434"
 request_timeout_seconds = 180
+context_window_tokens = 32768
+reasoning = false
 ~~~
+
+`qwen3.5:9b` 是带 thinking 能力的模型。Ollama 开启 reasoning 时，回答会写入
+`message.thinking` 而不是 `message.content`，LangChain 适配器只读取 `content`，
+结果就是「执行完成、消耗了 token，但界面没有任何回答」。因此默认显式关闭
+reasoning；若设为 `true`，运行时检测到空响应会明确报 `empty_model_response`，
+不会静默结束。
 
 已确认本机存在该模型。启动 Ollama 服务后直接使用下面的命令，无需配置云端 API key。
 

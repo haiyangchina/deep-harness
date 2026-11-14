@@ -4,3 +4,7 @@ name = "qwen3.5:9b"
 base_url = "http://127.0.0.1:11434"
 request_timeout_seconds = 180
 context_window_tokens = 32768
+# qwen3.5 是 thinking 模型。开启 reasoning 时回答会写入 Ollama 的 thinking
+# 字段，LangChain 适配器读不到，结果是「执行完成但没有文本」。保持 false；
+# 只有在你能自行处理 thinking 输出时才设为 true。
+reasoning = false

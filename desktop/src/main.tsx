@@ -72,7 +72,10 @@ function Chat({ newSession }: { newSession: () => void }) {
   const status = conversation?.status
   const latest = status?.latest_admission
   const running = status?.active_admissions.some(a => ['queued', 'started', 'waiting_approval'].includes(a.status))
-  const unknown = status?.active_admissions.some(a => ['unknown', 'interrupted', 'reconciled'].includes(a.status))
+  // Only unknown/reconciled mean a write may have landed without a receipt. An
+  // interrupted run is a deterministic local stop with no uncertain side effects.
+  const uncertain = status?.active_admissions.some(a => ['unknown', 'reconciled'].includes(a.status))
+  const interrupted = status?.active_admissions.some(a => a.status === 'interrupted')
   const send = () =>
     void perform(async () => {
       if (!sessionId) {
@@ -186,10 +189,17 @@ function Chat({ newSession }: { newSession: () => void }) {
             </article>
           )}
           {latest?.result && latest.status !== 'completed' && <p className="notice">{latest.result}</p>}
+          {latest?.status === 'completed' && !latest.result && !running && (
+            <p className="notice">
+              本次执行已完成，但模型没有返回文本结果。常见原因是模型开启了 thinking / reasoning
+              模式，回答被写入思考字段而未被读取（qwen3.5 等思考模型默认如此）。请确认配置中
+              reasoning 为 false，或换用非思考模型，然后新建会话重试。
+            </p>
+          )}
           {status?.runtime.compatible === false && (
             <p className="notice">当前模型或工具配置与会话快照不同。请恢复原配置，或审阅后新建分支。</p>
           )}
-          {unknown && (
+          {uncertain && (
             <div className="notice">
               <strong>任务结果不确定，已停止自动推进。</strong>
               <p>先核对实际文件与右侧状态台账。分支只复制完整已完成轮次，不会重做未知操作。</p>
@@ -206,6 +216,15 @@ function Chat({ newSession }: { newSession: () => void }) {
                 }
               >
                 我已核对，创建新分支
+              </button>
+            </div>
+          )}
+          {interrupted && (
+            <div className="notice">
+              <strong>任务已安全停止，未产生未知副作用。</strong>
+              <p>上方为具体停止原因。常见原因是单次读取内容过大或超出上下文预算；请缩小读取范围，或新建会话后重试。</p>
+              <button disabled={busy} onClick={newSession}>
+                新建会话
               </button>
             </div>
           )}
