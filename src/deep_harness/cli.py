@@ -1,0 +1,287 @@
+"""Independent entry point, defaulting to the configured local Ollama model."""
+
+import argparse
+import asyncio
+import json
+import os
+import secrets
+import sys
+from pathlib import Path
+
+from deep_harness.application.config import load_execution_settings, load_model_settings
+from deep_harness.bootstrap import ProjectHost
+from deep_harness.domain.models import DomainError
+from deep_harness.runtime.models import DiagnosticModel, ollama_model, openai_model
+
+
+def parser():
+    result = argparse.ArgumentParser(prog="deep-harness")
+    result.add_argument("--state-dir", type=Path, required=True)
+    result.add_argument("--workspace", type=Path, default=Path.cwd())
+    result.add_argument("--profile", default="default")
+    result.add_argument("--config", type=Path, help="Model configuration TOML override")
+    result.add_argument("--provider", choices=["ollama", "openai", "diagnostic"])
+    result.add_argument(
+        "--model",
+        help="Model identifier; defaults to the configured local Ollama model",
+    )
+    result.add_argument("--base-url")
+    result.add_argument("--context-window", type=int, help="Ollama context window in tokens")
+    result.add_argument("--api-key-env", default="OPENAI_API_KEY")
+    commands = result.add_subparsers(dest="command", required=True)
+    chat = commands.add_parser("chat")
+    chat.add_argument("text")
+    chat.add_argument("--session", help="Continue an existing session")
+    chat.add_argument("--engine", choices=["standard", "deep"])
+    chat.add_argument("--harness", choices=["general", "coding", "research"])
+    chat.add_argument("--permission-mode", choices=["ask", "auto", "full"])
+    chat.add_argument(
+        "--mcp-tool", action="append", default=[], help="Grant one configured MCP tool"
+    )
+    chat.add_argument(
+        "--allow-write",
+        action="store_true",
+        help="Grant file writes under the session approval policy",
+    )
+    chat.add_argument(
+        "--allow-exec", action="store_true", help="Grant commands under the session approval policy"
+    )
+    chat.add_argument(
+        "--allow-delegation", action="store_true", help="Grant scoped Deep specialists"
+    )
+    chat.add_argument(
+        "--allow-memory",
+        action="store_true",
+        help="Grant memory saves under the session approval policy",
+    )
+    chat.add_argument("--submission-id", help="Stable ID for safe submission retries")
+    repl = commands.add_parser("repl")
+    repl.add_argument("--session")
+    repl.add_argument("--engine", choices=["standard", "deep"])
+    repl.add_argument("--harness", choices=["general", "coding", "research"])
+    repl.add_argument("--permission-mode", choices=["ask", "auto", "full"])
+    repl.add_argument("--mcp-tool", action="append", default=[])
+    repl.add_argument("--allow-write", action="store_true")
+    repl.add_argument("--allow-exec", action="store_true")
+    repl.add_argument("--allow-delegation", action="store_true")
+    repl.add_argument("--allow-memory", action="store_true")
+    sessions = commands.add_parser("sessions")
+    sessions.add_argument("--after", default="")
+    sessions.add_argument("--limit", type=int, choices=range(1, 101), default=50, metavar="1..100")
+    inspect = commands.add_parser("inspect")
+    inspect.add_argument("session")
+    inspect.add_argument("--messages", action="store_true")
+    permissions = commands.add_parser("permissions")
+    permissions.add_argument("session")
+    permissions.add_argument("--mode", required=True, choices=["ask", "auto", "full"])
+    permissions.add_argument("--expected-revision", type=int, required=True)
+    delegations = commands.add_parser("delegations")
+    delegations.add_argument("session")
+    delegation_steer = commands.add_parser("delegation-steer")
+    delegation_steer.add_argument("session")
+    delegation_steer.add_argument("delegation")
+    delegation_steer.add_argument("text")
+    delegation_steer.add_argument("--submission-id")
+    delegation_stop = commands.add_parser("delegation-stop")
+    delegation_stop.add_argument("session")
+    delegation_stop.add_argument("delegation")
+    history = commands.add_parser("history")
+    history.add_argument("session")
+    history.add_argument("--after", default="")
+    history.add_argument("--limit", type=int, choices=range(1, 101), default=50)
+    search = commands.add_parser("search")
+    search.add_argument("session")
+    search.add_argument("query")
+    search.add_argument("--limit", type=int, choices=range(1, 51), default=20)
+    skill_add = commands.add_parser("skill-add")
+    skill_add.add_argument("file", type=Path)
+    commands.add_parser("skill-list")
+    skill_disable = commands.add_parser("skill-disable")
+    skill_disable.add_argument("name")
+    memory_add = commands.add_parser("memory-add")
+    memory_add.add_argument("content")
+    commands.add_parser("memory-list")
+    commands.add_parser("mcp-list")
+    memory_search = commands.add_parser("memory-search")
+    memory_search.add_argument("query")
+    memory_forget = commands.add_parser("memory-forget")
+    memory_forget.add_argument("memory_id")
+    curate = commands.add_parser("curate")
+    curate.add_argument("session")
+    commands.add_parser("curation-list")
+    curation_decide = commands.add_parser("curation-decide")
+    curation_decide.add_argument("candidate_id")
+    curation_decide.add_argument("--decision", required=True, choices=["accept", "reject"])
+    usage = commands.add_parser("usage")
+    usage.add_argument("session")
+    fork = commands.add_parser("fork")
+    fork.add_argument("session")
+    fork.add_argument("--request-id", help="Stable ID for safe fork retries")
+    bind = commands.add_parser("bind-session")
+    bind.add_argument("session")
+    bind.add_argument(
+        "--fingerprint", required=True, help="Reviewed current runtime fingerprint from inspect"
+    )
+    approve = commands.add_parser("approve")
+    approve.add_argument("session")
+    approve.add_argument("interaction")
+    approve.add_argument("--generation", required=True, type=int)
+    approve.add_argument("--decision", required=True, choices=["approve", "deny"])
+    serve = commands.add_parser("serve")
+    serve.add_argument("--port", type=int, default=8765)
+    for name in ("backup", "restore"):
+        command = commands.add_parser(name)
+        command.add_argument("path", type=Path)
+    cancel = commands.add_parser("cancel")
+    cancel.add_argument("session")
+    cancel.add_argument("admission")
+    resolve = commands.add_parser("resolve")
+    resolve.add_argument("session")
+    resolve.add_argument("admission")
+    resolve.add_argument("--evidence-file", required=True, type=Path)
+    doctor = commands.add_parser("doctor")
+    doctor.add_argument(
+        "--check-model", action="store_true", help="Inspect model metadata without generation"
+    )
+    return result
+
+
+def build_host(args):
+    execution_limits = load_execution_settings(args.config)
+    recover_queued = args.command in {"chat", "repl", "serve", "approve"}
+    settings = load_model_settings(
+        args.config,
+        provider=args.provider,
+        name=args.model,
+        base_url=args.base_url,
+        context_window_tokens=args.context_window,
+    )
+    if settings.provider == "diagnostic":
+        return ProjectHost(
+            args.state_dir,
+            args.workspace,
+            lambda scope: DiagnosticModel(),
+            recover_queued=recover_queued,
+            execution_limits=execution_limits,
+        )
+    api_key = None
+    if settings.provider == "openai":
+        api_key = os.environ.get(args.api_key_env)
+        if not api_key:
+            raise SystemExit(f"Required secret environment variable is missing: {args.api_key_env}")
+
+    def factory(scope):
+        if scope.profile_id != args.profile:
+            raise DomainError("profile_mismatch", "Model route is bound to the launch profile")
+        common = {
+            "model": settings.name,
+            "base_url": settings.base_url,
+            "request_timeout": settings.request_timeout_seconds,
+        }
+        if settings.provider == "ollama":
+            return ollama_model(**common, context_window_tokens=settings.context_window_tokens)
+        return openai_model(**common, api_key=api_key)
+
+    return ProjectHost(
+        args.state_dir,
+        args.workspace,
+        factory,
+        recover_queued=recover_queued,
+        execution_limits=execution_limits,
+    )
+
+
+def main():
+    sys.stdout.reconfigure(encoding="utf-8")
+    args = parser().parse_args()
+    if args.command in {"backup", "restore", "cancel", "resolve"}:
+        from deep_harness.transports.admin import run_admin
+
+        try:
+            code = asyncio.run(run_admin(build_host(args), args))
+        except DomainError as exc:
+            print(json.dumps({"code": exc.code, "message": str(exc)}), file=sys.stderr)
+            code = 2
+        raise SystemExit(code)
+    if args.command == "doctor":
+        from deep_harness.runtime.probe import report
+
+        settings = load_model_settings(
+            args.config,
+            provider=args.provider,
+            name=args.model,
+            base_url=args.base_url,
+            context_window_tokens=args.context_window,
+        )
+        evidence = {**report(), "model": settings.model_dump()}
+        if args.check_model:
+            from deep_harness.runtime.readiness import check_model
+
+            evidence["model_readiness"] = asyncio.run(check_model(settings))
+        print(
+            json.dumps(
+                evidence,
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        if args.check_model and evidence["model_readiness"]["status"] != "ready":
+            raise SystemExit(1)
+        return
+    if args.command in {
+        "chat",
+        "repl",
+        "sessions",
+        "inspect",
+        "history",
+        "search",
+        "skill-add",
+        "skill-list",
+        "skill-disable",
+        "memory-add",
+        "memory-list",
+        "mcp-list",
+        "memory-search",
+        "memory-forget",
+        "curate",
+        "curation-list",
+        "curation-decide",
+        "delegations",
+        "delegation-steer",
+        "delegation-stop",
+        "usage",
+        "approve",
+        "fork",
+        "bind-session",
+    }:
+        from deep_harness.transports.console import run_console
+
+        try:
+            code = asyncio.run(run_console(build_host(args), args))
+        except DomainError as exc:
+            print(
+                json.dumps({"code": exc.code, "message": str(exc)}, ensure_ascii=False),
+                file=sys.stderr,
+            )
+            code = 2
+        raise SystemExit(code)
+    import uvicorn
+
+    from deep_harness.transports.api import create_api
+
+    args.state_dir.mkdir(parents=True, exist_ok=True)
+    token_path = args.state_dir / "operator.token"
+    if not token_path.exists():
+        # Exclusive creation avoids competing launchers rotating an existing token.
+        try:
+            with token_path.open("x", encoding="utf-8") as stream:
+                stream.write(secrets.token_urlsafe(32))
+        except FileExistsError:
+            pass
+    token = token_path.read_text(encoding="utf-8").strip()
+    print(f"Operator token file: {token_path.resolve()}")
+    uvicorn.run(create_api(build_host(args), token), host="127.0.0.1", port=args.port)
+
+
+if __name__ == "__main__":
+    main()

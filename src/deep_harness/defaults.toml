@@ -1,0 +1,6 @@
+[model]
+provider = "ollama"
+name = "qwen3.5:9b"
+base_url = "http://127.0.0.1:11434"
+request_timeout_seconds = 180
+context_window_tokens = 32768
