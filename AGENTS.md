@@ -34,7 +34,18 @@ MAJOR 无左侧段位，9.9.9 的下一个版本写作 10.0.0。设定基线本�
 - `desktop/package-lock.json` 的顶层 `version` 与 `packages[""].version`
 - `desktop/README.md` 的便携包文件名示例
 
+客户端「运行设置」侧边栏的版本号不手工维护：`desktop/build.mjs` 在构建时从
+`desktop/package.json` 读取 `version`，经 esbuild `define` 注入 `desktop/src/main.tsx`
+的 `__APP_VERSION__`。递增后需重新 `npm run build` 并重启桌面端才会显示新值。
+
 `desktop/release/` 下的产物由 `npm run dist:win` 按 `${version}` 重新生成，不手工改名；
 `desktop/node_modules/.package-lock.json` 由 `npm ci` 生成，不同步修改。
 注意 `package-lock.json` 中第三方依赖 `cross-dirname` 的版本恰为 `0.1.0`，
 禁止对版本号做全局替换。
+
+2026-11-14 例外（用户明确要求）：「内置能力清单、本地命令统一逐次确认、删除
+`local_time` 独立工具」这一轮保持 **v1.0.4**，未按上述规则递增，也未改动 6 处版本号。
+同日「三档批准策略与安全访问权限对齐」这一轮同样按用户要求保持 **v1.0.4**，
+内部 `CAPABILITY_VERSION` 也保持 1。同日「移除只读时钟子能力、统一为本地命令执行」
+这一轮沿用该约定，仍保持 **v1.0.4** 与 `CAPABILITY_VERSION = 1`。
+后续产生内容变更时仍按规则递增。

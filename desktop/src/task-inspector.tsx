@@ -3,6 +3,14 @@ import { useState } from 'react'
 import { Json } from './components'
 import { $busy, $conversation, $runtime, api, perform, refreshConversation } from './state'
 
+function proposalScope(proposal: unknown): string | null {
+  if (proposal && typeof proposal === 'object' && 'scope_key' in proposal) {
+    const value = (proposal as { scope_key?: unknown }).scope_key
+    return typeof value === 'string' ? value : null
+  }
+  return null
+}
+
 export function TaskInspector() {
   const conversation = useStore($conversation)
   const busy = useStore($busy)
@@ -37,6 +45,9 @@ export function TaskInspector() {
           <span className="eyebrow">WAITING FOR YOU</span>
           <h3>操作需要你的批准</h3>
           <Json value={approval.proposal} />
+          {proposalScope(approval.proposal) && (
+            <p className="muted small">作用域 {proposalScope(approval.proposal)}</p>
+          )}
           <p className="muted small">generation {approval.generation}</p>
           <div className="actions">
             {(['deny', 'approve'] as const).map(decision => (
@@ -61,6 +72,22 @@ export function TaskInspector() {
           </div>
         </section>
       ))}
+      {status?.session.permission_mode === 'auto' && status.latest_admission && (
+        <button
+          className="revoke-reuse"
+          disabled={busy}
+          onClick={() =>
+            void perform(async () => {
+              await api(`/sessions/${sessionId}/revoke-reuse`, 'POST', {
+                admission_id: status.latest_admission?.id
+              })
+              await refreshConversation()
+            })
+          }
+        >
+          撤销本轮复用 · 后续同类操作重新逐次确认
+        </button>
+      )}
       {tab === 'activity' && (
         <div className="events">
           {!conversation && <p className="muted small">发送任务后，执行记录会显示在这里。</p>}

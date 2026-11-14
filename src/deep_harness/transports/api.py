@@ -10,7 +10,8 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from deep_harness.application.workspace import PROJECT_PROMPT, READ_TOOLS
+from deep_harness.application.capabilities import manifest
+from deep_harness.application.workspace import PROJECT_PROMPT
 from deep_harness.domain.models import DomainError
 from deep_harness.runtime.inference import usage_totals
 from deep_harness.transports.events import stream_events
@@ -24,15 +25,23 @@ class RequestModel(BaseModel):
 class CreateSession(RequestModel):
     request_id: str = Field(min_length=1, max_length=128)
     prompt: str = Field(default=PROJECT_PROMPT, max_length=32_000)
-    tools: tuple[str, ...] = READ_TOOLS
+    tools: tuple[str, ...] | None = None
     engine: Literal["standard", "deep"] = "standard"
     harness: Literal["general", "coding", "research"] = "general"
     permission_mode: Literal["ask", "auto", "full"] | None = None
+    extensions: tuple[str, ...] = ()
+    mcp_tools: tuple[str, ...] = ()
+    risk_acknowledged: bool = False
 
 
 class ChangePermissions(RequestModel):
     permission_mode: Literal["ask", "auto", "full"]
     expected_revision: int = Field(ge=0, strict=True)
+    risk_acknowledged: bool = False
+
+
+class RevokeReuse(RequestModel):
+    admission_id: str = Field(min_length=1, max_length=256)
 
 
 class SubmitInput(RequestModel):
@@ -80,6 +89,11 @@ def create_api(host, token: str) -> FastAPI:
     async def health():
         return {"status": "ok", "stage": "development", "engines": ["standard", "deep"]}
 
+    @app.get("/profiles/{profile_id}/capabilities", dependencies=[Depends(authenticate)])
+    async def capabilities(profile_id: str):
+        """Built-in capabilities are a product contract, not a per-session toggle."""
+        return manifest()
+
     @app.post("/profiles/{profile_id}/sessions", dependencies=[Depends(authenticate)])
     async def create(profile_id: str, body: CreateSession):
         service = await host.application(profile_id)
@@ -90,6 +104,9 @@ def create_api(host, token: str) -> FastAPI:
             engine=body.engine,
             harness=body.harness,
             permission_mode=body.permission_mode or "legacy",
+            extensions=body.extensions,
+            mcp_tools=body.mcp_tools,
+            full_access_acknowledged=body.risk_acknowledged,
         )
         return asdict(session)
 
@@ -100,8 +117,21 @@ def create_api(host, token: str) -> FastAPI:
     async def permissions(profile_id: str, session_id: str, body: ChangePermissions):
         service = await host.application(profile_id)
         return asdict(
-            await service.set_permissions(session_id, body.permission_mode, body.expected_revision)
+            await service.set_permissions(
+                session_id,
+                body.permission_mode,
+                body.expected_revision,
+                body.risk_acknowledged,
+            )
         )
+
+    @app.post(
+        "/profiles/{profile_id}/sessions/{session_id}/revoke-reuse",
+        dependencies=[Depends(authenticate)],
+    )
+    async def revoke_reuse(profile_id: str, session_id: str, body: RevokeReuse):
+        service = await host.application(profile_id)
+        return await service.revoke_reuse(session_id, body.admission_id)
 
     @app.get("/profiles/{profile_id}/mcp/tools", dependencies=[Depends(authenticate)])
     async def mcp_tools(profile_id: str):

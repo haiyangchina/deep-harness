@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { FullAccessConfirm, useAccessScopes } from './full-access-confirm'
 import type { PermissionMode } from './protocol'
 import { permissionLabel, permissionOptions } from './permissions'
 
@@ -19,6 +20,8 @@ function Icon({ kind }: { kind: string }) {
 
 export function PermissionPicker({ value, disabled, direction = 'up', onChange }: PermissionPickerProps) {
   const [open, setOpen] = useState(false)
+  const [confirming, setConfirming] = useState(false)
+  const scopes = useAccessScopes()
   const root = useRef<HTMLDivElement>(null)
   const trigger = useRef<HTMLButtonElement>(null)
   useEffect(() => {
@@ -55,11 +58,26 @@ export function PermissionPicker({ value, disabled, direction = 'up', onChange }
       {permissionOptions.map(row => <button type="button" key={row.value} role="menuitemradio"
         aria-checked={value === row.value || (value === 'legacy' && row.value === 'ask')}
         className={row.value === 'full' ? 'permission-danger' : ''}
-        onClick={() => { setOpen(false); trigger.current?.focus(); onChange(row.value) }}>
+        onClick={() => {
+          setOpen(false)
+          trigger.current?.focus()
+          if (row.value === 'full' && value !== 'full') {
+            setConfirming(true)
+            return
+          }
+          onChange(row.value)
+        }}>
         <Icon kind={row.icon} /><span><strong>{row.label}</strong><small>{row.description}</small></span>
         {(value === row.value || (value === 'legacy' && row.value === 'ask')) && <span aria-hidden="true">✓</span>}
       </button>)}
-      <p>已启用的工具保持不变。Shell 使用本机账号运行；运行状态目录不向文件工具开放。</p>
+      <p>内置能力默认启用。除完全访问外，文件操作、终端命令与访问互联网均逐次确认；运行状态目录不开放。</p>
     </div>}
+    {confirming && (
+      <FullAccessConfirm
+        scopes={scopes}
+        onCancel={() => setConfirming(false)}
+        onConfirm={() => { setConfirming(false); onChange('full') }}
+      />
+    )}
   </div>
 }

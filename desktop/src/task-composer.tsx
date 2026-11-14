@@ -52,7 +52,9 @@ export function TaskComposer({ draft, pending, updateDraft, send }: TaskComposer
               disabled={busy || pending || Boolean(running) || Boolean(unknown) || Boolean(childRunning)}
               onChange={mode => void perform(async () => {
                 await api(`/sessions/${sessionId}/permissions`, 'POST', {
-                  permission_mode: mode, expected_revision: status.session.permission_revision ?? 0
+                  permission_mode: mode,
+                  expected_revision: status.session.permission_revision ?? 0,
+                  risk_acknowledged: mode === 'full'
                 })
                 await refreshConversation()
               })} />}
@@ -84,7 +86,7 @@ export function TaskComposer({ draft, pending, updateDraft, send }: TaskComposer
           ? '上次提交未确认。草稿已保留；手动重试沿用同一 submission_id。'
           : childRunning
             ? '后台子任务仍在执行，完成后可切换批准模式。'
-            : '工具在创建时启用 · 空闲时可切换批准模式 · 所有结果以本机执行记录为准'}
+            : '内置能力默认启用 · 除完全访问外三类能力逐次确认 · 空闲时可切换批准模式'}
       </p>
     </footer>
   )

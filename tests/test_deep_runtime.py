@@ -222,7 +222,7 @@ async def test_deep_repeated_identical_tool_arguments_keep_distinct_call_ids(tmp
     )
     try:
         app = await host.application("deep")
-        session = await app.create_session("create", "frozen", engine="deep")
+        session = await app.create_session("create", "frozen", ("read_file",), engine="deep")
         admission = await app.submit(session.id, "send", "read twice")
         await app.wait_idle()
         completed = await app.store.get_admission(admission.id, session.id)

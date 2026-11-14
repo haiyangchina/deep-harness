@@ -36,7 +36,9 @@ async def test_analysis_discovers_searches_and_reads_without_approval(tmp_path):
     host = ProjectHost(tmp_path / "state", tmp_path, lambda scope: AnalysisModel())
     try:
         app = await host.application("one")
-        session = await app.create_session("create", "Analyze project")
+        session = await app.create_session(
+            "create", "Analyze project", ("list_files", "search_files", "read_file")
+        )
         admission = await app.submit(session.id, "input", "Explain this project")
         await app.wait_idle()
         done = await app.store.get_admission(admission.id, session.id)

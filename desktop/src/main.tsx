@@ -1,7 +1,7 @@
 import { createRoot } from 'react-dom/client'
 import { useStore } from '@nanostores/react'
 import { useEffect, useRef, useState } from 'react'
-import { CreateSession, Knowledge, Setup } from './components'
+import { Capabilities, CreateSession, Knowledge, Setup } from './components'
 import {
   $busy,
   $conversation,
@@ -22,6 +22,10 @@ import type { Admission } from './protocol'
 import { TaskComposer } from './task-composer'
 import { TaskInspector } from './task-inspector'
 import './styles.css'
+
+// Injected by build.mjs from package.json so the sidebar label always matches
+// the packaged version instead of drifting like the old hard-coded "v0.1".
+declare const __APP_VERSION__: string
 
 const starters = [
   [
@@ -49,7 +53,7 @@ const starters = [
     '请结合当前工作区中的文件研究以下问题，给出证据、结论与尚未验证的部分。研究问题：'
   ]
 ]
-type Page = 'chat' | 'skills' | 'memories' | 'mcp/tools' | 'settings'
+type Page = 'chat' | 'capabilities' | 'skills' | 'memories' | 'mcp/tools' | 'settings'
 
 function Chat({ newSession }: { newSession: () => void }) {
   const conversation = useStore($conversation)
@@ -286,6 +290,7 @@ function App() {
           {(
             [
               ['chat', '◈', '工作台'],
+              ['capabilities', '◎', '能力'],
               ['skills', '◫', '技能库'],
               ['memories', '◉', '记忆'],
               ['mcp/tools', '⌘', 'MCP 工具']
@@ -334,7 +339,7 @@ function App() {
           <div className="connection">
             <span className={ready ? 'dot' : 'dot offline'} />
             {ready ? '本机 Agent 已连接' : '等待配置'}
-            <small>v0.1 · 独立开发版</small>
+            <small>v{__APP_VERSION__} · 独立开发版</small>
           </div>
         </div>
       </aside>
@@ -351,6 +356,8 @@ function App() {
           <Setup onClose={ready ? () => setPage('chat') : undefined} />
         ) : page === 'chat' ? (
           <Chat newSession={() => setCreating(true)} />
+        ) : page === 'capabilities' ? (
+          <Capabilities />
         ) : (
           <Knowledge key={page} kind={page} />
         )}

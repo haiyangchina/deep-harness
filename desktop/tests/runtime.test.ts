@@ -11,6 +11,14 @@ test('native API routing stays inside one profile and rejects traversal and exte
     apiPath('work', { method: 'GET', path: '/sessions?limit=100&after=' }),
     '/profiles/work/sessions?limit=100&after='
   )
+  assert.equal(
+    apiPath('work', { method: 'GET', path: '/capabilities' }),
+    '/profiles/work/capabilities'
+  )
+  assert.equal(
+    apiPath('work', { method: 'POST', path: '/sessions/abc/revoke-reuse' }),
+    '/profiles/work/sessions/abc/revoke-reuse'
+  )
   for (const value of [
     'https://example.com',
     '//example.com',

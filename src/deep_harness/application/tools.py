@@ -14,7 +14,8 @@ from jsonschema import ValidationError as JsonSchemaError
 from pydantic import BaseModel, ConfigDict, Field
 
 from deep_harness.application.atomic_files import EditArgs, ReadArgs, WriteArgs, mutate, read
-from deep_harness.application.permissions import approval_reason
+from deep_harness.application.capabilities import READ_ONLY_SCOPES
+from deep_harness.application.permissions import approval_reason, approval_scope
 from deep_harness.application.shell import BashArgs, bash, shell_command
 from deep_harness.application.terminal import CommandArgs, run_command, validate_command
 from deep_harness.application.workspace import (
@@ -91,11 +92,13 @@ TOOL_DESCRIPTIONS = {
         "Optional expected_sha256 rejects stale content. Requires approval."
     ),
     "bash": (
-        "Execute a shell command in workspace-relative cwd after approval. Supports pipes, "
-        "redirects and PATH commands. auto uses PowerShell on Windows and Bash on POSIX. "
-        "Returns exit_code, stdout/stderr and truncation flags (64 KiB per stream). "
-        "Timeout 1-120 seconds. Runs as the current OS user, without ambient secret env vars; "
-        "the shell is not a filesystem sandbox. A timeout has an unknown effect outcome."
+        "Execute a shell command in workspace-relative cwd, subject to the session "
+        "approval mode. Supports pipes, redirects and PATH commands. auto uses PowerShell "
+        "on Windows and Bash on POSIX. Returns exit_code, stdout/stderr and truncation "
+        "flags (64 KiB per stream). Timeout 1-120 seconds. Runs as the current OS user, "
+        "without ambient secret env vars; the shell is not a filesystem sandbox. A timeout "
+        "has an unknown effect outcome. Every command follows the session approval mode: "
+        "per call in ask/legacy, once per scope per round in auto, and exempt in full."
     ),
     "list_files": (
         "List workspace files recursively with a glob pattern. Skips state, dependencies "
@@ -205,21 +208,40 @@ class ToolGateway:
         return target
 
     def approval_reason(self, call: ToolCall) -> str | None:
-        if self.session.permission_mode == "legacy":
-            return (
-                "需要逐项批准"
-                if (call.name in MUTATING_TOOLS or call.name.startswith("mcp__"))
-                else None
-            )
+        # legacy is a compatibility row inside the shared policy table: it keeps
+        # strict workspace-relative paths and must not resolve paths here.
         return approval_reason(call, self.session, self.scope, self.path)
+
+    def approval_scope(self, call: ToolCall):
+        """Return (scope_key, decision, reusable) for this call."""
+        return approval_scope(call, self.session, self.scope, self.path)
+
+    async def reused_in_round(self, call: ToolCall) -> bool:
+        scope_key, _, can_reuse = self.approval_scope(call)
+        if not can_reuse:
+            return False
+        return await self.receipts.scope_granted(
+            self.claim,
+            scope_key,
+            self.session.permission_revision,
+            exclude_key=f"{self.claim.admission.id}:{call.id}",
+        )
 
     async def execute(self, call: ToolCall) -> str:
         arguments = self.validate(call)
         await self._preflight(call, arguments)
         key = f"{self.claim.admission.id}:{call.id}"
         digest = fingerprint({"name": call.name, "arguments": call.arguments})
+        if self.session.permission_mode == "full":
+            scope_key, _, _ = self.approval_scope(call)
+            if scope_key not in READ_ONLY_SCOPES:
+                await self.receipts.record_approval_event(
+                    self.claim, "approval.exempt", scope_key, call.name
+                )
         if self.session.permission_mode != "legacy" and self.approval_reason(call) is not None:
-            if not await self.receipts.approved(key, digest):
+            if not await self.reused_in_round(call) and not await self.receipts.approved(
+                key, digest
+            ):
                 raise DomainError("approval_missing", "This operation needs a durable approval")
         existing = await self.receipts.prepare_effect(self.claim, key, digest)
         if existing and existing["status"] == "succeeded":

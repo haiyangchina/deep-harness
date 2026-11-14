@@ -180,6 +180,67 @@ class ReceiptLedger:
             )
             return None
 
+    async def scope_granted(
+        self,
+        claim: ExecutionClaim,
+        scope_key: str,
+        revision: int,
+        exclude_key: str | None = None,
+    ) -> bool:
+        """Reuse one approval for the same scope within the same admission.
+
+        The per-call ``key = admission:call`` and its proposal hash stay intact;
+        this only looks for an earlier approved interaction that the operator
+        explicitly allowed to be reused under the same permission revision.
+        """
+        async with self.store.engine.connect() as conn:
+            revoked = await conn.execute(
+                select(s.events.c.payload).where(
+                    s.events.c.session_id == claim.admission.session_id,
+                    s.events.c.type == "approval.reuse_revoked",
+                )
+            )
+            if any(
+                row["payload"].get("admission_id") == claim.admission.id
+                for row in revoked.mappings()
+            ):
+                return False
+            query = select(s.interactions.c.id, s.interactions.c.proposal).where(
+                s.interactions.c.admission_id == claim.admission.id,
+                s.interactions.c.decision == "approve",
+            )
+            if exclude_key is not None:
+                query = query.where(s.interactions.c.id != exclude_key)
+            rows = await conn.execute(query)
+        return any(
+            row["proposal"].get("scope_key") == scope_key
+            and row["proposal"].get("reusable") is True
+            and row["proposal"].get("permission_revision") == revision
+            for row in rows.mappings()
+        )
+
+    async def record_approval_event(self, claim, kind, scope_key, tool_name):
+        async with self.store.transaction() as conn:
+            await self.store.append_event(
+                conn,
+                claim.admission.session_id,
+                kind,
+                {
+                    "admission_id": claim.admission.id,
+                    "scope_key": scope_key,
+                    "tool_name": tool_name,
+                },
+            )
+
+    async def revoke_reuse(self, session_id: str, admission_id: str):
+        async with self.store.transaction() as conn:
+            await self.store.append_event(
+                conn,
+                session_id,
+                "approval.reuse_revoked",
+                {"admission_id": admission_id},
+            )
+
     async def decided_waiting(self) -> list[dict]:
         async with self.store.engine.connect() as conn:
             rows = await conn.execute(

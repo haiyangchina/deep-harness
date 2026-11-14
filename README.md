@@ -36,6 +36,7 @@
 - 模型响应 receipt、工具 effect ledger；不确定动作停止，阻挡后继输入。
 - 相对工作区的 UTF-8 文件读取/写入；写入必须审批，覆盖已有文件需要 SHA-256。
 - 会话显式授权的本机命令执行；每次执行需审批，使用绝对可执行文件路径和参数数组，限制时间与输出。
+- 内置能力由 `application/capabilities.py` 单点声明：文件读取与检索、文件写入与编辑、本地命令执行。新会话默认派生 6 个核心工具，无需逐项勾选。
 - 任务取消、优雅排空、未知结果人工对账，以及业务库和 checkpoint 的完整 Profile 备份/新 Profile 还原。
 - 上下文预算与整轮压缩归档、模型调用和工具调用预算、用量统计、模型增量事件。
 - LangGraph interrupt 审批，事件包含可审阅参数，应用重启后可继续审批。
@@ -58,20 +59,30 @@
 
 ## 项目分析与 Coding
 
-新建 CLI/HTTP 会话默认授予只读 `read`、`list_files`、`search_files`、`read_file`：
-目录发现、按字面文本搜索符号，以及按行分段读取。CLI 默认引导模型先检查
-README、依赖清单、AGENTS.md 和入口文件，再根据文件证据介绍功能或修改代码。
+新建 CLI/HTTP/桌面会话由后端 `derive_grants()` 派生授权，默认授予 6 个核心工具
+`read`、`list_files`、`search_files`、`write`、`edit`、`bash`，对应 3 项内置能力
+（文件读取与检索、文件写入与编辑、本地命令执行）。`GET /profiles/{profile}/capabilities`
+返回能力清单、`capability_version`、三类安全作用域与三档策略矩阵；桌面「能力」页
+与新建会话弹窗都消费这一份事实，不再逐项勾选工具。能力默认授予不等于默认放行：写入与
+命令在执行期仍受批准模式、路径校验和 effect 账本约束。
+
+任何 Shell 查询（包括时间、日期、时区）都统一由 `bash` 执行，输出是 Shell 的 stdout
+文本；「本地命令执行」不设子能力，也不为特定命令单列白名单或专用工具。所有命令按同一
+批准模式确认（`ask`/`legacy` 逐次，`auto` 同一轮同类只问第一次，`full` 免批），
+后端不从命令文本推断用途。research / `--read-only` 会话只有 3 个只读工具，
+没有命令执行能力。CLI 默认引导模型先检查 README、依赖清单、AGENTS.md 和入口文件，
+再根据文件证据介绍功能或修改代码。
 搜索跳过运行状态、常见依赖与构建目录，并限制扫描量和结果大小；结果出现
 `truncated=true` 时应缩小目录/模式或继续读取后续行。
 
-四个基本工具在 Standard、Deep 和获授权的 coding 子任务中使用同一执行网关：
+六个核心工具在 Standard、Deep 和获授权的 coding 子任务中使用同一执行网关：
 
 | 工具 | 参数与行为 |
 |---|---|
 | `read` | `path` 相对工作区解析，新权限模式也支持外部绝对路径。读取文件或列出目录；`offset` 从 1 开始，`limit` 默认 200、最多 2000。文件返回原始 UTF-8 文本、整文件 SHA-256 和续读游标。 |
 | `write` | `path`、`content`；自动创建父目录。覆盖已有文件须传 `read` 返回的 `expected_sha256`。同目录临时文件、fsync 和原子替换避免留下半写文件。 |
 | `edit` | `path`、`old_text`、`new_text`；只接受唯一精确匹配，零匹配或多匹配（包括重叠匹配）均拒绝。可传 `expected_sha256` 检查版本，保留其余内容、BOM 和换行。 |
-| `bash` | `command`、工作区相对 `cwd`、`timeout_seconds`（默认 30，范围 1–120）、`shell`（`auto/bash/powershell`）。支持管道、重定向及 PATH 命令，返回退出码、标准输出和标准错误。 |
+| `bash` | `command`、工作区相对 `cwd`、`timeout_seconds`（默认 30，范围 1–120）、`shell`（`auto/bash/powershell`）。支持管道、重定向及 PATH 命令，返回退出码、标准输出和标准错误。每条命令在 ask/legacy 下逐次确认、auto 下同一轮同类只问第一次，`full` 模式免除逐项批准。 |
 
 `read/write/edit` 处理最多 8 MiB 的 UTF-8 文件。`read` 每页正文最多 24000 字符，
 用返回的 `next_offset` 和 `next_column` 分别作为下一次的 `offset` 和 `column`，
@@ -89,11 +100,18 @@ USERPROFILE、APPDATA 等），不注入模型供应商密钥。Shell 以当前�
 失败提示会显示超时工具及时间限制。修复运行环境后，旧 unknown 会话仍需核对实际
 结果，再通过“我已核对，创建新分支”继续；重启不会清除未知结果记录。
 
-未指定权限模式的 CLI/HTTP 会话沿用只读默认和原审批规则。桌面新建会话默认启用
-读取、写入、编辑与 Shell，并选择“请求批准”；可分别关闭不需要的工具。CLI 的 `--allow-write` 授予 `write/edit`，`--allow-exec` 授予 `bash`。
-旧 `read_file/write_file/run_command` 保留供已有会话使用，原参数与 schema 保持不变；
-其中旧 `read_file` 仍限制 128 KB、默认 120 行和 6000 UTF-8 字节。工具授权在会话创建
-时冻结，要使用新工具须新建会话，不会扩充已有会话的授权或重写历史 prompt。
+未指定权限模式的 CLI/HTTP 会话沿用 `legacy` 原审批规则，但工具授权统一由后端派生，
+默认就是上述 6 个核心工具；桌面新建会话默认选择“请求批准”。`--allow-write` 与
+`--allow-exec` 现在仅是兼容空操作（会在 stderr 提示一次），因为对应能力已默认授予；
+`--allow-memory`、`--allow-delegation`、`--mcp-tool` 仍追加扩展；新增 `--read-only`
+强制只授予 3 个只读工具。HTTP 创建会话可省略 `tools`，改用可选的 `extensions` /
+`mcp_tools`；显式传 `tools` 仍可用。
+
+旧 `read_file/write_file/run_command` 保留供显式 CLI/HTTP 授予，原参数与 schema 不变；
+其中 `read_file` 仍限制 128 KB、默认 120 行和 6000 UTF-8 字节，但不出现在新会话清单。
+工具授权在会话创建时冻结，不会扩充已有会话的授权或重写历史 prompt。本次变更前已清空
+两处会话库（项目 `.state/` 与桌面端 `agent-state/`），因此不存在需要 `bind-session`
+的旧快照；清空前的完整备份位于 `.workbuddy/session-backup-20261114-1646/`。
 
 在本子项目目录运行：
 
@@ -128,20 +146,41 @@ Deep 模式同样执行预算检查，但尚不支持 Standard 的整轮自动�
 
 ## 权限与批准模式
 
-桌面新建会话和输入框右下角提供与参考菜单对应的三种模式：
+桌面新建会话和输入框右下角提供三种模式。三档只是批准策略，**不授予工具**：内置
+6 个核心工具由 harness 默认授予；`full` 不会额外授予任何工具。三档差异落在同一条轴上：
+审批频率与信任半径。
 
-| 模式 | 后端执行规则 |
-|---|---|
-| 请求批准（ask） | 普通工作区读取无需批准；文件修改、外部文件读取/修改、命令和 MCP 调用需逐项批准。 |
-| 帮我批准（auto） | 自动批准普通工作区文件编辑及简单字面量 Shell 内置命令；外部文件、敏感文件、网络/MCP、重定向及无法确认安全的命令仍需批准。 |
-| 完全访问权限（full） | 已启用的工具免除逐项批准，允许外部文件和网络操作。仍受操作系统权限、工具授权及原有文件大小/超时/预算等限制。 |
+| 模式 | 审批频率 | 信任半径 | 启用门槛 |
+|---|---|---|---|
+| 请求批准（ask） | 每次调用逐项询问 | 无 | — |
+| 帮我批准（auto） | 同一轮任务内每类只问一次 | 工作区内的写入与命令 | — |
+| 完全访问权限（full） | 免批 | 三类作用域全部放开 | 风险勾选 + 确认 |
 
-自动批准使用后端保守规则，不依赖模型自报风险：仅简单 `pwd/echo/Get-Location/Write-Output`
-内置命令自动放行；测试、安装、Git、任意可执行文件、管道、重定向、变量和命令替换
-均需批准。访问凭据文件、`.git` 或 Agent 指令文件也会请求批准。该规则不是操作系统级
-沙箱或完整恶意代码检测器；Shell 执行后能访问本机账号权限内的文件和网络。
-运行状态目录仍不向文件工具开放。全访问不会自动授予会话中未启用的工具，research
-也不能借此取得写入或 Shell 工具。
+三类安全作用域（`GET /capabilities` 的 `access_scopes`）：**文件操作**（读取、创建、
+修改、上传、删除此计算机上任意位置文件）、**终端命令**（运行命令、安装软件、修改系统
+设置）、**访问互联网**（访问网站、发送数据、使用已启用连接器）。
+
+| 操作 | ask | auto | full |
+|---|---|---|---|
+| 工作区内只读 | 免批 | 免批 | 免批 |
+| 工作区内写入 / 命令 | 每次逐项 | 同一轮同类只问一次 | 免批 |
+| 工作区外 / 敏感路径 | 每次逐项 | 每次逐项（不复用） | 免批 |
+| 互联网 / 连接器 / 持久状态 | 每次逐项 | 每次逐项（不复用） | 免批 |
+
+`auto` 的复用**不是**从命令文本推断安全性：后端 `permissions.py::classify()` 只按工具、
+目标路径与 cwd 归类到作用域，再由 `capabilities.py::PERMISSION_POLICY` 决定
+`exempt / per_round / per_call`。同一 `admission`（一轮任务）里，用户批准过某个可复用
+作用域后，后续同类调用直接放行并写入 `approval.reused` 事件；下一轮自动清空。可在审批
+面板点「撤销本轮复用」立即恢复逐次确认。`full` 的免批写入 `approval.exempt` 事件。
+批准记录仍按 `admission.id:call.id` + 参数 digest 独立保存；`pwd`/`echo`、管道、分号、
+变量替换、外部程序和重定向一律同等对待，不做文本白名单。
+
+启用 `full` 前必须勾选「我已了解风险，并对自己的数据安全负责」并由「允许完全访问」确认；
+服务端 `CreateSession` / `ChangePermissions` 会校验 `risk_acknowledged`，CLI 需显式
+`--acknowledge-full-access`，否则报 `full_access_acknowledgement_required`。该字段不进
+创建 digest，幂等重放不受影响。该规则不是操作系统级沙箱或完整恶意代码检测器；Shell
+执行后能访问本机账号权限内的文件和网络。运行状态目录仍不向文件工具开放，
+`full` 不会自动授予会话中未启用的工具，research 也不能借此取得写入或 Shell 工具。
 
 模式可以在会话空闲时切换，切换持久化并记录事件；等待审批、正在运行、排队、结果
 未知或后台子任务尚未结束时拒绝切换。变更需要当前 `permission_revision`，过期请求
@@ -153,17 +192,22 @@ prompt、工具 schema 或模型快照，也不会自动批准此前挂起的操
 数据库 v8→v9 升级前自动备份，保留旧会话快照与待审批记录。
 
 ~~~powershell
-# 新建会话：自动批准普通编辑，风险命令继续审批
-deep-harness --state-dir .state --workspace . repl --allow-write --allow-exec --permission-mode auto
+# 新建会话：同一轮任务内同类操作只问一次
+deep-harness --state-dir .state --workspace . repl --permission-mode auto
+
+# 完全访问必须显式确认风险，否则报 full_access_acknowledgement_required
+deep-harness --state-dir .state --workspace . repl --permission-mode full --acknowledge-full-access
 
 # 查看当前模式和 permission_revision 后，切换已有空闲会话
 deep-harness --state-dir .state --workspace . inspect SESSION_ID
 deep-harness --state-dir .state --workspace . permissions SESSION_ID --mode ask --expected-revision 0
 ~~~
 
-HTTP 创建会话增加 `permission_mode: "ask" | "auto" | "full"`。
-已有会话使用 `POST /profiles/{profile}/sessions/{session}/permissions`，请求体例如
-`{"permission_mode":"auto","expected_revision":0}`。接口仍要求本机 operator token，
+HTTP 创建会话支持 `permission_mode: "ask" | "auto" | "full"`，选 `full` 时必须同时传
+`risk_acknowledged: true`。已有会话使用 `POST /profiles/{profile}/sessions/{session}/permissions`，
+请求体例如 `{"permission_mode":"auto","expected_revision":0}`；切到 `full` 同样需要
+`risk_acknowledged: true`。`POST /profiles/{profile}/sessions/{session}/revoke-reuse`
+带 `{"admission_id": "..."}` 可撤销本轮的批准复用。接口仍要求本机 operator token，
 会话不能跨 Profile 访问。同步/后台子任务继承父任务创建时的模式和受限工具集合。
 
 ## 开发环境
@@ -256,8 +300,8 @@ deep-harness --state-dir .state --workspace . chat "请使用 read_file 工具�
 deep-harness --state-dir .state --workspace . --provider diagnostic chat "/read README.md"
 ~~~
 
-诊断器不是本地大模型；/read、/write 仅为其测试指令。CLI 新会话默认仅授予读取工具，
-需要写入时在创建会话的命令上加 --allow-write；每次写入仍必须逐项审批。
+诊断器不是本地大模型；/read、/write 仅为其测试指令。CLI 新会话默认授予 6 个核心工具，
+写入与命令仍需逐项审批；`--read-only` 可强制只授予 3 个只读工具。
 
 ## 连续对话、会话管理与审批
 

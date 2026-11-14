@@ -1,8 +1,21 @@
-"""Conservative approval policy, independent of model instructions."""
+"""Conservative approval policy, independent of model instructions.
 
-import re
+One policy table decides every tool call. ``classify`` maps a call to a risk
+scope without inspecting command text; ``approval_reason`` then applies the
+session mode. The same table is published through the capability manifest.
+"""
 
-from deep_harness.application.shell import shell_kind
+from deep_harness.application.capabilities import (
+    SCOPE_FILE_READ,
+    SCOPE_FILE_WRITE,
+    SCOPE_INTERNET,
+    SCOPE_OUTSIDE,
+    SCOPE_PERSISTENT,
+    SCOPE_SENSITIVE,
+    SCOPE_TERMINAL,
+    policy_for,
+    reusable,
+)
 from deep_harness.application.workspace import MUTATING_TOOLS
 
 SENSITIVE_PARTS = {".git", ".ssh", ".aws", ".azure", ".kube", ".gnupg"}
@@ -18,40 +31,52 @@ def sensitive_path(target):
     )
 
 
-def approval_reason(call, session, scope, resolve_path):
-    mode = session.permission_mode
-    if mode == "full":
-        return None
+def classify(call, scope, resolve_path):
+    """Map a call to (scope_key, reason) without inspecting command text."""
     if call.name in FILE_TOOLS:
         target = resolve_path(call.arguments.get("path", "."))
         if not target.is_relative_to(scope.workspace):
-            return "访问工作区外的文件"
+            return SCOPE_OUTSIDE, "访问工作区外的文件"
         if sensitive_path(target):
-            return "访问凭据、版本控制或 Agent 指令文件"
+            return SCOPE_SENSITIVE, "访问凭据、版本控制或 Agent 指令文件"
         if call.name in FILE_WRITES:
-            return None if mode == "auto" else "修改文件需要批准"
-        return None
+            return SCOPE_FILE_WRITE, "修改文件需要批准"
+        return SCOPE_FILE_READ, None
     if call.name in {"bash", "run_command"}:
         cwd = resolve_path(call.arguments.get("cwd", "."))
         if not cwd.is_relative_to(scope.workspace) or sensitive_path(cwd):
-            return "在工作区外或敏感目录执行命令"
-        # Only literal shell builtins are auto-approved. Network, substitutions,
-        # pipelines and repository hooks cannot be inferred safe from a command name.
-        command = call.arguments.get("command", "").strip()
-        if mode == "auto" and call.name == "bash" and re.fullmatch(r"[\w .,:/+\-]+", command):
-            words = command.split()
-            kind = shell_kind(call.arguments.get("shell", "auto"))
-            builtin = words[0] if kind == "bash" else words[0].lower()
-            allowed = (
-                {"pwd", "echo"}
-                if kind == "bash"
-                else {"pwd", "echo", "get-location", "write-output"}
-            )
-            if builtin in allowed:
-                return None
-        return "命令可能访问网络、修改文件或产生其他副作用"
+            return SCOPE_OUTSIDE, "在工作区外或敏感目录执行命令"
+        # No command is inferred safe from its text; every command is
+        # classified identically by tool and cwd alone.
+        return SCOPE_TERMINAL, "命令可能访问网络、修改文件或产生其他副作用"
     if call.name.startswith("mcp__"):
-        return "外部服务可能访问网络或产生副作用"
+        return SCOPE_INTERNET, "外部服务可能访问网络或产生副作用"
     if call.name in MUTATING_TOOLS:
-        return "修改持久状态需要批准"
+        return SCOPE_PERSISTENT, "修改持久状态需要批准"
+    return SCOPE_FILE_READ, None
+
+
+def legacy_reason(call):
+    """Compatibility row: strict workspace paths, no path resolution here."""
+    if call.name in MUTATING_TOOLS or call.name.startswith("mcp__"):
+        return "需要逐项批准"
     return None
+
+
+def approval_reason(call, session, scope, resolve_path):
+    mode = session.permission_mode
+    if mode == "legacy":
+        return legacy_reason(call)
+    scope_key, reason = classify(call, scope, resolve_path)
+    if policy_for(mode, scope_key) == "exempt":
+        return None
+    return reason or "该操作需要批准"
+
+
+def approval_scope(call, session, scope, resolve_path):
+    """Return (scope_key, decision, reusable) for the session mode."""
+    if session.permission_mode == "legacy":
+        return None, "per_call", False
+    scope_key, _ = classify(call, scope, resolve_path)
+    decision = policy_for(session.permission_mode, scope_key)
+    return scope_key, decision, reusable(session.permission_mode, scope_key)

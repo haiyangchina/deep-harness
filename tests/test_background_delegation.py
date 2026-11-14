@@ -97,6 +97,7 @@ async def test_background_parent_completes_then_steer_runs_next_turn(tmp_path, m
             ("delegate_task", "check_delegation"),
             engine="deep",
             permission_mode=mode,
+            full_access_acknowledged=(mode == "full"),
         )
         admission = await app.submit(session.id, "parent", "parent")
         row = await parent_completed(app, session, admission)

@@ -36,6 +36,11 @@ def parser():
     chat.add_argument("--harness", choices=["general", "coding", "research"])
     chat.add_argument("--permission-mode", choices=["ask", "auto", "full"])
     chat.add_argument(
+        "--acknowledge-full-access",
+        action="store_true",
+        help="Confirm the full-access risk notice (required with --permission-mode full)",
+    )
+    chat.add_argument(
         "--mcp-tool", action="append", default=[], help="Grant one configured MCP tool"
     )
     chat.add_argument(
@@ -54,17 +59,26 @@ def parser():
         action="store_true",
         help="Grant memory saves under the session approval policy",
     )
+    chat.add_argument(
+        "--read-only", action="store_true", help="Grant only the three read-only core tools"
+    )
     chat.add_argument("--submission-id", help="Stable ID for safe submission retries")
     repl = commands.add_parser("repl")
     repl.add_argument("--session")
     repl.add_argument("--engine", choices=["standard", "deep"])
     repl.add_argument("--harness", choices=["general", "coding", "research"])
     repl.add_argument("--permission-mode", choices=["ask", "auto", "full"])
+    repl.add_argument(
+        "--acknowledge-full-access",
+        action="store_true",
+        help="Confirm the full-access risk notice (required with --permission-mode full)",
+    )
     repl.add_argument("--mcp-tool", action="append", default=[])
     repl.add_argument("--allow-write", action="store_true")
     repl.add_argument("--allow-exec", action="store_true")
     repl.add_argument("--allow-delegation", action="store_true")
     repl.add_argument("--allow-memory", action="store_true")
+    repl.add_argument("--read-only", action="store_true")
     sessions = commands.add_parser("sessions")
     sessions.add_argument("--after", default="")
     sessions.add_argument("--limit", type=int, choices=range(1, 101), default=50, metavar="1..100")
@@ -75,6 +89,11 @@ def parser():
     permissions.add_argument("session")
     permissions.add_argument("--mode", required=True, choices=["ask", "auto", "full"])
     permissions.add_argument("--expected-revision", type=int, required=True)
+    permissions.add_argument(
+        "--acknowledge-full-access",
+        action="store_true",
+        help="Confirm the full-access risk notice (required with --mode full)",
+    )
     delegations = commands.add_parser("delegations")
     delegations.add_argument("session")
     delegation_steer = commands.add_parser("delegation-steer")

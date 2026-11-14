@@ -623,6 +623,25 @@ nav button span {
   line-height: 1.8;
   margin: 16px 0;
 }
+.capability-card {
+  border: 1px solid #3c4651;
+  background: #202832;
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin: 8px 0;
+  font-size: 12px;
+}
+.capability-card p {
+  margin: 4px 0 0;
+}
+.capability-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+  color: #e6ecf2;
+}
 .error-banner {
   padding: 12px 20px;
   background: #3c2726;
@@ -650,6 +669,60 @@ nav button span {
   align-items: center;
   z-index: 10;
   backdrop-filter: blur(8px);
+}
+.modal-backdrop-nested {
+  z-index: 30;
+}
+.full-access-modal {
+  width: 520px;
+}
+.full-access-scopes {
+  display: grid;
+  gap: 10px;
+  margin: 18px 0;
+}
+.full-access-scope {
+  border: 1px solid #3c4651;
+  border-radius: 10px;
+  padding: 12px 14px;
+  background: #202832;
+}
+.full-access-scope p {
+  margin: 6px 0 0;
+}
+.full-access-check {
+  margin: 18px 0;
+}
+button.danger:not(:disabled) {
+  background: #a8412f;
+  border-color: #c25a45;
+}
+.policy-matrix {
+  border: 1px solid #3c4651;
+  border-radius: 10px;
+  overflow: hidden;
+  margin: 16px 0;
+}
+.policy-row {
+  display: grid;
+  grid-template-columns: 2fr repeat(3, 1fr);
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid #313b46;
+  font-size: 12px;
+  color: #c6d0da;
+}
+.policy-row:last-child {
+  border-bottom: 0;
+}
+.policy-head {
+  background: #232c36;
+  color: #e6ecf2;
+}
+.revoke-reuse {
+  width: 100%;
+  margin: 10px 0;
+  font-size: 12px;
 }
 .modal {
   width: 490px;

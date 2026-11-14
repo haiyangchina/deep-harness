@@ -115,12 +115,22 @@ class StandardRuntime:
     async def _approval(self, call: ToolCall) -> bool:
         key = f"{self.claim.admission.id}:{call.id}"
         digest = fingerprint({"name": call.name, "arguments": call.arguments})
+        scope_key, _, can_reuse = self.gateway.approval_scope(call)
+        if can_reuse and await self.receipts.scope_granted(
+            self.claim, scope_key, self.session.permission_revision, exclude_key=key
+        ):
+            await self.receipts.record_approval_event(
+                self.claim, "approval.reused", scope_key, call.name
+            )
+            return True
         proposal = {"tool_name": call.name, "arguments": call.arguments}
         if self.session.permission_mode != "legacy":
             proposal.update(
                 reason=self.gateway.approval_reason(call),
                 permission_mode=self.session.permission_mode,
                 permission_revision=self.session.permission_revision,
+                scope_key=scope_key,
+                reusable=can_reuse,
             )
         # An interrupt resume replays this node from the beginning. Keep waiting for
         # the durable decision instead of turning a still-pending approval into a

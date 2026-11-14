@@ -32,6 +32,52 @@ export interface Session {
   permission_revision?: number
 }
 export type PermissionMode = 'legacy' | 'ask' | 'auto' | 'full'
+export interface CapabilitySpec {
+  key: string
+  label: string
+  description: string
+  tier: 'core' | 'extension'
+  risk: string
+  tools: string[]
+  approval_hint: string
+}
+export interface AccessScope {
+  key: string
+  label: string
+  description: string
+  scope_keys: string[]
+  approval_hint: string
+}
+export interface PermissionModeSpec {
+  key: string
+  label: string
+  description: string
+  approval: string
+  requires_acknowledgement: boolean
+}
+export interface PermissionPolicy {
+  modes: PermissionModeSpec[]
+  access_scopes: AccessScope[]
+  scope_keys: string[]
+  matrix: Record<string, Record<string, string>>
+  reusable_scopes: string[]
+  always_per_call: string[]
+  read_only_scopes: string[]
+  hard_boundaries: string[]
+  requires_acknowledgement: string[]
+}
+export interface CapabilityManifest {
+  capability_version: number
+  capabilities: CapabilitySpec[]
+  core_tools: string[]
+  read_only_core: string[]
+  legacy_tools: string[]
+  extensions: string[]
+  access_scopes?: AccessScope[]
+  permission_modes?: PermissionModeSpec[]
+  permission_policy?: PermissionPolicy
+  hard_boundaries?: string[]
+}
 export interface Admission {
   id: string
   text: string

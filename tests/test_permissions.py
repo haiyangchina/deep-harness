@@ -84,11 +84,12 @@ async def test_modes_control_workspace_write_and_external_read(tmp_path, engine,
     try:
         app = await host.application("one")
         session = await app.create_session(
-            "create", "tools", ("read", "write"), engine=engine, permission_mode=mode
+            "create", "tools", ("read", "write"), engine=engine, permission_mode=mode,
+            full_access_acknowledged=(mode == "full"),
         )
         admission = await app.submit(session.id, "send", "act")
         await app.wait_idle()
-        expected = {"ask": ["write", "read"], "auto": ["read"], "full": []}[mode]
+        expected = {"ask": ["write", "read"], "auto": ["write", "read"], "full": []}[mode]
         for name in expected:
             pending = await app.store.get_admission(admission.id, session.id)
             assert pending.status == "waiting_approval"
@@ -123,7 +124,10 @@ async def test_network_commands_dispatch_only_under_the_selected_policy(
     host = project(tmp_path, calls)
     try:
         app = await host.application("one")
-        session = await app.create_session("create", "tools", ("bash",), permission_mode=mode)
+        session = await app.create_session(
+            "create", "tools", ("bash",), permission_mode=mode,
+            full_access_acknowledged=(mode == "full"),
+        )
         admission = await app.submit(session.id, "send", "network")
         await app.wait_idle()
         pending = await app.store.get_admission(admission.id, session.id)
@@ -141,7 +145,14 @@ async def test_network_commands_dispatch_only_under_the_selected_policy(
         await host.close()
 
 
-async def test_auto_allows_literal_builtin_but_requires_approval_for_redirection(tmp_path):
+async def test_auto_reuses_command_approval_within_one_admission(tmp_path, monkeypatch):
+    dispatched = []
+
+    async def command(arguments, path):
+        dispatched.append(arguments.command)
+        return {"exit_code": 0, "stdout": "stub", "stderr": ""}
+
+    monkeypatch.setattr("deep_harness.application.tools.bash", command)
     host = project(
         tmp_path,
         [
@@ -156,13 +167,17 @@ async def test_auto_allows_literal_builtin_but_requires_approval_for_redirection
         await app.wait_idle()
         pending = await app.store.get_admission(admission.id, session.id)
         assert pending.status == "waiting_approval"
-        assert not (tmp_path / "workspace/risky.txt").exists()
+        assert dispatched == []
         approval = (await app.sessions.status(session.id))["approvals"][0]
-        assert approval["proposal"]["arguments"]["command"].endswith("> risky.txt")
-        await app.approve(session.id, approval["id"], pending.generation, "deny")
+        assert approval["proposal"]["arguments"]["command"] == "echo safe"
+        assert approval["proposal"]["scope_key"] == "terminal:workspace"
+        assert approval["proposal"]["reusable"] is True
+        await app.approve(session.id, approval["id"], pending.generation, "approve")
         await app.wait_idle()
+        assert dispatched == ["echo safe", "echo risky > risky.txt"]
         assert (await app.store.get_admission(admission.id, session.id)).status == "completed"
-        assert not (tmp_path / "workspace/risky.txt").exists()
+        events = await app.store.event_history(session.id)
+        assert sum(event["type"] == "approval.reused" for event in events) == 1
     finally:
         await host.close()
 
@@ -181,7 +196,8 @@ async def test_external_directory_discovery_and_file_creation_follow_policy(tmp_
     try:
         app = await host.application("one")
         session = await app.create_session(
-            "create", "tools", ("list_files", "search_files", "write"), permission_mode=mode
+            "create", "tools", ("list_files", "search_files", "write"), permission_mode=mode,
+            full_access_acknowledged=(mode == "full"),
         )
         admission = await app.submit(session.id, "send", "inspect outside")
         await app.wait_idle()
@@ -210,9 +226,9 @@ async def test_idle_switch_is_audited_preserves_model_snapshot_and_survives_rest
         app = await host.application("one")
         session = await app.create_session("create", "unchanged prompt", permission_mode="ask")
         before = await app.sessions.status(session.id)
-        changed = await app.set_permissions(session.id, "full", 0)
+        changed = await app.set_permissions(session.id, "full", 0, True)
         assert changed.permission_mode == "full" and changed.permission_revision == 1
-        assert await app.set_permissions(session.id, "full", 0) == changed
+        assert await app.set_permissions(session.id, "full", 0, True) == changed
         after = await app.sessions.status(session.id)
         assert before["runtime"] == after["runtime"]
         assert changed.prompt == session.prompt and changed.tools == session.tools
@@ -304,7 +320,11 @@ async def test_api_validates_modes_and_enforces_profile_and_operator_access(tmp_
             assert response.status_code == 200
             session = response.json()
             route = f"/profiles/one/sessions/{session['id']}/permissions"
-            body = {"permission_mode": "full", "expected_revision": 0}
+            body = {
+                "permission_mode": "full",
+                "expected_revision": 0,
+                "risk_acknowledged": True,
+            }
             assert (await client.post(route, json=body)).status_code == 401
             assert (
                 await client.post(route.replace("/one/", "/two/"), headers=headers, json=body)

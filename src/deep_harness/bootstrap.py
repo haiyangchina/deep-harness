@@ -9,6 +9,7 @@ from uuid import uuid4
 from filelock import FileLock, Timeout
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
+from deep_harness.application.capabilities import derive_grants
 from deep_harness.application.config import ExecutionSettings
 from deep_harness.application.curation import CurationService, auto_curation_enabled
 from deep_harness.application.lifecycle import drain_tasks, mutation
@@ -106,21 +107,31 @@ class ProfileApplication:
         self,
         request_id: str,
         prompt: str,
-        tools: tuple[str, ...] = READ_TOOLS,
+        tools: tuple[str, ...] | None = None,
         engine: str = "standard",
         harness: str = "general",
         permission_mode: str = "legacy",
+        extensions: tuple[str, ...] = (),
+        mcp_tools: tuple[str, ...] = (),
+        full_access_acknowledged: bool = False,
     ):
         if permission_mode not in {"legacy", "ask", "auto", "full"}:
             raise DomainError("permission_mode", "Unknown permission mode")
+        if permission_mode == "full" and not full_access_acknowledged:
+            raise DomainError(
+                "full_access_acknowledgement_required",
+                "Full access requires an explicit risk acknowledgement",
+            )
         if engine not in {"standard", "deep"}:
             raise DomainError("unknown_engine", "Requested engine is not supported")
-        if engine != "deep" and set(tools) & {"delegate_task", "check_delegation"}:
-            raise DomainError("tool_denied", "Delegation is available only in Deep sessions")
         if harness not in {"general", "coding", "research"}:
             raise DomainError("unknown_harness", "Requested Deep harness is not supported")
         if engine != "deep" and harness != "general":
             raise DomainError("unknown_harness", "Specialized harness requires Deep engine")
+        if tools is None:
+            tools = derive_grants(engine, harness, extensions, mcp_tools)
+        if engine != "deep" and set(tools) & {"delegate_task", "check_delegation"}:
+            raise DomainError("tool_denied", "Delegation is available only in Deep sessions")
         if harness == "research" and set(tools) & MUTATING_TOOLS:
             raise DomainError("tool_denied", "Research harness cannot receive mutating tools")
         if any(name not in TOOL_ARGUMENTS and not name.startswith("mcp__") for name in tools):
@@ -407,12 +418,26 @@ class ProfileApplication:
         return await self.sessions.status(session_id)
 
     @mutation
-    async def set_permissions(self, session_id, mode, expected_revision):
+    async def set_permissions(
+        self, session_id, mode, expected_revision, full_access_acknowledged=False
+    ):
         status = await self.store.session_status(session_id, "operator")
         if status["active_admissions"]:
             raise DomainError("permissions_busy", "Finish pending work before changing permissions")
+        if mode == "full" and not full_access_acknowledged:
+            raise DomainError(
+                "full_access_acknowledgement_required",
+                "Full access requires an explicit risk acknowledgement",
+            )
         async with self.locks.setdefault(session_id, asyncio.Lock()):
             return await change_permissions(self.store, session_id, mode, expected_revision)
+
+    @mutation
+    async def revoke_reuse(self, session_id, admission_id):
+        await self.store.get_session(session_id, "operator")
+        admission = await self.store.get_admission(admission_id, session_id)
+        await self.receipts.revoke_reuse(session_id, admission.id)
+        return await self.sessions.status(session_id)
 
     @mutation
     async def fork_session(self, session_id, request_id):

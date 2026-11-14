@@ -3,10 +3,12 @@
 import asyncio
 import json
 import shlex
+import sys
 from dataclasses import asdict
 from uuid import uuid4
 
-from deep_harness.application.workspace import PROJECT_PROMPT, READ_TOOLS
+from deep_harness.application.capabilities import CORE_TOOLS, READ_ONLY_CORE
+from deep_harness.application.workspace import PROJECT_PROMPT
 from deep_harness.domain.models import DomainError
 from deep_harness.runtime.inference import usage_totals
 
@@ -24,6 +26,7 @@ async def select_session(app, args):
             or args.allow_delegation
             or args.mcp_tool
             or args.permission_mode
+            or args.read_only
         ):
             raise DomainError("immutable_grants", "Existing session tool grants cannot be changed")
         session = await app.store.get_session(args.session, "operator")
@@ -32,11 +35,20 @@ async def select_session(app, args):
         if args.harness and args.harness != session.harness:
             raise DomainError("immutable_harness", "Existing session harness cannot be changed")
         return session
-    tools = READ_TOOLS
-    if args.allow_write:
-        tools += ("write", "edit")
-    if args.allow_exec:
-        tools += ("bash",)
+    if args.read_only and (
+        args.allow_write
+        or args.allow_exec
+        or args.allow_memory
+        or args.allow_delegation
+        or args.mcp_tool
+    ):
+        raise DomainError("immutable_grants", "--read-only cannot be combined with extra grants")
+    if args.allow_write or args.allow_exec:
+        print(
+            "注意：--allow-write / --allow-exec 对应的能力现在默认授予，参数仅为兼容保留。",
+            file=sys.stderr,
+        )
+    tools = READ_ONLY_CORE if args.read_only else CORE_TOOLS
     if args.allow_memory:
         tools += ("save_memory",)
     if args.allow_delegation:
@@ -49,6 +61,7 @@ async def select_session(app, args):
         engine=args.engine or "standard",
         harness=args.harness or "general",
         permission_mode=args.permission_mode or "legacy",
+        full_access_acknowledged=args.acknowledge_full_access,
     )
 
 
@@ -246,7 +259,14 @@ async def conversation(app, args):
 
 
 async def permissions(app, args):
-    display(await app.set_permissions(args.session, args.mode, args.expected_revision))
+    display(
+        await app.set_permissions(
+            args.session,
+            args.mode,
+            args.expected_revision,
+            args.acknowledge_full_access,
+        )
+    )
     return 0
 
 
