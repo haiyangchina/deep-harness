@@ -36,7 +36,7 @@
 - 模型响应 receipt、工具 effect ledger；不确定动作停止，阻挡后继输入。
 - 相对工作区的 UTF-8 文件读取/写入；写入必须审批，覆盖已有文件需要 SHA-256。
 - 会话显式授权的本机命令执行；每次执行需审批，使用绝对可执行文件路径和参数数组，限制时间与输出。
-- 内置能力由 `application/capabilities.py` 单点声明：文件读取与检索、文件写入与编辑、本地命令执行。新会话默认派生 6 个核心工具，无需逐项勾选。
+- 内置能力由 `application/capabilities.py` 单点声明：文件读取与检索、文件写入与编辑、本地命令执行、联网检索与深度研究。新会话默认派生 10 个核心工具（含 4 个 web 工具），无需逐项勾选。
 - 任务取消、优雅排空、未知结果人工对账，以及业务库和 checkpoint 的完整 Profile 备份/新 Profile 还原。
 - 上下文预算与整轮压缩归档、模型调用和工具调用预算、用量统计、模型增量事件。
 - LangGraph interrupt 审批，事件包含可审阅参数，应用重启后可继续审批。
@@ -52,16 +52,72 @@
 - 显式本地模型就绪探测，区分服务不可达、模型缺失和工具能力不足。
 - SQLite schema 版本、升级前自动业务库备份、不可变会话运行快照和安全分支恢复。
 
-当前会话 API 提供 standard 和 deep 引擎。Deep 支持冻结的 coding/research harness、
+当前会话 API 提供 standard 和 deep 引擎。Deep 支持冻结的 coding/research/research_web harness、
 显式授权的同步多 Agent 协作；MCP 支持客户端凭据 OAuth。交互式 OAuth 登录、
 旧桌面 RPC 兼容、Cron 和插件迁移仍待开发。
 完整状态和剩余工作见 [COMPLETION_STATUS.md](COMPLETION_STATUS.md)。
 
+## 联网检索与深度研究
+
+第 4 项内置核心能力提供 4 个只读工具，实现位于 `infrastructure/web/`。设计目标是让
+本地 9B / 32k 模型也能做像样的联网研究：**把多跳循环放在宿主代码里**，而不是让小模型
+自己反复「搜 → 读 → 再搜」。
+
+| 工具 | 行为 |
+|---|---|
+| `web_search` | 按 `[web].routing` 顺序尝试检索后端，首个返回非空结果的后端生效；出错或空结果自动回退。 |
+| `web_fetch` | 读取单个公网 URL，把 HTML 清洗为紧凑正文；`offset` 分页续读。拒绝私网、loopback 与含凭据 URL。 |
+| `web_extract` | 并发读取最多 8 个 URL，共享字符预算，一次审批、一次回灌。 |
+| `web_research` | 一次调用并发多个子查询、按 URL 交错去重、并发补抓正文、裁剪，返回单一带 `[n]` 引用的证据包。 |
+
+所有工具返回的是**证据包**而不是原始网页：标题、URL 与说明由宿主生成，网页正文包在
+`<untrusted-web-content>` 中并明确标注为不可信证据，不进入系统提示或长期记忆。输出按
+`max_chars` 硬封顶，超长内容标注 `[TRUNCATED]`。搜索结果与页面正文使用进程内 TTL 缓存
+和 in-flight 请求合并；原始网页正文不落盘。凭据只以**环境变量名**出现在配置里，不进入
+会话快照。
+
+### 后端与配置
+
+`defaults.toml` 的 `[web]` 段与 `--config` 覆盖文件均可配置。默认检索链为
+`tavily → exa → brave → serper → searxng → bing_cn → ddgs → jina`，只有已配置
+（有 API key、有 SearXNG 地址、已安装 `ddgs`）的后端才进入链；`bing_cn` 免密钥、
+始终可用。API key 不写进 TOML，只引用环境变量名：
+`TAVILY_API_KEY`、`EXA_API_KEY`、`BRAVE_SEARCH_API_KEY`、`SERPER_API_KEY`、
+`JINA_API_KEY`、`FIRECRAWL_API_KEY`。
+
+**国内网络**：`ddgs`（DuckDuckGo）与 `s.jina.ai` / `r.jina.ai` 常读超时，零配置时
+优先使用 `bing_cn`（`cn.bing.com`，直连或经系统代理均可，约 0.4s）。它用标准库
+`HTMLParser` 解析 `li.b_algo`，无额外依赖；**必须发送完整浏览器 User-Agent**，
+否则 Bing 只返回空页或挑战页。自建 SearXNG 设置
+`searxng_url = "http://127.0.0.1:8888"`（运维自有端点，不受私网 URL 校验约束）。页面读取
+默认走 `static`（直接 GET + `trafilatura` 清洗），可用 `extract_routing` 前置 `jina`
+或 `firecrawl`。`allow_private_urls` 默认 `false`。
+
+查询建议：`bing_cn` 对简短关键词效果最好。过长的自然语言查询（例如
+「武汉未来三天天气预报」）可能被 Bing 理解为城市实体而返回百科/门户页，这与
+`setlang` 参数无关；`web_research` 的子查询建议控制在 3–6 个关键词。
+
+### 审批与 Deep 研究模式
+
+4 个工具由 `permissions.classify()` 显式归入 `internet:external`，属于
+`ALWAYS_PER_CALL`：`ask`/`auto` 逐次确认，`full` 免批但写 `approval.exempt`，`legacy`
+同样要求逐项批准。把批量抓取收进 `web_research` 的一次调用可避免逐次弹窗。
+
+Deep 引擎新增 `research_web` harness：引导模型先做一次 `web_research`，只对分歧点补
+`web_fetch`/`web_extract`，并用 `delegate_task` 并行独立子问题（子任务继承只读核心工具，
+因此同样能联网），最终输出带 `[n]` 引用与 URL 的 JSON 报告。
+
+依赖：`trafilatura>=2,<3`（正文抽取）、`ddgs>=9,<10`（境外免密钥兜底），HTTP 复用既有
+`httpx`；`bing_cn` 只用标准库 `html.parser`，无新依赖。前两者都通过
+`scripts/dependencies.py add` 按有界 spec 安装。
+
 ## 项目分析与 Coding
 
-新建 CLI/HTTP/桌面会话由后端 `derive_grants()` 派生授权，默认授予 6 个核心工具
-`read`、`list_files`、`search_files`、`write`、`edit`、`bash`，对应 3 项内置能力
-（文件读取与检索、文件写入与编辑、本地命令执行）。`GET /profiles/{profile}/capabilities`
+新建 CLI/HTTP/桌面会话由后端 `derive_grants()` 派生授权，默认授予 10 个核心工具
+`read`、`list_files`、`search_files`、`write`、`edit`、`bash` 以及
+`web_search`、`web_fetch`、`web_extract`、`web_research`，对应 4 项内置能力
+（文件读取与检索、文件写入与编辑、本地命令执行、联网检索与深度研究）。
+`GET /profiles/{profile}/capabilities`
 返回能力清单、`capability_version`、三类安全作用域与三档策略矩阵；桌面「能力」页
 与新建会话弹窗都消费这一份事实，不再逐项勾选工具。能力默认授予不等于默认放行：写入与
 命令在执行期仍受批准模式、路径校验和 effect 账本约束。
@@ -69,13 +125,13 @@
 任何 Shell 查询（包括时间、日期、时区）都统一由 `bash` 执行，输出是 Shell 的 stdout
 文本；「本地命令执行」不设子能力，也不为特定命令单列白名单或专用工具。所有命令按同一
 批准模式确认（`ask`/`legacy` 逐次，`auto` 同一轮同类只问第一次，`full` 免批），
-后端不从命令文本推断用途。research / `--read-only` 会话只有 3 个只读工具，
+后端不从命令文本推断用途。research / `--read-only` 会话只有 7 个只读工具，
 没有命令执行能力。CLI 默认引导模型先检查 README、依赖清单、AGENTS.md 和入口文件，
 再根据文件证据介绍功能或修改代码。
 搜索跳过运行状态、常见依赖与构建目录，并限制扫描量和结果大小；结果出现
 `truncated=true` 时应缩小目录/模式或继续读取后续行。
 
-六个核心工具在 Standard、Deep 和获授权的 coding 子任务中使用同一执行网关：
+核心工具在 Standard、Deep 和获授权的 coding 子任务中使用同一执行网关：
 
 | 工具 | 参数与行为 |
 |---|---|
@@ -83,6 +139,10 @@
 | `write` | `path`、`content`；自动创建父目录。覆盖已有文件须传 `read` 返回的 `expected_sha256`。同目录临时文件、fsync 和原子替换避免留下半写文件。 |
 | `edit` | `path`、`old_text`、`new_text`；只接受唯一精确匹配，零匹配或多匹配（包括重叠匹配）均拒绝。可传 `expected_sha256` 检查版本，保留其余内容、BOM 和换行。 |
 | `bash` | `command`、工作区相对 `cwd`、`timeout_seconds`（默认 30，范围 1–120）、`shell`（`auto/bash/powershell`）。支持管道、重定向及 PATH 命令，返回退出码、标准输出和标准错误。每条命令在 ask/legacy 下逐次确认、auto 下同一轮同类只问第一次，`full` 模式免除逐项批准。 |
+| `web_search` | `query`、`max_results`、`max_chars`；按后端链检索，返回带 `[n]` 引用、按字符预算封顶的证据包。 |
+| `web_fetch` | `url`、`max_chars`、`offset`；读取单个公网页面并清洗正文，`offset` 续读。 |
+| `web_extract` | `urls`（最多 8 个）、`max_chars`；并发抓取并共享输出预算。 |
+| `web_research` | `question`、可选 `queries`、`max_sources`、`max_chars`；一次调用完成多查询并发检索、去重、补抓与证据打包。 |
 
 `read/write/edit` 处理最多 8 MiB 的 UTF-8 文件。`read` 每页正文最多 24000 字符，
 用返回的 `next_offset` 和 `next_column` 分别作为下一次的 `offset` 和 `column`，
@@ -101,10 +161,10 @@ USERPROFILE、APPDATA 等），不注入模型供应商密钥。Shell 以当前�
 结果，再通过“我已核对，创建新分支”继续；重启不会清除未知结果记录。
 
 未指定权限模式的 CLI/HTTP 会话沿用 `legacy` 原审批规则，但工具授权统一由后端派生，
-默认就是上述 6 个核心工具；桌面新建会话默认选择“请求批准”。`--allow-write` 与
+默认就是上述 10 个核心工具；桌面新建会话默认选择“请求批准”。`--allow-write` 与
 `--allow-exec` 现在仅是兼容空操作（会在 stderr 提示一次），因为对应能力已默认授予；
 `--allow-memory`、`--allow-delegation`、`--mcp-tool` 仍追加扩展；新增 `--read-only`
-强制只授予 3 个只读工具。HTTP 创建会话可省略 `tools`，改用可选的 `extensions` /
+强制只授予 7 个只读工具。HTTP 创建会话可省略 `tools`，改用可选的 `extensions` /
 `mcp_tools`；显式传 `tools` 仍可用。
 
 旧 `read_file/write_file/run_command` 保留供显式 CLI/HTTP 授予，原参数与 schema 不变；
@@ -147,7 +207,7 @@ Deep 模式同样执行预算检查，但尚不支持 Standard 的整轮自动�
 ## 权限与批准模式
 
 桌面新建会话和输入框右下角提供三种模式。三档只是批准策略，**不授予工具**：内置
-6 个核心工具由 harness 默认授予；`full` 不会额外授予任何工具。三档差异落在同一条轴上：
+10 个核心工具由 harness 默认授予；`full` 不会额外授予任何工具。三档差异落在同一条轴上：
 审批频率与信任半径。
 
 | 模式 | 审批频率 | 信任半径 | 启用门槛 |
@@ -158,14 +218,14 @@ Deep 模式同样执行预算检查，但尚不支持 Standard 的整轮自动�
 
 三类安全作用域（`GET /capabilities` 的 `access_scopes`）：**文件操作**（读取、创建、
 修改、上传、删除此计算机上任意位置文件）、**终端命令**（运行命令、安装软件、修改系统
-设置）、**访问互联网**（访问网站、发送数据、使用已启用连接器）。
+设置）、**访问互联网**（联网检索、读取外部网页、发送数据、使用已启用连接器）。
 
 | 操作 | ask | auto | full |
 |---|---|---|---|
 | 工作区内只读 | 免批 | 免批 | 免批 |
 | 工作区内写入 / 命令 | 每次逐项 | 同一轮同类只问一次 | 免批 |
 | 工作区外 / 敏感路径 | 每次逐项 | 每次逐项（不复用） | 免批 |
-| 互联网 / 连接器 / 持久状态 | 每次逐项 | 每次逐项（不复用） | 免批 |
+| 联网工具 / 互联网 / 连接器 / 持久状态 | 每次逐项 | 每次逐项（不复用） | 免批 |
 
 `auto` 的复用**不是**从命令文本推断安全性：后端 `permissions.py::classify()` 只按工具、
 目标路径与 cwd 归类到作用域，再由 `capabilities.py::PERMISSION_POLICY` 决定
@@ -300,8 +360,8 @@ deep-harness --state-dir .state --workspace . chat "请使用 read_file 工具�
 deep-harness --state-dir .state --workspace . --provider diagnostic chat "/read README.md"
 ~~~
 
-诊断器不是本地大模型；/read、/write 仅为其测试指令。CLI 新会话默认授予 6 个核心工具，
-写入与命令仍需逐项审批；`--read-only` 可强制只授予 3 个只读工具。
+诊断器不是本地大模型；/read、/write 仅为其测试指令。CLI 新会话默认授予 10 个核心工具，
+写入与命令仍需逐项审批；`--read-only` 可强制只授予 7 个只读工具。
 
 ## 连续对话、会话管理与审批
 
@@ -342,8 +402,9 @@ Deep 子任务也必须在建会话时授予 `--allow-delegation`。research 子
 委派 ID 和子会话 ID；`check_delegation` 可在后续回合查询。运行中的 steer 持久排队，
 在当前轮次结束后作为下一轮输入生效；stop 持久阻止后续执行并取消当前执行。
 若取消时外部效果不确定，状态为 `unknown`，不自动重试。排队任务在重启后自动恢复。
-`--harness coding|research` 在创建时冻结；两种模式均要求最终结果符合
-`summary/evidence/changes/tests/limitations` JSON 结构，research 不授予本机写入或命令。
+`--harness coding|research|research_web` 在创建时冻结；三种模式均要求最终结果符合
+`summary/evidence/changes/tests/limitations` JSON 结构，research 与 research_web
+只授予 7 个只读核心工具（含联网检索），不授予本机写入或命令。
 `delegations` 可查看子任务状态和结果；REST 提供
 `GET /profiles/{profile}/sessions/{session}/delegations`。
 HTTP 还提供 `GET .../delegations/{id}`、`POST .../delegations/{id}/steers`

@@ -163,7 +163,7 @@ export function CreateSession({ close }: { close: () => void }) {
   const visibleExtensions = extensionOptions.filter(
     ([tool]) =>
       !(engine === 'standard' && tool === 'delegate_task') &&
-      !(harness === 'research' && tool === 'save_memory')
+      !((harness === 'research' || harness === 'research_web') && tool === 'save_memory')
   )
   return (
     <div className="modal-backdrop">
@@ -200,6 +200,7 @@ export function CreateSession({ close }: { close: () => void }) {
               <option value="general">通用</option>
               <option value="coding">编程</option>
               <option value="research">研究（只读）</option>
+              <option value="research_web">联网深度研究</option>
             </select>
           </label>
         )}
@@ -229,8 +230,8 @@ export function CreateSession({ close }: { close: () => void }) {
             {label}
           </label>
         ))}
-        {harness === 'research' && (
-          <p className="muted small">研究模式仅授予 3 个只读工具，没有命令执行能力。</p>
+        {(harness === 'research' || harness === 'research_web') && (
+          <p className="muted small">研究模式仅授予只读核心工具（含联网检索），没有写入与命令执行能力。</p>
         )}
         <div className="actions">
           <button onClick={close} disabled={busy}>
@@ -344,7 +345,7 @@ export function Capabilities() {
           ))}
           <h2>策略边界</h2>
           <p className="muted small">
-            批准模式、工作区与敏感路径、research 只读契约、冻结快照与上下文预算恒定生效，
+            批准模式、工作区与敏感路径、research / research_web 只读契约、冻结快照与上下文预算恒定生效，
             不受能力清单影响。全访问模式不会授予未启用的扩展能力。
           </p>
           {manifest.hard_boundaries?.map(boundary => (

@@ -47,11 +47,12 @@ npm start
 
 ## 使用方式
 
-- **新建会话**：内置能力（文件读取与检索、文件写入与编辑、本地命令执行）由后端
-  能力清单默认授予，弹窗只展示 3 张只读能力卡，不再逐项勾选工具；扩展能力（保存记忆、
-  Deep 子任务）在折叠区按需开启。侧栏「能力」页可查看清单与版本。选择 Standard
-  或 Deep 引擎；Deep 可选择 general、coding、research。research 只有 3 个只读工具，
-  不能执行命令。显式离线诊断模式不能用于 Deep。
+- **新建会话**：内置能力（文件读取与检索、文件写入与编辑、本地命令执行、联网检索与
+  深度研究）由后端能力清单默认授予，弹窗展示 4 张能力卡，不再逐项勾选工具；扩展能力
+  （保存记忆、Deep 子任务）在折叠区按需开启。侧栏「能力」页可查看清单与版本。选择
+  Standard 或 Deep 引擎；Deep 可选择 general、coding、research、research_web。research
+  与 research_web 只有 7 个只读工具（含联网检索），不能执行写入与命令。显式离线诊断
+  模式不能用于 Deep。
 - **任务工作台**：输入任务并发送，或使用了解项目、功能实现、排错、研究模板。
   模板先填入草稿，发送后才开始执行。Enter 发送，Shift+Enter 换行。
 - **修改与执行**：写入与命令能力默认启用。非完全访问模式下，文件写入、终端命令、
@@ -115,7 +116,7 @@ context_window_tokens = 32768
 npm run dist:win
 ```
 
-生成 `release/deep-harness-1.0.4-x64.exe`（portable 目标）。这是桌面壳的便携包，
+生成 `release/deep-harness-1.0.5-x64.exe`（portable 目标）。这是桌面壳的便携包，
 **不包含 Conda、Python 依赖和 Ollama 模型**。目标 Windows 机器仍须先安装 deep-harness
 独立环境；启动后选择其 Python 路径即可。打包配置已提供，不等于已完成签名/干净机器安装验收。
 尚未提供自动安装 Python/模型的一体化安装器与自动更新。

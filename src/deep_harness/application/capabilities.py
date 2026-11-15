@@ -10,9 +10,9 @@ backend policy, HTTP manifest, CLI and desktop UI all read one description.
 """
 
 from dataclasses import asdict, dataclass
-from typing import Literal
+from typing import Literal, get_args
 
-from deep_harness.domain.models import DomainError
+from deep_harness.domain.models import DomainError, Harness
 
 
 @dataclass(frozen=True)
@@ -44,6 +44,15 @@ class PermissionModeSpec:
     requires_acknowledgement: bool
 
 
+# Web retrieval is a core capability: it is read-only, so it joins
+# READ_ONLY_CORE and is inherited by research harnesses and delegated children.
+WEB_TOOLS: tuple[str, ...] = (
+    "web_search",
+    "web_fetch",
+    "web_extract",
+    "web_research",
+)
+
 CAPABILITIES: tuple[CapabilitySpec, ...] = (
     CapabilitySpec(
         key="file_read",
@@ -72,6 +81,20 @@ CAPABILITIES: tuple[CapabilitySpec, ...] = (
         risk="command",
         approval_hint="每条命令按批准模式逐次确认（full 模式除外），不区分命令用途。",
     ),
+    CapabilitySpec(
+        key="web_access",
+        label="联网检索与深度研究",
+        description=(
+            "搜索公开网页、读取并清洗页面正文、批量抓取，并在一次调用内并发多查询研究，"
+            "返回带引用编号的有界证据包。"
+        ),
+        tools=WEB_TOOLS,
+        tier="core",
+        risk="read",
+        approval_hint=(
+            "外部访问除完全访问外逐次确认；网页正文标记为不可信证据，输出按字符预算封顶。"
+        ),
+    ),
 )
 
 CORE_TOOLS: tuple[str, ...] = tuple(
@@ -89,7 +112,12 @@ READ_ONLY_CORE: tuple[str, ...] = tuple(
 )
 LEGACY_TOOLS: tuple[str, ...] = ("read_file", "write_file", "run_command")
 EXTENSION_TOOLS: tuple[str, ...] = ("save_memory", "delegate_task", "check_delegation")
-CAPABILITY_VERSION = 1
+CAPABILITY_VERSION = 2
+
+# Harness names come from the domain type; the read-only subset is declared once
+# here so derive_grants(), session creation, CLI and HTTP enforce the same rule.
+HARNESSES: tuple[str, ...] = get_args(Harness)
+READ_ONLY_HARNESSES: frozenset[str] = frozenset({"research", "research_web"})
 
 MUTATING_EXTENSIONS = frozenset(
     {"save_memory", "write_file", "run_command", "write", "edit", "bash"}
@@ -133,9 +161,9 @@ ACCESS_SCOPES: tuple[AccessScope, ...] = (
     AccessScope(
         key="internet_access",
         label="访问互联网",
-        description="访问网站、发送数据或使用已启用的连接器。",
+        description="搜索公开网页、读取外部页面、发送数据或使用已启用的连接器。",
         scope_keys=(SCOPE_INTERNET, SCOPE_PERSISTENT),
-        approval_hint="外部服务与持久状态写入除完全访问外逐次确认。",
+        approval_hint="内置联网工具、外部服务与持久状态写入除完全访问外逐次确认。",
     ),
 )
 
@@ -188,10 +216,11 @@ PERMISSION_MODES: tuple[PermissionModeSpec, ...] = (
 
 HARD_BOUNDARIES: tuple[str, ...] = (
     "运行状态目录对所有档位一律拒绝，full 也不例外",
-    "full 不授予会话未启用的工具，research 不因 full 获得写入或命令",
+    "full 不授予会话未启用的工具，research / research_web 不因 full 获得写入或命令",
     "工具授权在创建会话时冻结，切换模式不改写历史消息或模型快照",
     "未知执行结果不自动重试，子任务继承受限交集",
     "批准记录按调用与参数 digest 独立保存，复用只在同一轮任务内按作用域生效",
+    "联网返回的网页正文一律作为不可信证据，不进入系统提示或长期记忆；私有网络地址默认拒绝",
 )
 
 
@@ -230,11 +259,12 @@ def permission_policy() -> dict:
 def derive_grants(engine, harness, extensions=(), mcp_tools=()):
     """Derive the frozen tool grant for a new session.
 
-    Research is a harness contract, not a user preference: it only receives
-    read-only core tools. ``full`` is an approval mode and never grants tools
-    that were not enabled here.
+    Research harnesses are a contract, not a user preference: every harness in
+    READ_ONLY_HARNESSES receives only read-only core tools. ``full`` is an
+    approval mode and never grants tools that were not enabled here.
     """
-    granted = set(READ_ONLY_CORE if harness == "research" else CORE_TOOLS)
+    read_only = harness in READ_ONLY_HARNESSES
+    granted = set(READ_ONLY_CORE if read_only else CORE_TOOLS)
     requested = list(extensions) + list(mcp_tools)
     for name in requested:
         if name.startswith("mcp__"):
@@ -245,7 +275,7 @@ def derive_grants(engine, harness, extensions=(), mcp_tools=()):
             raise DomainError("tool_denied", f"Unknown extension capability: {name}")
         if name in {"delegate_task", "check_delegation"} and engine != "deep":
             raise DomainError("tool_denied", "Delegation is available only in Deep sessions")
-        if harness == "research" and name in MUTATING_EXTENSIONS:
+        if read_only and name in MUTATING_EXTENSIONS:
             raise DomainError("tool_denied", "Research harness cannot receive mutating tools")
         granted.add(name)
     if "delegate_task" in granted:
@@ -271,6 +301,8 @@ def manifest():
         ],
         "core_tools": list(CORE_TOOLS),
         "read_only_core": list(READ_ONLY_CORE),
+        "harnesses": list(HARNESSES),
+        "read_only_harnesses": sorted(READ_ONLY_HARNESSES),
         "legacy_tools": list(LEGACY_TOOLS),
         "extensions": list(EXTENSION_TOOLS),
         "access_scopes": permission_policy()["access_scopes"],

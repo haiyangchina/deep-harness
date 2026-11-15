@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from deep_harness.application.capabilities import manifest
 from deep_harness.application.workspace import PROJECT_PROMPT
-from deep_harness.domain.models import DomainError
+from deep_harness.domain.models import DomainError, Harness
 from deep_harness.runtime.inference import usage_totals
 from deep_harness.transports.events import stream_events
 from deep_harness.transports.operations import operations_router
@@ -27,7 +27,7 @@ class CreateSession(RequestModel):
     prompt: str = Field(default=PROJECT_PROMPT, max_length=32_000)
     tools: tuple[str, ...] | None = None
     engine: Literal["standard", "deep"] = "standard"
-    harness: Literal["general", "coding", "research"] = "general"
+    harness: Harness = "general"
     permission_mode: Literal["ask", "auto", "full"] | None = None
     extensions: tuple[str, ...] = ()
     mcp_tools: tuple[str, ...] = ()

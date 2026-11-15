@@ -13,6 +13,7 @@ from deep_harness.application.capabilities import (
     SCOPE_PERSISTENT,
     SCOPE_SENSITIVE,
     SCOPE_TERMINAL,
+    WEB_TOOLS,
     policy_for,
     reusable,
 )
@@ -49,6 +50,8 @@ def classify(call, scope, resolve_path):
         # No command is inferred safe from its text; every command is
         # classified identically by tool and cwd alone.
         return SCOPE_TERMINAL, "命令可能访问网络、修改文件或产生其他副作用"
+    if call.name in WEB_TOOLS:
+        return SCOPE_INTERNET, "联网检索会向外部服务发出请求并读取网页"
     if call.name.startswith("mcp__"):
         return SCOPE_INTERNET, "外部服务可能访问网络或产生副作用"
     if call.name in MUTATING_TOOLS:
@@ -58,7 +61,11 @@ def classify(call, scope, resolve_path):
 
 def legacy_reason(call):
     """Compatibility row: strict workspace paths, no path resolution here."""
-    if call.name in MUTATING_TOOLS or call.name.startswith("mcp__"):
+    if (
+        call.name in MUTATING_TOOLS
+        or call.name in WEB_TOOLS
+        or call.name.startswith("mcp__")
+    ):
         return "需要逐项批准"
     return None
 

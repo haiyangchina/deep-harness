@@ -51,6 +51,10 @@ def test_policy_table_is_exhaustive(mode):
         ("read", {"path": "../outside.txt"}, "outside:workspace"),
         ("read", {"path": ".env"}, "sensitive:path"),
         ("mcp__srv__tool", {}, "internet:external"),
+        ("web_search", {"query": "latest"}, "internet:external"),
+        ("web_fetch", {"url": "https://example.com"}, "internet:external"),
+        ("web_extract", {"urls": ["https://example.com"]}, "internet:external"),
+        ("web_research", {"question": "compare x and y"}, "internet:external"),
         ("save_memory", {"content": "note"}, "persistent:state"),
     ],
 )

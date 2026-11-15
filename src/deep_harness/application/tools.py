@@ -18,6 +18,12 @@ from deep_harness.application.capabilities import READ_ONLY_SCOPES
 from deep_harness.application.permissions import approval_reason, approval_scope
 from deep_harness.application.shell import BashArgs, bash, shell_command
 from deep_harness.application.terminal import CommandArgs, run_command, validate_command
+from deep_harness.application.web_tools import (
+    WEB_TOOL_ARGUMENTS,
+    WEB_TOOL_DESCRIPTIONS,
+    WEB_TOOL_NAMES,
+    execute_web_tool,
+)
 from deep_harness.application.workspace import (
     MUTATING_TOOLS,
     ListFilesArgs,
@@ -76,6 +82,7 @@ TOOL_ARGUMENTS = {
     "delegate_task": DelegateTaskArgs,
     "check_delegation": CheckDelegationArgs,
 }
+TOOL_ARGUMENTS.update(WEB_TOOL_ARGUMENTS)
 TOOL_DESCRIPTIONS = {
     "read": (
         "Read a workspace-relative UTF-8 file or list a directory. offset is a 1-based line "
@@ -130,6 +137,7 @@ TOOL_DESCRIPTIONS = {
     ),
     "check_delegation": "Read the durable status and latest result of one delegated task.",
 }
+TOOL_DESCRIPTIONS.update(WEB_TOOL_DESCRIPTIONS)
 
 
 def tool_definitions(names: tuple[str, ...], mcp_catalog=None) -> list[dict]:
@@ -167,6 +175,7 @@ class ToolGateway:
         *,
         mcp=None,
         mcp_bindings=None,
+        web_client=None,
     ):
         self.scope = scope
         self.session = session
@@ -174,6 +183,7 @@ class ToolGateway:
         self.claim = claim
         self.mcp = mcp
         self.mcp_bindings = mcp_bindings or {}
+        self.web_client = web_client
 
     def validate(self, call: ToolCall) -> BaseModel:
         if call.name not in self.session.tools:
@@ -261,6 +271,13 @@ class ToolGateway:
                 "command_cwd",
                 "shell_unavailable",
                 "command_argument",
+                "web_url",
+                "web_private_url",
+                "web_disabled",
+                "web_unavailable",
+                "web_timeout",
+                "web_backend",
+                "web_error",
             }
             if not refused and (call.name in MUTATING_TOOLS or (call.name in self.mcp_bindings)):
                 if isinstance(exc, TimeoutError) and isinstance(arguments, (BashArgs, CommandArgs)):
@@ -279,6 +296,8 @@ class ToolGateway:
     async def _preflight(self, call, arguments):
         if call.name in {"delegate_task", "check_delegation"}:
             raise DomainError("tool_denied", "Delegation is managed by the Deep runtime")
+        if call.name in WEB_TOOL_NAMES and self.web_client is None:
+            raise DomainError("web_disabled", "Web retrieval client is not configured")
         if call.name in self.mcp_bindings:
             if self.mcp is None:
                 raise DomainError("mcp_unavailable", "MCP registry is not configured")
@@ -300,6 +319,8 @@ class ToolGateway:
     async def _invoke(self, name, arguments, key):
         if name in self.mcp_bindings:
             return await self.mcp.call(name, arguments, self.mcp_bindings[name]["schema_hash"])
+        if name in WEB_TOOL_NAMES:
+            return await execute_web_tool(name, arguments, self.web_client)
         commands = {"bash": bash, "run_command": run_command}
         if name in commands:
             return json.dumps(await commands[name](arguments, self.path), ensure_ascii=False)

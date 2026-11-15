@@ -9,7 +9,11 @@ from uuid import uuid4
 from filelock import FileLock, Timeout
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from deep_harness.application.capabilities import derive_grants
+from deep_harness.application.capabilities import (
+    HARNESSES,
+    READ_ONLY_HARNESSES,
+    derive_grants,
+)
 from deep_harness.application.config import ExecutionSettings
 from deep_harness.application.curation import CurationService, auto_curation_enabled
 from deep_harness.application.lifecycle import drain_tasks, mutation
@@ -27,6 +31,8 @@ from deep_harness.infrastructure.permissions import change_permissions
 from deep_harness.infrastructure.receipts import ReceiptLedger
 from deep_harness.infrastructure.reconciliation import reconcile
 from deep_harness.infrastructure.store import BusinessStore
+from deep_harness.infrastructure.web import WebClient
+from deep_harness.infrastructure.web.settings import WebSettings
 from deep_harness.runtime.deep import DeepRuntime
 from deep_harness.runtime.mcp import McpRegistry
 from deep_harness.runtime.models import DiagnosticModel
@@ -37,7 +43,15 @@ logger = logging.getLogger(__name__)
 
 class ProfileApplication:
     def __init__(
-        self, scope, model, *, recover_queued=True, execution_limits=None, mcp_objects=None
+        self,
+        scope,
+        model,
+        *,
+        recover_queued=True,
+        execution_limits=None,
+        mcp_objects=None,
+        web_settings=None,
+        web_client=None,
     ):
         self.scope = scope
         self.model = model
@@ -50,6 +64,7 @@ class ProfileApplication:
         self.curator = CurationService(self.store, model)
         self.auto_curate = False
         self.mcp = McpRegistry(scope, objects=mcp_objects)
+        self.web = web_client or WebClient(web_settings or WebSettings())
         self.limits = execution_limits or ExecutionSettings()
         self.sessions = SessionRuntime(self.store, scope, model, self.limits, self.mcp)
         self.resources = AsyncExitStack()
@@ -65,6 +80,7 @@ class ProfileApplication:
         lease = await acquire_lease(self.scope)
         self.resources.callback(lease.release)
         self.resources.push_async_callback(self.mcp.close)
+        self.resources.push_async_callback(self.web.close)
         try:
             await asyncio.to_thread(self.scope.home.mkdir, parents=True, exist_ok=True)
             self.auto_curate = auto_curation_enabled(self.scope.home)
@@ -124,7 +140,7 @@ class ProfileApplication:
             )
         if engine not in {"standard", "deep"}:
             raise DomainError("unknown_engine", "Requested engine is not supported")
-        if harness not in {"general", "coding", "research"}:
+        if harness not in HARNESSES:
             raise DomainError("unknown_harness", "Requested Deep harness is not supported")
         if engine != "deep" and harness != "general":
             raise DomainError("unknown_harness", "Specialized harness requires Deep engine")
@@ -132,7 +148,7 @@ class ProfileApplication:
             tools = derive_grants(engine, harness, extensions, mcp_tools)
         if engine != "deep" and set(tools) & {"delegate_task", "check_delegation"}:
             raise DomainError("tool_denied", "Delegation is available only in Deep sessions")
-        if harness == "research" and set(tools) & MUTATING_TOOLS:
+        if harness in READ_ONLY_HARNESSES and set(tools) & MUTATING_TOOLS:
             raise DomainError("tool_denied", "Research harness cannot receive mutating tools")
         if any(name not in TOOL_ARGUMENTS and not name.startswith("mcp__") for name in tools):
             raise DomainError("unknown_tool", "Requested tool is not supported")
@@ -275,6 +291,7 @@ class ProfileApplication:
             limits=self.limits,
             mcp=self.mcp,
             mcp_bindings=mcp_bindings,
+            web_client=self.web,
         )
         if runtime_type is DeepRuntime:
             kwargs["background_launcher"] = self.launch_background
@@ -525,12 +542,16 @@ class ProjectHost:
         recover_queued=True,
         execution_limits=None,
         mcp_objects=None,
+        web_settings=None,
+        web_clients=None,
     ):
         self.profiles = ProfileResolver(state_dir, workspace)
         self.model_factory = model_factory or (lambda scope: DiagnosticModel())
         self.recover_queued = recover_queued
         self.execution_limits = execution_limits
         self.mcp_objects = mcp_objects or {}
+        self.web_settings = web_settings
+        self.web_clients = web_clients or {}
         self.apps: dict[str, ProfileApplication] = {}
         self.lock = asyncio.Lock()
 
@@ -544,6 +565,8 @@ class ProjectHost:
                     recover_queued=self.recover_queued,
                     execution_limits=self.execution_limits,
                     mcp_objects=self.mcp_objects.get(profile_id),
+                    web_settings=self.web_settings,
+                    web_client=self.web_clients.get(profile_id),
                 ).start()
             return self.apps[profile_id]
 

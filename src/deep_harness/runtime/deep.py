@@ -118,6 +118,7 @@ class DeepRuntime:
         limits,
         mcp=None,
         mcp_bindings=None,
+        web_client=None,
         record_messages=True,
         delegation_id=None,
         model_lock=None,
@@ -144,7 +145,13 @@ class DeepRuntime:
         self.mcp = mcp
         self.tool_specs = tool_definitions(session.tools, mcp_bindings)
         self.gateway = ToolGateway(
-            scope, session, receipts, claim, mcp=mcp, mcp_bindings=mcp_bindings
+            scope,
+            session,
+            receipts,
+            claim,
+            mcp=mcp,
+            mcp_bindings=mcp_bindings,
+            web_client=web_client,
         )
         self.delegations = DelegationLedger(store, executions)
         params = model.model._get_ls_params()
@@ -330,6 +337,7 @@ class DeepRuntime:
             limits=self.limits,
             mcp=self.mcp,
             mcp_bindings=self.gateway.mcp_bindings,
+            web_client=self.gateway.web_client,
             record_messages=False,
             delegation_id=delegation["id"],
             model_lock=self.model_lock,

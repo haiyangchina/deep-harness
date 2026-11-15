@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Literal
 
 PermissionMode = Literal["legacy", "ask", "auto", "full"]
+Harness = Literal["general", "coding", "research", "research_web"]
 
 
 class DomainError(Exception):
@@ -31,7 +32,7 @@ class Session:
     prompt: str
     tools: tuple[str, ...]
     engine: Literal["standard", "deep"]
-    harness: Literal["general", "coding", "research"] = "general"
+    harness: Harness = "general"
     permission_mode: PermissionMode = "legacy"
     permission_revision: int = 0
 

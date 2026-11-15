@@ -52,6 +52,7 @@ class StandardRuntime:
         limits,
         mcp=None,
         mcp_bindings=None,
+        web_client=None,
     ):
         self.session = session
         self.claim = claim
@@ -65,7 +66,13 @@ class StandardRuntime:
             self.model = model.with_tool_specs(self.tool_specs)
         self.context = ContextProjector(store, executions, limits)
         self.gateway = ToolGateway(
-            scope, session, receipts, claim, mcp=mcp, mcp_bindings=mcp_bindings
+            scope,
+            session,
+            receipts,
+            claim,
+            mcp=mcp,
+            mcp_bindings=mcp_bindings,
+            web_client=web_client,
         )
         graph = StateGraph(State)
         graph.add_node("model", self._model)

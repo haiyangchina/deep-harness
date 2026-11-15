@@ -6,6 +6,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from deep_harness.infrastructure.web.settings import WebSettings
+
 
 class ModelSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -63,3 +65,14 @@ def load_model_settings(path: Path | None = None, **overrides) -> ModelSettings:
     settings.update(file_settings)
     settings.update({key: value for key, value in overrides.items() if value is not None})
     return ModelSettings.model_validate(settings)
+
+
+def load_web_settings(path: Path | None = None) -> WebSettings:
+    """Read [web] from packaged defaults, then overlay an operator TOML file."""
+    defaults_path = Path(__file__).parents[1] / "defaults.toml"
+    with defaults_path.open("rb") as stream:
+        settings = dict(tomllib.load(stream).get("web", {}))
+    if path is not None and path.exists():
+        with path.open("rb") as stream:
+            settings.update(tomllib.load(stream).get("web", {}))
+    return WebSettings.model_validate(settings)

@@ -7,7 +7,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 
-from deep_harness.application.capabilities import CORE_TOOLS
+from deep_harness.application.capabilities import CORE_TOOLS, WEB_TOOLS
 from deep_harness.application.permissions import approval_reason
 from deep_harness.application.shell import BashArgs, bash
 from deep_harness.application.tools import TOOL_ARGUMENTS, ToolGateway, tool_definitions
@@ -70,7 +70,15 @@ def test_outside_cwd_reason_is_preserved(tmp_path):
 
 def test_core_grant_has_no_special_case_commands():
     assert "local_time" not in TOOL_ARGUMENTS
-    assert set(CORE_TOOLS) == {"read", "list_files", "search_files", "write", "edit", "bash"}
+    assert set(CORE_TOOLS) == {
+        "read",
+        "list_files",
+        "search_files",
+        "write",
+        "edit",
+        "bash",
+        *WEB_TOOLS,
+    }
     definition = next(spec for spec in tool_definitions(("bash",)) if spec["name"] == "bash")
     description = definition["description"]
     assert "per call" in description

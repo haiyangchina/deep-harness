@@ -278,8 +278,9 @@ async def test_timed_out_shell_effect_is_unknown_and_never_replayed(tmp_path):
         await restarted.close()
 
 
+@pytest.mark.parametrize("harness", ["research", "research_web"])
 @pytest.mark.parametrize("tool", ["write", "edit", "bash"])
-async def test_research_cannot_acquire_mutating_primitives(tmp_path, tool):
+async def test_research_cannot_acquire_mutating_primitives(tmp_path, harness, tool):
     host = ProjectHost(
         tmp_path / "state", tmp_path, lambda scope: LangChainModel(ScriptModel(calls=[]))
     )
@@ -287,7 +288,7 @@ async def test_research_cannot_acquire_mutating_primitives(tmp_path, tool):
         app = await host.application("one")
         with pytest.raises(DomainError, match="Research harness"):
             await app.create_session(
-                "create", "research", (tool,), engine="deep", harness="research"
+                "create", "research", (tool,), engine="deep", harness=harness
             )
     finally:
         await host.close()

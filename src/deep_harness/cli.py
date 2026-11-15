@@ -8,7 +8,12 @@ import secrets
 import sys
 from pathlib import Path
 
-from deep_harness.application.config import load_execution_settings, load_model_settings
+from deep_harness.application.capabilities import HARNESSES
+from deep_harness.application.config import (
+    load_execution_settings,
+    load_model_settings,
+    load_web_settings,
+)
 from deep_harness.bootstrap import ProjectHost
 from deep_harness.domain.models import DomainError
 from deep_harness.runtime.models import DiagnosticModel, ollama_model, openai_model
@@ -33,7 +38,7 @@ def parser():
     chat.add_argument("text")
     chat.add_argument("--session", help="Continue an existing session")
     chat.add_argument("--engine", choices=["standard", "deep"])
-    chat.add_argument("--harness", choices=["general", "coding", "research"])
+    chat.add_argument("--harness", choices=list(HARNESSES))
     chat.add_argument("--permission-mode", choices=["ask", "auto", "full"])
     chat.add_argument(
         "--acknowledge-full-access",
@@ -60,13 +65,13 @@ def parser():
         help="Grant memory saves under the session approval policy",
     )
     chat.add_argument(
-        "--read-only", action="store_true", help="Grant only the three read-only core tools"
+        "--read-only", action="store_true", help="Grant only the read-only core tools"
     )
     chat.add_argument("--submission-id", help="Stable ID for safe submission retries")
     repl = commands.add_parser("repl")
     repl.add_argument("--session")
     repl.add_argument("--engine", choices=["standard", "deep"])
-    repl.add_argument("--harness", choices=["general", "coding", "research"])
+    repl.add_argument("--harness", choices=list(HARNESSES))
     repl.add_argument("--permission-mode", choices=["ask", "auto", "full"])
     repl.add_argument(
         "--acknowledge-full-access",
@@ -167,6 +172,7 @@ def parser():
 
 def build_host(args):
     execution_limits = load_execution_settings(args.config)
+    web_settings = load_web_settings(args.config)
     recover_queued = args.command in {"chat", "repl", "serve", "approve"}
     settings = load_model_settings(
         args.config,
@@ -182,6 +188,7 @@ def build_host(args):
             lambda scope: DiagnosticModel(),
             recover_queued=recover_queued,
             execution_limits=execution_limits,
+            web_settings=web_settings,
         )
     api_key = None
     if settings.provider == "openai":
@@ -211,6 +218,7 @@ def build_host(args):
         factory,
         recover_queued=recover_queued,
         execution_limits=execution_limits,
+        web_settings=web_settings,
     )
 
 
