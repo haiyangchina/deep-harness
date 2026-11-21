@@ -95,7 +95,7 @@ export interface SessionStatus {
   latest_admission: Admission | null
   active_admissions: Admission[]
   approvals: Approval[]
-  runtime: { compatible: boolean; current_fingerprint: string }
+  runtime?: { compatible: boolean; current_fingerprint: string; changed_fields?: string[] }
   active_effects: unknown[]
 }
 export interface JournalEvent {

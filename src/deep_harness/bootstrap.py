@@ -21,7 +21,7 @@ from deep_harness.application.scopes import ProfileResolver
 from deep_harness.application.session_runtime import SessionRuntime
 from deep_harness.application.tools import TOOL_ARGUMENTS
 from deep_harness.application.workspace import CODING_TOOLS, MUTATING_TOOLS, READ_TOOLS
-from deep_harness.domain.models import DomainError
+from deep_harness.domain.models import DomainError, ExecutionClaim
 from deep_harness.infrastructure.archives import create_archive, restore_archive
 from deep_harness.infrastructure.delegations import DelegationLedger
 from deep_harness.infrastructure.executions import ExecutionLedger
@@ -33,6 +33,7 @@ from deep_harness.infrastructure.reconciliation import reconcile
 from deep_harness.infrastructure.store import BusinessStore
 from deep_harness.infrastructure.web import WebClient
 from deep_harness.infrastructure.web.settings import WebSettings
+from deep_harness.runtime.approval_checkpoint import approval_ids, checkpoint_interrupts
 from deep_harness.runtime.deep import DeepRuntime
 from deep_harness.runtime.mcp import McpRegistry
 from deep_harness.runtime.models import DiagnosticModel
@@ -66,9 +67,13 @@ class ProfileApplication:
         self.mcp = McpRegistry(scope, objects=mcp_objects)
         self.web = web_client or WebClient(web_settings or WebSettings())
         self.limits = execution_limits or ExecutionSettings()
-        self.sessions = SessionRuntime(self.store, scope, model, self.limits, self.mcp)
+        self.sessions = SessionRuntime(
+            self.store, scope, model, self.limits, self.mcp, self.web.settings
+        )
         self.resources = AsyncExitStack()
         self.tasks: set[asyncio.Task] = set()
+        self.drains: dict[str, asyncio.Task] = {}
+        self.wakeups: set[str] = set()
         self.locks: dict[str, asyncio.Lock] = {}
         self.saver = None
         self.closing = False
@@ -101,16 +106,39 @@ class ProfileApplication:
             await self.saver.setup()
             queued = await self.executions.recover()
             await self.delegations.reconcile_background()
+            if self.recover_queued:
+                await self.restore_waits()
             for session_id in queued if self.recover_queued else ():
                 self.schedule(session_id)
             decided = await self.receipts.decided_waiting() if self.recover_queued else ()
             for pending in decided:
                 session = await self.store.get_session(pending["session_id"], "operator")
-                await self.resume_decided(session, pending["admission_id"])
+                await self.resume_decided(session, pending["admission_id"], pending["generation"])
         except BaseException:
             await self.resources.aclose()
             raise
         return self
+
+    async def restore_waits(self):
+        for admission in await self.executions.unbound_waits():
+            session = await self.store.get_session(admission.session_id, "operator")
+            try:
+                await self.sessions.validate(session)
+                binding = await self.sessions.policies.get(session.id)
+                runtime = self.runtime(
+                    session,
+                    ExecutionClaim(admission, self.owner),
+                    binding["snapshot"].get("mcp_bindings"),
+                )
+                state = await runtime.graph.aget_state(runtime.config)
+                ids = approval_ids(checkpoint_interrupts(state), admission.generation)
+                await self.executions.bind_wait(admission, ids)
+                if not ids:
+                    logger.warning("No verified approval checkpoint for %s", admission.id)
+            except Exception as exc:
+                logger.warning(
+                    "Approval checkpoint for %s unavailable [%s]", admission.id, type(exc).__name__
+                )
 
     async def close(self, grace_seconds=5):
         async with self.control:
@@ -189,7 +217,22 @@ class ProfileApplication:
         return admission
 
     def schedule(self, session_id: str):
-        self.track(asyncio.create_task(self.drain(session_id)))
+        if self.closing:
+            return
+        self.wakeups.add(session_id)
+        if session_id not in self.drains:
+            task = asyncio.create_task(self.drain_scheduled(session_id))
+            self.drains[session_id] = task
+            self.track(task)
+
+    async def drain_scheduled(self, session_id: str):
+        try:
+            while session_id in self.wakeups and not self.closing:
+                self.wakeups.discard(session_id)
+                await self.drain(session_id)
+        finally:
+            self.wakeups.discard(session_id)
+            self.drains.pop(session_id, None)
 
     def track(self, task: asyncio.Task):
         self.tasks.add(task)
@@ -365,7 +408,9 @@ class ProfileApplication:
             return status
         finally:
             self.active.pop(claim.admission.id, None)
-        await self.executions.settle(claim, result["status"], result["result"])
+        await self.executions.settle(
+            claim, result["status"], result["result"], interactions=result.get("interactions", ())
+        )
         await self.delegations.settle_background(session.id, result["status"], result["result"])
         if result["status"] == "completed" and self.auto_curate:
             self.track(asyncio.create_task(self._curate_completed(session.id)))
@@ -397,18 +442,24 @@ class ProfileApplication:
                 generation,
                 decision,
             )
-            claim = await self.executions.resume(admission_id, session_id, self.owner)
-            self.track(asyncio.create_task(self._resume(session, claim)))
+            claim = await self.executions.resume(
+                admission_id, session_id, self.owner, expected_generation=generation
+            )
+            if claim is not None:
+                self.track(asyncio.create_task(self._resume(session, claim)))
         return admission_id
 
-    async def resume_decided(self, session, admission_id):
+    async def resume_decided(self, session, admission_id, generation):
         try:
             await self.sessions.validate(session)
         except DomainError as exc:
             logger.warning("Approval recovery for %s paused: %s", session.id, exc.code)
             return
-        claim = await self.executions.resume(admission_id, session.id, self.owner)
-        self.track(asyncio.create_task(self._resume(session, claim)))
+        claim = await self.executions.resume(
+            admission_id, session.id, self.owner, expected_generation=generation
+        )
+        if claim is not None:
+            self.track(asyncio.create_task(self._resume(session, claim)))
 
     @mutation
     async def bind_runtime(self, session_id, expected_fingerprint):
@@ -425,12 +476,16 @@ class ProfileApplication:
                     harness=session.harness,
                     knowledge=knowledge,
                     mcp_catalog=catalog,
+                    version=bound["snapshot"].get("version", 1) if bound else 2,
                 ),
                 expected_fingerprint,
             )
+            await self.restore_waits()
             for pending in await self.receipts.decided_waiting():
                 if pending["session_id"] == session_id:
-                    await self.resume_decided(session, pending["admission_id"])
+                    await self.resume_decided(
+                        session, pending["admission_id"], pending["generation"]
+                    )
         self.schedule(session_id)
         return await self.sessions.status(session_id)
 

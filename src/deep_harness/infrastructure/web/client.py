@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 
 import httpx
@@ -42,12 +43,19 @@ class WebClient:
         self._owns_client = client is None
         self.client = client or httpx.AsyncClient(
             timeout=httpx.Timeout(self.settings.request_timeout_seconds),
-            follow_redirects=True,
+            follow_redirects=False,
             headers={"User-Agent": USER_AGENT},
             limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
         )
+        self._public_client = client or httpx.AsyncClient(
+            timeout=httpx.Timeout(self.settings.request_timeout_seconds),
+            trust_env=False,
+            limits=httpx.Limits(max_connections=8, max_keepalive_connections=0),
+        )
         self.providers = (
-            providers if providers is not None else build_providers(self.settings, self.client)
+            providers
+            if providers is not None
+            else build_providers(self.settings, self.client, self._public_client)
         )
         self.search_chain = [
             self.providers[name]
@@ -61,9 +69,11 @@ class WebClient:
             for name in self.settings.extract_routing
             if name in self.providers and self.providers[name].available
         ]
-        self._cache: dict[tuple, tuple[float, object]] = {}
+        self._cache: OrderedDict[tuple, tuple[float, object]] = OrderedDict()
         self._inflight: dict[tuple, asyncio.Task] = {}
         self._lock = asyncio.Lock()
+        self._slots = asyncio.Semaphore(self.settings.max_concurrency)
+        self._closed = False
 
     def _cache_get(self, key: tuple):
         if self.settings.cache_ttl_seconds <= 0:
@@ -75,34 +85,53 @@ class WebClient:
         if time.monotonic() - stamp > self.settings.cache_ttl_seconds:
             self._cache.pop(key, None)
             return None
+        self._cache.move_to_end(key)
         return value
 
     def _cache_set(self, key: tuple, value) -> None:
-        if self.settings.cache_ttl_seconds > 0:
-            self._cache[key] = (time.monotonic(), value)
+        ttl = self.settings.cache_ttl_seconds
+        if ttl <= 0:
+            return
+        now = time.monotonic()
+        for expired, (stamp, _) in tuple(self._cache.items()):
+            if now - stamp > ttl:
+                self._cache.pop(expired)
+        self._cache[key] = (now, value)
+        self._cache.move_to_end(key)
+        while len(self._cache) > self.settings.max_cache_entries:
+            self._cache.popitem(last=False)
 
-    async def _coalesced(self, key: tuple, factory: Callable[[], Awaitable]):
-        """Share one in-flight backend request across concurrent callers."""
-        cached = self._cache_get(key)
-        if cached is not None:
-            return cached
+    async def _produce(self, key, factory, cacheable):
+        try:
+            async with asyncio.timeout(self.settings.total_timeout_seconds):
+                async with self._slots:
+                    result = await factory()
+            if cacheable(result):
+                self._cache_set(key, result)
+            return result
+        finally:
+            self._inflight.pop(key, None)
+
+    async def _coalesced(self, key: tuple, factory: Callable[[], Awaitable], cacheable):
+        """Share one request until its producer finishes, even if a waiter is cancelled."""
         async with self._lock:
+            if self._closed:
+                raise DomainError("web_disabled", "Web client is closed")
+            cached = self._cache_get(key)
+            if cached is not None:
+                return cached
             task = self._inflight.get(key)
             if task is None:
-                task = asyncio.create_task(factory())
+                task = asyncio.create_task(self._produce(key, factory, cacheable))
+                task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
                 self._inflight[key] = task
-        try:
-            return await asyncio.shield(task)
-        finally:
-            async with self._lock:
-                if self._inflight.get(key) is task:
-                    self._inflight.pop(key, None)
+        return await asyncio.shield(task)
 
     async def _search_hits(self, query: str, limit: int):
         key = ("search", query.strip().lower(), limit)
-        result = await self._coalesced(key, lambda: self._search_uncached(query, limit))
-        self._cache_set(key, result)
-        return result
+        return await self._coalesced(
+            key, lambda: self._search_uncached(query, limit), lambda _: True
+        )
 
     async def _search_uncached(self, query: str, limit: int):
         errors: list[str] = []
@@ -131,10 +160,11 @@ class WebClient:
 
     async def _fetch_result(self, url: str) -> FetchResult:
         key = ("fetch", url)
-        result = await self._coalesced(key, lambda: self._fetch_uncached(url))
-        if result.status in {"ok", "partial"}:
-            self._cache_set(key, result)
-        return result
+        return await self._coalesced(
+            key,
+            lambda: self._fetch_uncached(url),
+            lambda result: result.status in {"ok", "partial"},
+        )
 
     async def _fetch_uncached(self, url: str) -> FetchResult:
         errors: list[str] = []
@@ -142,6 +172,8 @@ class WebClient:
             try:
                 result = await provider.fetch(url)
             except DomainError as exc:
+                if exc.code in {"web_url", "web_private_url"}:
+                    raise
                 errors.append(f"{provider.name}:{exc.code}")
                 continue
             except Exception:
@@ -153,6 +185,7 @@ class WebClient:
         return FetchResult(url=url, status="error", note="未能读取页面" + detail)
 
     async def search(self, query: str, limit: int, max_chars: int) -> str:
+        max_chars = min(max_chars, self.settings.max_response_chars)
         hits, provider, skipped = await self._search_hits(query, limit)
         sources = [
             Source(
@@ -167,6 +200,7 @@ class WebClient:
         return evidence_pack(f"联网检索：{query[:80]}", sources, budget=max_chars, meta=meta)
 
     async def fetch(self, url: str, max_chars: int, offset: int = 0) -> str:
+        max_chars = min(max_chars, self.settings.max_response_chars)
         url = validate_public_url(url, allow_private=self.settings.allow_private_urls)
         result = await self._fetch_result(url)
         if not result.text:
@@ -177,14 +211,20 @@ class WebClient:
                 meta=f"URL={url}；状态={result.status}；{result.note}",
             )
         remaining = result.text[offset:]
-        truncated = len(remaining) > max_chars
+        truncated = len(remaining) > max_chars or result.truncated
+        next_offset = offset + max_chars if len(remaining) > max_chars else None
         source = Source(
             title=result.title,
-            url=url,
+            url=result.url or url,
             text=remaining[:max_chars],
             provider=result.provider,
             note=(
-                f"offset={offset}；{'内容已截断，可增大 offset 续读' if truncated else '完整读取'}"
+                f"offset={offset}；"
+                + (
+                    f"内容已截断，next_offset={next_offset}"
+                    if next_offset is not None
+                    else "已达正文提取上限" if truncated else "完整读取"
+                )
             ),
         )
         return evidence_pack(
@@ -195,9 +235,9 @@ class WebClient:
         )
 
     async def extract(self, urls: list[str], max_chars: int) -> str:
+        max_chars = min(max_chars, self.settings.max_response_chars)
         validated = [
-            validate_public_url(url, allow_private=self.settings.allow_private_urls)
-            for url in urls
+            validate_public_url(url, allow_private=self.settings.allow_private_urls) for url in urls
         ]
         results = await asyncio.gather(
             *(self._safe_fetch(url) for url in validated), return_exceptions=False
@@ -233,17 +273,19 @@ class WebClient:
         if not effective:
             effective = [question]
         effective = effective[: self.settings.max_queries]
+        max_sources = min(max_sources, self.settings.max_sources)
+        max_chars = min(max_chars, self.settings.max_response_chars)
         limit = max(3, min(8, max_sources))
-        semaphore = asyncio.Semaphore(self.settings.max_concurrency)
 
         async def one(query: str):
-            async with semaphore:
-                try:
-                    return await self._search_hits(query, limit)
-                except DomainError:
-                    return [], "unavailable", ["all backends failed"]
+            try:
+                return await self._search_hits(query, limit)
+            except (DomainError, TimeoutError):
+                return [], "unavailable", ["all backends failed"]
 
         bundles = await asyncio.gather(*(one(query) for query in effective))
+        if all(bundle[1] == "unavailable" for bundle in bundles):
+            raise DomainError("web_unavailable", "所有研究子查询的检索后端均不可用")
         ranked = [list(bundle[0]) for bundle in bundles]
         merged: list[SearchHit] = []
         seen: set[str] = set()
@@ -252,8 +294,14 @@ class WebClient:
                 if position >= len(hits):
                     continue
                 hit = hits[position]
-                key = normalize_url(hit.url)
-                if not hit.url or key in seen:
+                try:
+                    public = validate_public_url(
+                        hit.url, allow_private=self.settings.allow_private_urls
+                    )
+                except DomainError:
+                    continue
+                key = normalize_url(public)
+                if key in seen:
                     continue
                 seen.add(key)
                 merged.append(hit)
@@ -266,16 +314,13 @@ class WebClient:
             if hit.text.strip():
                 return hit
             try:
-                url = validate_public_url(
-                    hit.url, allow_private=self.settings.allow_private_urls
-                )
+                url = validate_public_url(hit.url, allow_private=self.settings.allow_private_urls)
             except DomainError:
                 return hit
-            async with semaphore:
-                try:
-                    result = await self._fetch_result(url)
-                except DomainError:
-                    return hit
+            try:
+                result = await self._fetch_result(url)
+            except (DomainError, TimeoutError):
+                return hit
             if not result.text:
                 return hit
             return SearchHit(
@@ -297,9 +342,10 @@ class WebClient:
             for hit in enriched
         ]
         providers = ",".join(dict.fromkeys(bundle[1] for bundle in bundles))
+        failures = sum(bundle[1] == "unavailable" for bundle in bundles)
         meta = (
             f"问题={question[:100]}；子查询={len(effective)}；"
-            f"后端={providers}；去重后来源={len(sources)}"
+            f"后端={providers}；失败子查询={failures}；去重后来源={len(sources)}"
         )
         return evidence_pack(f"深度联网研究：{question[:80]}", sources, budget=max_chars, meta=meta)
 
@@ -315,5 +361,12 @@ class WebClient:
         }
 
     async def close(self) -> None:
+        async with self._lock:
+            self._closed = True
+            tasks = tuple(self._inflight.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._cache.clear()
         if self._owns_client:
-            await self.client.aclose()
+            await asyncio.gather(self.client.aclose(), self._public_client.aclose())

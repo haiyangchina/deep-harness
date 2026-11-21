@@ -1,6 +1,6 @@
 """Receipts for model responses, effects and human decisions."""
 
-from sqlalchemy import insert, select, update
+from sqlalchemy import func, insert, select, update
 
 from deep_harness.domain.models import DomainError, ExecutionClaim
 from deep_harness.infrastructure import schema as s
@@ -31,23 +31,6 @@ class ReceiptLedger:
         if row["request_hash"] != request_hash:
             raise DomainError("snapshot_mismatch", "Model replay request changed")
         return row["response"]
-
-    async def approved(self, key: str, digest: str) -> bool:
-        async with self.store.engine.connect() as conn:
-            row = (
-                (
-                    await conn.execute(
-                        select(s.interactions).where(
-                            s.interactions.c.id == key,
-                        )
-                    )
-                )
-                .mappings()
-                .first()
-            )
-        if row is not None and row["proposal_hash"] != digest:
-            raise DomainError("interaction_conflict", "Approval proposal changed")
-        return row is not None and row["decision"] == "approve"
 
     async def save_model(
         self,
@@ -107,9 +90,31 @@ class ReceiptLedger:
             )
             return None
 
-    async def dispatch_effect(self, claim: ExecutionClaim, key: str):
+    async def dispatch_effect(self, claim: ExecutionClaim, key: str, *, approval=None, audit=None):
         async with self.store.transaction() as conn:
             await self.executions.assert_claim(conn, claim)
+            if approval is not None:
+                digest, scope_key, revision, reusable = approval
+                row = (
+                    await conn.execute(
+                        select(s.interactions.c.proposal_hash, s.interactions.c.decision).where(
+                            s.interactions.c.id == key
+                        )
+                    )
+                ).first()
+                if row is not None and row.proposal_hash != digest:
+                    raise DomainError("interaction_conflict", "Approval proposal changed")
+                if row is not None and row.decision == "approve":
+                    source = "direct"
+                elif (
+                    row is None
+                    and reusable
+                    and await self._scope_granted(conn, claim, scope_key, revision, key)
+                ):
+                    source = "reuse"
+                else:
+                    raise DomainError("approval_missing", "This operation needs a durable approval")
+                audit = (source, scope_key, audit[2])
             result = await conn.execute(
                 update(s.effects)
                 .where(
@@ -120,6 +125,23 @@ class ReceiptLedger:
             )
             if result.rowcount != 1:
                 raise DomainError("unknown_effect", "Effect cannot be dispatched again")
+            if audit is not None:
+                source, scope_key, tool_name = audit
+                kind = {"reuse": "approval.reused", "full": "approval.exempt"}.get(
+                    source, "approval.dispatched"
+                )
+                await self.store.append_event(
+                    conn,
+                    claim.admission.session_id,
+                    kind,
+                    {
+                        "admission_id": claim.admission.id,
+                        "effect_id": key,
+                        "scope_key": scope_key,
+                        "tool_name": tool_name,
+                        "source": source,
+                    },
+                )
 
     async def save_effect(self, claim: ExecutionClaim, key: str, result: str):
         async with self.store.transaction() as conn:
@@ -194,46 +216,33 @@ class ReceiptLedger:
         explicitly allowed to be reused under the same permission revision.
         """
         async with self.store.engine.connect() as conn:
-            revoked = await conn.execute(
-                select(s.events.c.payload).where(
-                    s.events.c.session_id == claim.admission.session_id,
-                    s.events.c.type == "approval.reuse_revoked",
-                )
-            )
-            if any(
-                row["payload"].get("admission_id") == claim.admission.id
-                for row in revoked.mappings()
-            ):
-                return False
-            query = select(s.interactions.c.id, s.interactions.c.proposal).where(
-                s.interactions.c.admission_id == claim.admission.id,
-                s.interactions.c.decision == "approve",
-            )
-            if exclude_key is not None:
-                query = query.where(s.interactions.c.id != exclude_key)
-            rows = await conn.execute(query)
-        return any(
-            row["proposal"].get("scope_key") == scope_key
-            and row["proposal"].get("reusable") is True
-            and row["proposal"].get("permission_revision") == revision
-            for row in rows.mappings()
-        )
+            return await self._scope_granted(conn, claim, scope_key, revision, exclude_key)
 
-    async def record_approval_event(self, claim, kind, scope_key, tool_name):
-        async with self.store.transaction() as conn:
-            await self.store.append_event(
-                conn,
-                claim.admission.session_id,
-                kind,
-                {
-                    "admission_id": claim.admission.id,
-                    "scope_key": scope_key,
-                    "tool_name": tool_name,
-                },
+    async def _scope_granted(self, conn, claim, scope_key, revision, exclude_key):
+        if await conn.scalar(
+            select(s.approval_revocations.c.admission_id).where(
+                s.approval_revocations.c.admission_id == claim.admission.id
             )
+        ):
+            return False
+        query = select(s.interactions.c.id).where(
+            s.interactions.c.admission_id == claim.admission.id,
+            s.interactions.c.decision == "approve",
+            s.interactions.c.proposal["scope_key"].as_string() == scope_key,
+            s.interactions.c.proposal["reusable"].as_boolean().is_(True),
+            s.interactions.c.proposal["permission_revision"].as_integer() == revision,
+        )
+        if exclude_key is not None:
+            query = query.where(s.interactions.c.id != exclude_key)
+        return await conn.scalar(query.limit(1)) is not None
 
     async def revoke_reuse(self, session_id: str, admission_id: str):
         async with self.store.transaction() as conn:
+            await conn.execute(
+                insert(s.approval_revocations)
+                .prefix_with("OR IGNORE")
+                .values(admission_id=admission_id)
+            )
             await self.store.append_event(
                 conn,
                 session_id,
@@ -242,13 +251,33 @@ class ReceiptLedger:
             )
 
     async def decided_waiting(self) -> list[dict]:
+        current = func.json_each(s.approval_waits.c.interaction_ids).table_valued("value")
+        decided_count = (
+            select(func.count())
+            .select_from(current.join(s.interactions, s.interactions.c.id == current.c.value))
+            .where(
+                s.interactions.c.decision.is_not(None),
+                s.interactions.c.admission_id == s.approval_waits.c.admission_id,
+            )
+            .correlate(s.approval_waits)
+            .scalar_subquery()
+        )
         async with self.store.engine.connect() as conn:
             rows = await conn.execute(
-                select(s.interactions.c.admission_id, s.interactions.c.session_id)
-                .join(s.admissions, s.admissions.c.id == s.interactions.c.admission_id)
+                select(
+                    s.admissions.c.id.label("admission_id"),
+                    s.admissions.c.session_id,
+                    s.approval_waits.c.generation,
+                )
+                .join(
+                    s.approval_waits,
+                    (s.approval_waits.c.admission_id == s.admissions.c.id)
+                    & (s.approval_waits.c.generation == s.admissions.c.generation),
+                )
                 .where(
-                    s.interactions.c.decision.is_not(None),
                     s.admissions.c.status == "waiting_approval",
+                    func.json_array_length(s.approval_waits.c.interaction_ids) > 0,
+                    func.json_array_length(s.approval_waits.c.interaction_ids) == decided_count,
                 )
             )
             return [dict(row) for row in rows.mappings()]
@@ -289,6 +318,14 @@ class ReceiptLedger:
                 raise DomainError("already_decided", "Approval has already been answered")
             if row["status"] != "waiting_approval":
                 raise DomainError("not_waiting", "Execution is not waiting")
+            current = await conn.scalar(
+                select(s.approval_waits.c.interaction_ids).where(
+                    s.approval_waits.c.admission_id == row["admission_id"],
+                    s.approval_waits.c.generation == generation,
+                )
+            )
+            if current is None or key not in current:
+                raise DomainError("stale_approval", "Approval is not a verified current pause")
             await conn.execute(
                 update(s.interactions)
                 .where(

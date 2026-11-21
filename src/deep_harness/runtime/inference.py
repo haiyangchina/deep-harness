@@ -2,7 +2,7 @@
 
 import json
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from deep_harness.domain.models import DomainError
 from deep_harness.infrastructure import schema as s
@@ -10,26 +10,27 @@ from deep_harness.runtime.models import with_timeout
 
 
 async def usage_totals(store, session_id, admission_id=None):
+    usage = s.model_receipts.c.response["usage"]
     query = (
-        select(s.model_receipts.c.response)
-        .join(
-            s.admissions,
-            s.admissions.c.id == s.model_receipts.c.admission_id,
+        select(
+            func.count().label("model_calls"),
+            func.coalesce(func.sum(usage["input_tokens"].as_integer()), 0).label("input_tokens"),
+            func.coalesce(func.sum(usage["output_tokens"].as_integer()), 0).label("output_tokens"),
+            func.coalesce(func.sum(usage["total_tokens"].as_integer()), 0).label("total_tokens"),
+            func.coalesce(func.max(usage["estimated"].as_boolean()), False).label(
+                "contains_estimates"
+            ),
         )
+        .select_from(s.model_receipts)
+        .join(s.admissions, s.admissions.c.id == s.model_receipts.c.admission_id)
         .where(s.admissions.c.session_id == session_id)
     )
     if admission_id is not None:
-        query = query.where(s.admissions.c.id == admission_id)
+        query = query.where(s.model_receipts.c.admission_id == admission_id)
     async with store.engine.connect() as conn:
-        responses = list((await conn.execute(query)).scalars())
-    usage = [response.get("usage", {}) for response in responses]
-    return {
-        "model_calls": len(responses),
-        "input_tokens": sum(row.get("input_tokens", 0) for row in usage),
-        "output_tokens": sum(row.get("output_tokens", 0) for row in usage),
-        "total_tokens": sum(row.get("total_tokens", 0) for row in usage),
-        "contains_estimates": any(row.get("estimated", False) for row in usage),
-    }
+        totals = dict((await conn.execute(query)).mappings().one())
+        totals["contains_estimates"] = bool(totals["contains_estimates"])
+        return totals
 
 
 def normalized_usage(response, prompt, messages):

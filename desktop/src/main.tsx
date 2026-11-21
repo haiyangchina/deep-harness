@@ -14,6 +14,7 @@ import {
   openSession,
   perform,
   refreshConversation,
+  loadOlderMessages,
   resetView,
   report,
   storageKey
@@ -159,6 +160,19 @@ function Chat({ newSession }: { newSession: () => void }) {
               </p>
             </section>
           )}
+          {conversation?.hasOlderMessages && (
+            <button onClick={event => {
+              const panel = event.currentTarget.closest('.transcript')
+              const height = panel?.scrollHeight ?? 0
+              follow.current = false
+              void perform(async () => {
+                await loadOlderMessages()
+                requestAnimationFrame(() => {
+                  if (panel) panel.scrollTop += panel.scrollHeight - height
+                })
+              })
+            }}>加载更早的消息</button>
+          )}
           {conversation?.messages
             .filter(message => message.content !== '' && message.content !== null)
             .map((message, index) => (
@@ -200,8 +214,12 @@ function Chat({ newSession }: { newSession: () => void }) {
               reasoning 为 false，或换用非思考模型，然后新建会话重试。
             </p>
           )}
-          {status?.runtime.compatible === false && (
-            <p className="notice">当前模型或工具配置与会话快照不同。请恢复原配置，或审阅后新建分支。</p>
+          {status?.runtime?.compatible === false && (
+            <p className="notice">
+              当前配置与会话快照不同。请恢复原配置，或审阅后新建分支。
+              {status.runtime.changed_fields?.length
+                ? ` 差异字段 ${status.runtime.changed_fields.join('、')}` : ''}
+            </p>
           )}
           {uncertain && (
             <div className="notice">

@@ -23,6 +23,8 @@ class WebSettings(BaseModel):
     max_sources: int = Field(default=6, ge=1, le=12)
     max_queries: int = Field(default=4, ge=1, le=8)
     max_concurrency: int = Field(default=4, ge=1, le=8)
+    total_timeout_seconds: float = Field(default=30, gt=0, le=180)
+    max_cache_entries: int = Field(default=128, ge=1, le=1024)
     cache_ttl_seconds: int = Field(default=300, ge=0, le=86_400)
     allow_private_urls: bool = False
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -77,24 +79,25 @@ async def execute_web_tool(name: str, arguments, client: WebClient | None) -> st
     if client is None or not client.settings.enabled:
         raise DomainError("web_disabled", "联网检索未启用（[web] enabled = false）")
     try:
-        if name == "web_search":
-            return await client.search(
-                arguments.query, arguments.max_results, arguments.max_chars
-            )
-        if name == "web_fetch":
-            return await client.fetch(arguments.url, arguments.max_chars, arguments.offset)
-        if name == "web_extract":
-            for url in arguments.urls:
-                if len(url) > 2048:
-                    raise DomainError("web_url", "URL exceeds 2048 characters")
-            return await client.extract(arguments.urls, arguments.max_chars)
-        if name == "web_research":
-            return await client.research(
-                arguments.question,
-                arguments.queries,
-                arguments.max_sources,
-                arguments.max_chars,
-            )
+        async with asyncio.timeout(client.settings.total_timeout_seconds):
+            if name == "web_search":
+                return await client.search(
+                    arguments.query, arguments.max_results, arguments.max_chars
+                )
+            if name == "web_fetch":
+                return await client.fetch(arguments.url, arguments.max_chars, arguments.offset)
+            if name == "web_extract":
+                for url in arguments.urls:
+                    if len(url) > 2048:
+                        raise DomainError("web_url", "URL exceeds 2048 characters")
+                return await client.extract(arguments.urls, arguments.max_chars)
+            if name == "web_research":
+                return await client.research(
+                    arguments.question,
+                    arguments.queries,
+                    arguments.max_sources,
+                    arguments.max_chars,
+                )
     except DomainError:
         raise
     except (httpx.TimeoutException, TimeoutError, OSError) as exc:

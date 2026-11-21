@@ -72,9 +72,9 @@
 
 所有工具返回的是**证据包**而不是原始网页：标题、URL 与说明由宿主生成，网页正文包在
 `<untrusted-web-content>` 中并明确标注为不可信证据，不进入系统提示或长期记忆。输出按
-`max_chars` 硬封顶，超长内容标注 `[TRUNCATED]`。搜索结果与页面正文使用进程内 TTL 缓存
-和 in-flight 请求合并；原始网页正文不落盘。凭据只以**环境变量名**出现在配置里，不进入
-会话快照。
+工具的字符预算裁剪，超长正文标注 `[TRUNCATED]`，抓取还可返回续读游标。
+搜索与页面正文使用 Profile 级并发限制、有界 TTL 缓存和在途请求合并。原始 HTTP 响应
+只在内存中处理，输出的工具证据随会话持久化。凭据值从环境变量读取。
 
 ### 后端与配置
 
@@ -90,8 +90,11 @@
 `HTMLParser` 解析 `li.b_algo`，无额外依赖；**必须发送完整浏览器 User-Agent**，
 否则 Bing 只返回空页或挑战页。自建 SearXNG 设置
 `searxng_url = "http://127.0.0.1:8888"`（运维自有端点，不受私网 URL 校验约束）。页面读取
-默认走 `static`（直接 GET + `trafilatura` 清洗），可用 `extract_routing` 前置 `jina`
-或 `firecrawl`。`allow_private_urls` 默认 `false`。
+默认走 `static`（直接 GET + `trafilatura` 清洗）。公网直抓不使用环境代理，
+校验 DNS 地址与每次重定向，并限制响应体大小。`allow_private_urls` 默认 `false`。
+`extract_routing` 可显式选择 `jina` 或 `firecrawl`，远端抓取的网络范围由该服务负责。
+`total_timeout_seconds` 控制工具总时限，`max_concurrency` 和 `max_cache_entries`
+分别限制 Profile 的请求并发与缓存规模。
 
 查询建议：`bing_cn` 对简短关键词效果最好。过长的自然语言查询（例如
 「武汉未来三天天气预报」）可能被 Bing 理解为城市实体而返回百科/门户页，这与
@@ -105,7 +108,8 @@
 
 Deep 引擎新增 `research_web` harness：引导模型先做一次 `web_research`，只对分歧点补
 `web_fetch`/`web_extract`，并用 `delegate_task` 并行独立子问题（子任务继承只读核心工具，
-因此同样能联网），最终输出带 `[n]` 引用与 URL 的 JSON 报告。
+因此同样能联网），最终输出带 `[n]` 引用与 URL 的 JSON 报告。研究模式的只读契约
+适用于内置工具。显式授权的 MCP 工具由连接器实现决定实际副作用，并按会话策略审批。
 
 依赖：`trafilatura>=2,<3`（正文抽取）、`ddgs>=9,<10`（境外免密钥兜底），HTTP 复用既有
 `httpx`；`bing_cn` 只用标准库 `html.parser`，无新依赖。前两者都通过
@@ -612,14 +616,14 @@ SSE 不持有模型执行任务，客户端断线不会取消已接纳任务。
 Python 测试始终使用仓库 runner。在仓库根目录的 PowerShell：
 
 ~~~powershell
-$env:Harness_PYTHON = "/d/ProgramData/miniconda3/envs/deep-harness/python.exe"
-& "C:\Program Files\Git\bin\bash.exe" scripts/run_tests.sh deep-harness/tests -j 2 -- -c deep-harness/pyproject.toml -q
-python -m ruff check deep-harness/src deep-harness/tests deep-harness/scripts --config deep-harness/pyproject.toml
-python scripts/check --only health --base HEAD
+conda activate deep-harness
+$env:Harness_PYTHON = (Get-Command python.exe).Source -replace '\\', '/'
+& "C:\Program Files\Git\bin\bash.exe" scripts/run_tests.sh -q
+python -m ruff check src tests scripts --config pyproject.toml
 ~~~
 
-最后两条命令需已激活 deep-harness。不要从仓库根目录运行宽泛的 ruff format tests scripts；
-检查与格式化必须显式限定 deep-harness 下的路径。
+Runner 固定使用仓库的 pytest 配置，额外参数直接传给 pytest。测试使用临时状态目录及
+确定性模型，默认无需 Ollama 或公网服务。
 
 ## 当前限制
 

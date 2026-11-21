@@ -16,9 +16,9 @@ from langchain.agents.middleware import AgentMiddleware, ModelResponse
 from langchain.tools import ToolRuntime
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import StructuredTool
-from langgraph.types import Command, interrupt
+from langgraph.types import interrupt
 from pydantic import ValidationError
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from deep_harness.application.tools import ToolGateway, tool_definitions
 from deep_harness.application.workspace import CODING_TOOLS, READ_TOOLS
@@ -27,6 +27,7 @@ from deep_harness.domain.models import DomainError, ToolCall
 from deep_harness.infrastructure import schema as s
 from deep_harness.infrastructure.branches import BranchLedger
 from deep_harness.infrastructure.delegations import DelegationLedger
+from deep_harness.runtime.approval_checkpoint import approval_ids, resume_command
 from deep_harness.runtime.harnesses import harness_prompt, parse_report
 from deep_harness.runtime.inference import normalized_usage, usage_totals
 from deep_harness.runtime.models import LangChainModel, model_errors, to_langchain
@@ -209,13 +210,15 @@ class DeepRuntime:
                 arguments,
             )
             try:
+                await self.executions.reserve_tools(
+                    self.claim, (call.id,), self.limits.max_tool_calls
+                )
                 self.gateway.validate(call)
                 existing = await self._tool_message(call)
                 if existing is not None:
                     return existing
                 if original == "delegate_task":
                     async with self.tool_lock:
-                        await self._check_tool_budget(call)
                         delegation = await self.delegations.begin(self.claim, call)
                     result = await self._delegate(call, delegation)
                 elif original == "check_delegation":
@@ -238,12 +241,20 @@ class DeepRuntime:
                     )
                 else:
                     async with self.tool_lock:
-                        await self._check_tool_budget(call)
                         required = self.gateway.approval_reason(call) is not None
                         if required and not await self._approval(call):
                             result = "Tool denied by user."
                         else:
-                            result = await self.gateway.execute(call)
+                            try:
+                                result = await self.gateway.execute(call)
+                            except DomainError as exc:
+                                if exc.code != "approval_missing":
+                                    raise
+                                result = (
+                                    await self.gateway.execute(call)
+                                    if await self._approval(call)
+                                    else "Tool denied by user."
+                                )
             except (ValidationError, OSError, UnicodeError) as exc:
                 result = f"Tool error: {type(exc).__name__}: {exc}"
             except DomainError as exc:
@@ -352,7 +363,7 @@ class DeepRuntime:
             await self.delegations.finish(self.claim, delegation["id"], result)
             return result
         value = (
-            Command(resume=True)
+            resume_command(checkpoint)
             if checkpoint.next
             else {"messages": [HumanMessage(id=f"{call.id}:task", content=call.arguments["task"])]}
         )
@@ -361,38 +372,16 @@ class DeepRuntime:
             config=child.config,
             durability="sync",
         )
-        if result.get("__interrupt__"):
-            interrupt(result["__interrupt__"][0].value)
+        if pending := result.get("__interrupt__"):
+            interrupt(
+                {
+                    **pending[0].value,
+                    "interaction_ids": approval_ids(pending, self.claim.admission.generation),
+                }
+            )
         answer = result["messages"][-1].content
         await self.delegations.finish(self.claim, delegation["id"], answer)
         return answer
-
-    async def _check_tool_budget(self, call):
-        count = await self._tool_count()
-        async with self.store.engine.connect() as conn:
-            table = s.delegations if call.name == "delegate_task" else s.effects
-            key = (
-                f"{self.claim.admission.id}:delegate:{call.id}"
-                if call.name == "delegate_task"
-                else f"{self.claim.admission.id}:{call.id}"
-            )
-            known = await conn.execute(select(table.c.id).where(table.c.id == key))
-        if count >= self.limits.max_tool_calls and known.scalar_one_or_none() is None:
-            raise DomainError("budget_exhausted", "Per-run tool call budget exhausted")
-
-    async def _tool_count(self):
-        async with self.store.engine.connect() as conn:
-            effects = await conn.execute(
-                select(func.count())
-                .select_from(s.effects)
-                .where(s.effects.c.admission_id == self.claim.admission.id)
-            )
-            delegated = await conn.execute(
-                select(func.count())
-                .select_from(s.delegations)
-                .where(s.delegations.c.admission_id == self.claim.admission.id)
-            )
-            return effects.scalar_one() + delegated.scalar_one()
 
     async def _approval(self, call):
         key = f"{self.claim.admission.id}:{call.id}"
@@ -401,9 +390,6 @@ class DeepRuntime:
         if can_reuse and await self.receipts.scope_granted(
             self.claim, scope_key, self.session.permission_revision, exclude_key=key
         ):
-            await self.receipts.record_approval_event(
-                self.claim, "approval.reused", scope_key, call.name
-            )
             return True
         proposal = {"tool_name": call.name, "arguments": call.arguments}
         if self.session.permission_mode != "legacy":
@@ -432,7 +418,7 @@ class DeepRuntime:
 
     async def run(self, *, resume=False):
         if resume:
-            value = Command(resume=True)
+            value = resume_command(await self.graph.aget_state(self.config))
         else:
             checkpoint = await self.graph.aget_state(self.config)
             inherited = (
@@ -448,7 +434,13 @@ class DeepRuntime:
             }
         result = await self.graph.ainvoke(value, config=self.config, durability="sync")
         if result.get("__interrupt__"):
-            return {"status": "waiting_approval", "result": None}
+            return {
+                "status": "waiting_approval",
+                "result": None,
+                "interactions": approval_ids(
+                    result["__interrupt__"], self.claim.admission.generation
+                ),
+            }
         answer = result["messages"][-1].content
         if self.session.harness != "general":
             answer = parse_report(answer)

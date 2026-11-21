@@ -18,6 +18,7 @@ from deep_harness.domain.models import DomainError
 from deep_harness.infrastructure.web.bing_cn import BROWSER_UA, parse_bing_results
 from deep_harness.infrastructure.web.extract import MAX_HTML_BYTES, extract_text
 from deep_harness.infrastructure.web.models import FetchResult, SearchHit
+from deep_harness.infrastructure.web.security import resolve_fetch_addresses, validate_public_url
 
 USER_AGENT = "deep-harness/1.0 (bounded web research)"
 MAX_BACKEND_TEXT = 64_000
@@ -279,9 +280,7 @@ class JinaProvider(HttpProvider):
         return _parse_jina_search(response.text[:MAX_BACKEND_TEXT], limit, self.name)
 
     async def fetch(self, url: str) -> FetchResult | None:
-        response = await self._request(
-            "GET", f"https://r.jina.ai/{url}", headers=self._headers()
-        )
+        response = await self._request("GET", f"https://r.jina.ai/{url}", headers=self._headers())
         text = response.text[:MAX_BACKEND_TEXT].strip()
         if not text:
             return None
@@ -385,39 +384,86 @@ class StaticFetchProvider:
     name = "static"
     available = True
 
-    def __init__(self, client: httpx.AsyncClient, *, max_chars: int = 32_000):
+    def __init__(
+        self, client: httpx.AsyncClient, *, max_chars: int = 32_000, allow_private: bool = False
+    ):
         self.client = client
         self.max_chars = max_chars
+        self.allow_private = allow_private
 
     async def search(self, query: str, limit: int) -> list[SearchHit]:
         return []
 
     async def fetch(self, url: str) -> FetchResult | None:
+        target = httpx.URL(validate_public_url(url, allow_private=self.allow_private))
         try:
-            response = await self.client.get(
-                url,
-                headers={"User-Agent": USER_AGENT, "Accept": "text/html,text/plain;q=0.9"},
-            )
-            response.raise_for_status()
-        except httpx.TimeoutException as exc:
+            for _ in range(6):
+                validate_public_url(str(target), allow_private=self.allow_private)
+                addresses = await resolve_fetch_addresses(
+                    target.raw_host.decode("ascii"),
+                    target.port or (443 if target.scheme == "https" else 80),
+                    allow_private=self.allow_private,
+                )
+                response = await self._connect(target, addresses)
+                try:
+                    if response.has_redirect_location:
+                        target = target.join(response.headers["location"])
+                        continue
+                    response.raise_for_status()
+                    content_type = response.headers.get("content-type", "").lower()
+                    if content_type and "html" not in content_type and "text" not in content_type:
+                        return FetchResult(
+                            url=url, status="blocked", note="非文本响应", provider=self.name
+                        )
+                    if response.headers.get("content-encoding", "identity").lower() != "identity":
+                        raise DomainError("web_backend", "Unexpected compressed page response")
+                    data = bytearray()
+                    truncated = False
+                    async for chunk in response.aiter_bytes(chunk_size=8192):
+                        remaining = MAX_HTML_BYTES - len(data)
+                        data.extend(chunk[:remaining])
+                        if len(chunk) > remaining:
+                            truncated = True
+                            break
+                    html = data.decode(response.encoding or "utf-8", errors="replace")
+                    break
+                finally:
+                    await response.aclose()
+            else:
+                raise DomainError("web_backend", "Page exceeded the redirect limit")
+        except (httpx.TimeoutException, TimeoutError) as exc:
             raise DomainError("web_timeout", "page fetch timed out") from exc
-        except httpx.HTTPError:
-            return FetchResult(url=url, status="error", note="HTTP 请求失败", provider=self.name)
-        content_type = response.headers.get("content-type", "").lower()
-        if content_type and "html" not in content_type and "text" not in content_type:
-            return FetchResult(url=url, status="blocked", note="非文本响应", provider=self.name)
-        text, title = await asyncio.to_thread(
-            extract_text, response.text[:MAX_HTML_BYTES], max_chars=self.max_chars
-        )
+        except (httpx.HTTPError, OSError, ValueError) as exc:
+            raise DomainError("web_backend", "Page request failed") from exc
+        text, title = await asyncio.to_thread(extract_text, html, max_chars=self.max_chars)
         return FetchResult(
-            url=url,
+            url=str(target),
             title=title,
             text=text,
             provider=self.name,
             status="ok" if text else "partial",
             note="" if text else "页面未提取到正文",
-            truncated=len(text) >= self.max_chars,
+            truncated=truncated or len(text) >= self.max_chars,
         )
+
+    async def _connect(self, target, addresses):
+        for index, address in enumerate(addresses):
+            request = httpx.Request(
+                "GET",
+                target.copy_with(host=address),
+                headers={
+                    "Host": target.netloc.decode("ascii"),
+                    "User-Agent": USER_AGENT,
+                    "Accept": "text/html,text/plain;q=0.9",
+                    "Accept-Encoding": "identity",
+                },
+                extensions={"sni_hostname": target.raw_host.decode("ascii")},
+            )
+            try:
+                return await self.client.send(request, stream=True, follow_redirects=False)
+            except (httpx.ConnectError, httpx.ConnectTimeout):
+                if index == len(addresses) - 1:
+                    raise
 
 
 class FakeProvider:
@@ -444,7 +490,9 @@ class FakeProvider:
         return self.pages.get(url)
 
 
-def build_providers(settings, client: httpx.AsyncClient) -> dict[str, SearchProvider]:
+def build_providers(
+    settings, client: httpx.AsyncClient, public_client: httpx.AsyncClient | None = None
+) -> dict[str, SearchProvider]:
     """Create every backend; unavailable ones stay in the dict but leave the chain."""
     return {
         "tavily": TavilyProvider(client, _key(settings.tavily_api_key_env)),
@@ -458,5 +506,9 @@ def build_providers(settings, client: httpx.AsyncClient) -> dict[str, SearchProv
             client, _key(settings.firecrawl_api_key_env), settings.firecrawl_url
         ),
         "ddgs": DdgsProvider(),
-        "static": StaticFetchProvider(client, max_chars=settings.max_response_chars * 4),
+        "static": StaticFetchProvider(
+            public_client or client,
+            max_chars=settings.max_response_chars * 4,
+            allow_private=settings.allow_private_urls,
+        ),
     }

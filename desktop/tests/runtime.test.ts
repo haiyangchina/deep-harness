@@ -134,11 +134,26 @@ test('permission modes control the real desktop backend and persist after restar
       throw new Error(`Did not reach ${expected}`)
     }
     await request(`${route}/inputs`, 'POST', {
-      submission_id: 'auto-write', text: '/write nested/auto.txt approved-automatically'
+      submission_id: 'auto-write',
+      text: '/write-batch\n/write nested/auto.txt first\n/write nested/reused.txt second'
     })
-    const automatic = await wait('completed')
-    assert.deepEqual(automatic.approvals, [])
-    assert.equal(await readFile(path.join(workspace, 'nested/auto.txt'), 'utf8'), 'approved-automatically')
+    const first = (await wait('waiting_approval')).approvals[0]
+    await assert.rejects(readFile(path.join(workspace, 'nested/auto.txt')))
+    await request(`${route}/approvals`, 'POST', {
+      interaction_id: first.id, generation: first.generation, decision: 'approve'
+    })
+    assert.deepEqual((await wait('completed')).approvals, [])
+    assert.equal(await readFile(path.join(workspace, 'nested/auto.txt'), 'utf8'), 'first')
+    assert.equal(await readFile(path.join(workspace, 'nested/reused.txt'), 'utf8'), 'second')
+    await request(`${route}/inputs`, 'POST', {
+      submission_id: 'new-round', text: '/write repeated.txt still-needs-approval'
+    })
+    const second = (await wait('waiting_approval')).approvals[0]
+    await request(`${route}/approvals`, 'POST', {
+      interaction_id: second.id, generation: second.generation, decision: 'deny'
+    })
+    await wait('completed')
+    await assert.rejects(readFile(path.join(workspace, 'repeated.txt')))
     await request(`${route}/permissions`, 'POST', {permission_mode: 'ask', expected_revision: 0})
     await request(`${route}/inputs`, 'POST', {submission_id: 'ask-write', text: '/write denied.txt deny-me'})
     const pending = await wait('waiting_approval')
@@ -149,7 +164,12 @@ test('permission modes control the real desktop backend and persist after restar
       interaction_id: approval.id, generation: approval.generation, decision: 'deny'
     })
     await wait('completed')
-    await request(`${route}/permissions`, 'POST', {permission_mode: 'full', expected_revision: 1})
+    await assert.rejects(request(`${route}/permissions`, 'POST', {
+      permission_mode: 'full', expected_revision: 1
+    }))
+    await request(`${route}/permissions`, 'POST', {
+      permission_mode: 'full', expected_revision: 1, risk_acknowledged: true
+    })
     await request(`${route}/inputs`, 'POST', {submission_id: 'external-read', text: `/read ${outside}`})
     const full = await wait('completed')
     assert.ok(full.latest_admission.result.includes('outside evidence'))

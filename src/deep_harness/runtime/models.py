@@ -157,14 +157,21 @@ class DiagnosticModel:
             name = "read_file" if "read_file" in tools else "read"
             call = {"id": "read-1", "name": name, "args": {"path": text[6:]}}
             return {"role": "assistant", "content": "", "tool_calls": [call]}
-        if text.startswith("/write "):
-            path, _, content = text[7:].partition(" ")
-            call = {
-                "id": "write-1",
-                "name": "write_file" if "write_file" in tools else "write",
-                "args": {"path": path, "content": content},
-            }
-            return {"role": "assistant", "content": "", "tool_calls": [call]}
+        writes = (
+            text.partition("\n")[2].splitlines() if text.startswith("/write-batch\n") else [text]
+        )
+        if writes and all(line.startswith("/write ") for line in writes):
+            calls = []
+            for index, line in enumerate(writes, 1):
+                path, _, content = line[7:].partition(" ")
+                calls.append(
+                    {
+                        "id": f"write-{index}",
+                        "name": "write_file" if "write_file" in tools else "write",
+                        "args": {"path": path, "content": content},
+                    }
+                )
+            return {"role": "assistant", "content": "", "tool_calls": calls}
         return {"role": "assistant", "content": f"Offline diagnostic (not an LLM): {text}"}
 
 
@@ -222,6 +229,7 @@ def ollama_model(
             "endpoint_hash": fingerprint(base_url),
             "temperature": 0,
             "context_window_tokens": context_window_tokens,
+            "reasoning": reasoning,
         },
     )
 

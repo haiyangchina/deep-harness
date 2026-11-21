@@ -64,8 +64,10 @@ class SearchFilesArgs(ListFilesArgs):
     query: str = Field(min_length=1, max_length=256)
 
 
-def workspace_files(arguments, workspace_path):
+def workspace_files(arguments, workspace_path, candidate_path=None):
     root = workspace_path(arguments.path)
+    candidate_path = candidate_path or workspace_path
+    workspace = workspace_path(".")
     if not root.is_dir():
         raise DomainError("not_directory", "Choose a workspace directory")
     visited = 0
@@ -80,7 +82,7 @@ def workspace_files(arguments, workspace_path):
             if name in SKIP_DIRECTORIES or child.is_symlink() or child.is_junction():
                 continue
             try:
-                workspace_path(display_path(child, workspace_path(".")))
+                candidate_path(display_path(child, workspace))
             except DomainError:
                 continue
             allowed.append(name)
@@ -95,9 +97,9 @@ def workspace_files(arguments, workspace_path):
                 file.relative_to(root).as_posix(), arguments.pattern
             ):
                 continue
-            relative = display_path(file, workspace_path("."))
+            relative = display_path(file, workspace)
             try:
-                workspace_path(relative)
+                candidate_path(relative)
             except DomainError:
                 continue
             yield relative
@@ -107,10 +109,10 @@ def display_path(path, workspace):
     return (path.relative_to(workspace) if path.is_relative_to(workspace) else path).as_posix()
 
 
-def list_files(arguments, workspace_path):
+def list_files(arguments, workspace_path, candidate_path=None):
     paths = []
     output_size = 0
-    for path in workspace_files(arguments, workspace_path):
+    for path in workspace_files(arguments, workspace_path, candidate_path):
         output_size += len((path or "").encode("utf-8")) + 4
         if path is None or len(paths) >= arguments.max_results or output_size > 6000:
             return {"files": paths, "truncated": True}
@@ -118,21 +120,22 @@ def list_files(arguments, workspace_path):
     return {"files": paths, "truncated": False}
 
 
-def search_files(arguments, workspace_path):
+def search_files(arguments, workspace_path, candidate_path=None):
+    candidate_path = candidate_path or workspace_path
     matches = []
     scanned = 0
     output_size = 0
-    for path in workspace_files(arguments, workspace_path):
+    for path in workspace_files(arguments, workspace_path, candidate_path):
         if path is None or scanned >= 200:
             return {"matches": matches, "truncated": True}
         scanned += 1
         try:
-            with workspace_path(path).open("rb") as stream:
+            with candidate_path(path).open("rb") as stream:
                 data = stream.read(128_001)
             if len(data) > 128_000 or b"\x00" in data:
                 continue
             lines = data.decode("utf-8").splitlines()
-        except (OSError, UnicodeError):
+        except (DomainError, OSError, UnicodeError):
             continue
         for number, line in enumerate(lines, 1):
             if arguments.query not in line:

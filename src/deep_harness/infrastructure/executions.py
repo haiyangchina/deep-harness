@@ -2,7 +2,7 @@
 
 from dataclasses import replace
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, insert, select, update
 
 from deep_harness.domain.models import DomainError, ExecutionClaim
 from deep_harness.infrastructure import schema as s
@@ -120,9 +120,46 @@ class ExecutionLedger:
         if row is None:
             raise DomainError("lease_lost", "Execution no longer owns this admission")
 
-    async def settle(self, claim: ExecutionClaim, status: str, result: str | None = None):
+    async def reserve_tools(self, claim, call_ids, limit):
+        ids = set(call_ids)
+        if not ids:
+            return
+        admission_id = claim.admission.id
         async with self.store.transaction() as conn:
             await self.assert_claim(conn, claim)
+            known = (
+                (
+                    await conn.execute(
+                        select(s.tool_attempts.c.call_id).where(
+                            s.tool_attempts.c.admission_id == admission_id
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            fresh = ids.difference(known)
+            if fresh and len(known) + len(fresh) > limit:
+                raise DomainError("budget_exhausted", "Per-run tool call budget exhausted")
+            if fresh:
+                await conn.execute(
+                    insert(s.tool_attempts),
+                    [{"admission_id": admission_id, "call_id": key} for key in sorted(fresh)],
+                )
+
+    async def settle(
+        self, claim: ExecutionClaim, status: str, result: str | None = None, *, interactions=()
+    ):
+        async with self.store.transaction() as conn:
+            await self.assert_claim(conn, claim)
+            if status == "waiting_approval" and interactions:
+                await conn.execute(
+                    insert(s.approval_waits).values(
+                        admission_id=claim.admission.id,
+                        generation=claim.admission.generation,
+                        interaction_ids=list(dict.fromkeys(interactions)),
+                    )
+                )
             await conn.execute(
                 update(s.admissions)
                 .where(
@@ -137,7 +174,9 @@ class ExecutionLedger:
                 {"admission_id": claim.admission.id, "result": result},
             )
 
-    async def resume(self, admission_id: str, session_id: str, owner: str) -> ExecutionClaim:
+    async def resume(
+        self, admission_id: str, session_id: str, owner: str, *, expected_generation=None
+    ) -> ExecutionClaim | None:
         async with self.store.transaction() as conn:
             row = (
                 (
@@ -152,8 +191,41 @@ class ExecutionLedger:
                 .mappings()
                 .first()
             )
-            if row is None:
-                raise DomainError("not_waiting", "Admission is not waiting for approval")
+            if row is None or (
+                expected_generation is not None and row["generation"] != expected_generation
+            ):
+                return None
+            wait = (
+                (
+                    await conn.execute(
+                        select(s.approval_waits).where(
+                            s.approval_waits.c.admission_id == admission_id,
+                            s.approval_waits.c.generation == row["generation"],
+                        )
+                    )
+                )
+                .mappings()
+                .first()
+            )
+            if wait is None or not wait["interaction_ids"]:
+                return None
+            decisions = (
+                (
+                    await conn.execute(
+                        select(s.interactions.c.decision).where(
+                            s.interactions.c.admission_id == admission_id,
+                            s.interactions.c.id.in_(wait["interaction_ids"]),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if len(decisions) != len(wait["interaction_ids"]) or None in decisions:
+                return None
+            await conn.execute(
+                delete(s.approval_waits).where(s.approval_waits.c.admission_id == admission_id)
+            )
             admission = replace(
                 admission_from(row),
                 status="started",
@@ -167,6 +239,53 @@ class ExecutionLedger:
                 .values(status="started", owner=owner, generation=admission.generation)
             )
             return ExecutionClaim(admission, owner)
+
+    async def unbound_waits(self):
+        async with self.store.engine.connect() as conn:
+            rows = await conn.execute(
+                select(s.admissions)
+                .outerjoin(s.approval_waits, s.approval_waits.c.admission_id == s.admissions.c.id)
+                .where(
+                    s.admissions.c.status == "waiting_approval",
+                    s.approval_waits.c.admission_id.is_(None),
+                )
+            )
+            return [admission_from(row) for row in rows.mappings()]
+
+    async def bind_wait(self, admission, interaction_ids):
+        ids = list(dict.fromkeys(interaction_ids))
+        if not ids:
+            return
+        async with self.store.transaction() as conn:
+            pending = await conn.scalar(
+                select(s.admissions.c.id).where(
+                    s.admissions.c.id == admission.id,
+                    s.admissions.c.status == "waiting_approval",
+                    s.admissions.c.generation == admission.generation,
+                )
+            )
+            matches = (
+                (
+                    await conn.execute(
+                        select(s.interactions.c.id).where(
+                            s.interactions.c.admission_id == admission.id,
+                            s.interactions.c.id.in_(ids),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if pending and set(matches) == set(ids):
+                await conn.execute(
+                    insert(s.approval_waits)
+                    .prefix_with("OR IGNORE")
+                    .values(
+                        admission_id=admission.id,
+                        generation=admission.generation,
+                        interaction_ids=ids,
+                    )
+                )
 
     async def recover(self) -> list[str]:
         """A crashed started execution is uncertain; never silently requeue it."""

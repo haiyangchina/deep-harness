@@ -3,6 +3,8 @@
 import hashlib
 import json
 import os
+import sqlite3
+from contextlib import closing
 
 import pytest
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -287,8 +289,103 @@ async def test_research_cannot_acquire_mutating_primitives(tmp_path, harness, to
     try:
         app = await host.application("one")
         with pytest.raises(DomainError, match="Research harness"):
-            await app.create_session(
-                "create", "research", (tool,), engine="deep", harness=harness
+            await app.create_session("create", "research", (tool,), engine="deep", harness=harness)
+    finally:
+        await host.close()
+
+
+@pytest.mark.parametrize("engine", ["standard", "deep"])
+@pytest.mark.parametrize("upgrade", [False, True])
+async def test_restart_waits_for_current_approval_after_an_older_decision(
+    tmp_path, engine, upgrade
+):
+    calls = [
+        {"name": "write", "args": {"path": path, "content": "written"}}
+        for path in ("first.txt", "second.txt")
+    ]
+
+    def model_factory(scope):
+        return LangChainModel(ScriptModel(calls=calls))
+
+    state = tmp_path / "state"
+    host = ProjectHost(state, tmp_path, model_factory)
+    try:
+        app = await host.application("one")
+        session = await app.create_session("create", "Prompt", ("write",), engine=engine)
+        admission = await app.submit(session.id, "send", "write sequentially")
+        await app.wait_idle()
+        first = (await app.sessions.status(session.id))["approvals"][0]
+        await app.approve(session.id, first["id"], first["generation"], "approve")
+        await app.wait_idle()
+        second = (await app.sessions.status(session.id))["approvals"][0]
+        assert first["generation"] < second["generation"]
+        assert (tmp_path / "first.txt").is_file()
+    finally:
+        await host.close()
+
+    if upgrade:
+        with closing(sqlite3.connect(state / "profiles" / "one" / "business.db")) as conn:
+            for table in ("approval_waits", "approval_revocations", "tool_attempts"):
+                conn.execute(f"DROP TABLE {table}")
+            conn.execute("ALTER TABLE context_heads DROP COLUMN summary_version")
+            conn.execute("PRAGMA user_version=9")
+            conn.commit()
+
+    restarted = ProjectHost(state, tmp_path, model_factory)
+    try:
+        app = await restarted.application("one")
+        await app.wait_idle()
+        pending = await app.store.get_admission(admission.id, session.id)
+        assert pending.status == "waiting_approval" and pending.generation == second["generation"]
+        assert not (tmp_path / "second.txt").exists()
+        assert await app.receipts.decided_waiting() == []
+        await app.approve(session.id, second["id"], second["generation"], "approve")
+        await app.wait_idle()
+        assert (await app.store.get_admission(admission.id, session.id)).status == "completed"
+        assert (tmp_path / "second.txt").read_text(encoding="utf-8") == "written"
+    finally:
+        await restarted.close()
+
+
+class ParallelWriteModel(ScriptModel):
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        if any(message.type == "tool" for message in messages):
+            answer = AIMessage(content="done")
+        else:
+            answer = AIMessage(
+                content="",
+                tool_calls=[{**call, "id": f"batch-{i}"} for i, call in enumerate(self.calls)],
             )
+        return ChatResult(generations=[ChatGeneration(message=answer)])
+
+
+async def test_deep_resumes_parallel_approvals_only_after_current_batch_decided(tmp_path):
+    calls = [
+        {"name": "write", "args": {"path": path, "content": "written"}}
+        for path in ("approved.txt", "denied.txt")
+    ]
+    host = ProjectHost(
+        tmp_path / "state", tmp_path, lambda scope: LangChainModel(ParallelWriteModel(calls=calls))
+    )
+    try:
+        app = await host.application("one")
+        session = await app.create_session("create", "Prompt", ("write",), engine="deep")
+        admission = await app.submit(session.id, "send", "write in parallel")
+        await app.wait_idle()
+        approvals = (await app.sessions.status(session.id))["approvals"]
+        pending = {item["proposal"]["arguments"]["path"]: item for item in approvals}
+        assert set(pending) == {"approved.txt", "denied.txt"}
+        first, second = pending["approved.txt"], pending["denied.txt"]
+        await app.approve(session.id, first["id"], first["generation"], "approve")
+        await app.wait_idle()
+        assert (
+            await app.store.get_admission(admission.id, session.id)
+        ).status == "waiting_approval"
+        assert not (tmp_path / "approved.txt").exists()
+        await app.approve(session.id, second["id"], second["generation"], "deny")
+        await app.wait_idle()
+        assert (await app.store.get_admission(admission.id, session.id)).status == "completed"
+        assert (tmp_path / "approved.txt").is_file()
+        assert not (tmp_path / "denied.txt").exists()
     finally:
         await host.close()

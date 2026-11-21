@@ -1,5 +1,6 @@
 """Session configuration and branching authority, independent of transport entry points."""
 
+from deep_harness.application.capabilities import WEB_TOOLS
 from deep_harness.application.tools import tool_definitions
 from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import DomainError
@@ -9,26 +10,48 @@ from deep_harness.runtime.harnesses import harness_contract
 
 
 class SessionRuntime:
-    def __init__(self, store, scope, model, limits, mcp=None):
+    def __init__(self, store, scope, model, limits, mcp=None, web_settings=None):
         self.store = store
         self.scope = scope
         self.model = model
         self.limits = limits
         self.mcp = mcp
+        self.web_settings = web_settings
         self.policies = PolicyLedger(store)
         self.branches = BranchLedger(store)
 
     def snapshot(
-        self, tools, *, engine="standard", harness="general", knowledge=None, mcp_catalog=None
+        self,
+        tools,
+        *,
+        engine="standard",
+        harness="general",
+        knowledge=None,
+        mcp_catalog=None,
+        version=2,
     ):
+        identity = dict(self.model.identity)
+        if version == 1 and identity.get("provider") == "ollama":
+            identity.pop("reasoning", None)
         result = {
-            "version": 1,
+            "version": version,
             "engine": engine,
             "workspace": str(self.scope.workspace),
-            "model": self.model.identity,
+            "model": identity,
             "tools": tool_definitions(tools, mcp_catalog),
             "execution": self.limits.model_dump(),
         }
+        if version >= 2:
+            result["model_request_timeout"] = self.model.request_timeout
+            if self.web_settings is not None and set(tools).intersection(WEB_TOOLS):
+                result["web"] = {
+                    key: value
+                    for key, value in self.web_settings.model_dump(mode="json").items()
+                    if not key.endswith("_env") and key not in {"searxng_url", "firecrawl_url"}
+                }
+                result["web"]["endpoint_hash"] = fingerprint(
+                    [self.web_settings.searxng_url, self.web_settings.firecrawl_url]
+                )
         if knowledge is not None:
             result["knowledge"] = knowledge
         if harness != "general":
@@ -67,6 +90,7 @@ class SessionRuntime:
                 harness=session.harness,
                 knowledge=knowledge,
                 mcp_catalog=catalog,
+                version=binding["snapshot"].get("version", 1) if binding else 2,
             ),
         )
 
@@ -81,11 +105,16 @@ class SessionRuntime:
             harness=status["session"].harness,
             knowledge=knowledge,
             mcp_catalog=catalog,
+            version=binding["snapshot"].get("version", 1) if binding else 2,
         )
+        saved = binding["snapshot"] if binding else {}
         status["runtime"] = {
             "binding": binding,
             "current_snapshot": current,
             "current_fingerprint": fingerprint(current),
             "compatible": binding is not None and binding["fingerprint"] == fingerprint(current),
+            "changed_fields": sorted(
+                key for key in saved.keys() | current.keys() if saved.get(key) != current.get(key)
+            ),
         }
         return status

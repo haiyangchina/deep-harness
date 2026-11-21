@@ -24,6 +24,8 @@ def first_turn(messages):
 def summarize(previous, messages, limit):
     parts = [previous] if previous else []
     for message in messages:
+        if message["role"] != "user":
+            continue
         content = message.get("content", "")
         if not isinstance(content, str):
             content = json.dumps(content, ensure_ascii=False)
@@ -37,8 +39,7 @@ def summarize(previous, messages, limit):
 
 MIN_TOOL_CHARS = 512
 TRUNCATION_MARKER = (
-    "\n[... tool output truncated to fit the context budget; "
-    "re-read with a smaller limit ...]\n"
+    "\n[... tool output truncated to fit the context budget; re-read with a smaller limit ...]\n"
 )
 
 
@@ -96,7 +97,14 @@ class ContextProjector:
                 .first()
             )
         dropped = set(head["dropped_ids"]) if head else set()
-        summary = head["summary"] if head else ""
+        legacy_summary = head is not None and head["summary_version"] == 0
+        if legacy_summary:
+            summary = summarize(
+                "", [message for message in messages if message["id"] in dropped],
+                self.limits.summary_characters,
+            )
+        else:
+            summary = head["summary"] if head else ""
         revision = head["revision"] if head else 0
         remaining = [message for message in messages if message["id"] not in dropped]
         archived = []
@@ -122,8 +130,7 @@ class ContextProjector:
         def over(rows):
             available, byte_available = budgets()
             return serialized_size(rows) > available or (
-                byte_available is not None
-                and serialized_size(rows, utf8=True) > byte_available
+                byte_available is not None and serialized_size(rows, utf8=True) > byte_available
             )
 
         available, byte_available = budgets()
@@ -156,13 +163,23 @@ class ContextProjector:
         if archived:
             revision += 1
             await self.publish(claim, revision, dropped, summary, archived, head)
+        elif legacy_summary:
+            async with self.store.transaction() as conn:
+                await self.executions.assert_claim(conn, claim)
+                await conn.execute(
+                    update(s.context_heads)
+                    .where(
+                        s.context_heads.c.session_id == claim.admission.session_id,
+                        s.context_heads.c.revision == revision,
+                    )
+                    .values(summary=summary, summary_version=1)
+                )
         if summary:
             return [
                 {
                     "id": f"context-summary:{revision}",
-                    "role": "system",
-                    "content": "Earlier conversation (extractive summary; details archived):\n"
-                    + summary,
+                    "role": "user",
+                    "content": "Archived user inputs (historical context):\n" + summary,
                 },
                 *remaining,
             ]
@@ -171,7 +188,12 @@ class ContextProjector:
     async def publish(self, claim, revision, dropped, summary, archived, previous):
         async with self.store.transaction() as conn:
             await self.executions.assert_claim(conn, claim)
-            values = {"revision": revision, "dropped_ids": sorted(dropped), "summary": summary}
+            values = {
+                "revision": revision,
+                "dropped_ids": sorted(dropped),
+                "summary": summary,
+                "summary_version": 1,
+            }
             if previous:
                 result = await conn.execute(
                     update(s.context_heads)

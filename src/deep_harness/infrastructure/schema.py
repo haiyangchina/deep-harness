@@ -113,6 +113,24 @@ interactions = Table(
     Column("proposal", JSON, nullable=False),
     Column("decision", String),
 )
+tool_attempts = Table(
+    "tool_attempts",
+    metadata,
+    Column("admission_id", ForeignKey("admissions.id"), primary_key=True),
+    Column("call_id", String, primary_key=True),
+)
+approval_waits = Table(
+    "approval_waits",
+    metadata,
+    Column("admission_id", ForeignKey("admissions.id"), primary_key=True),
+    Column("generation", Integer, nullable=False),
+    Column("interaction_ids", JSON, nullable=False),
+)
+approval_revocations = Table(
+    "approval_revocations",
+    metadata,
+    Column("admission_id", String, primary_key=True),
+)
 model_receipts = Table(
     "model_receipts",
     metadata,
@@ -150,6 +168,7 @@ context_heads = Table(
     Column("revision", Integer, nullable=False),
     Column("dropped_ids", JSON, nullable=False),
     Column("summary", Text, nullable=False),
+    Column("summary_version", Integer, nullable=False, server_default="1"),
 )
 context_archives = Table(
     "context_archives",

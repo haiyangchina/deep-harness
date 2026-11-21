@@ -403,6 +403,33 @@ class BusinessStore:
             )
             return list(rows.scalars())
 
+    async def live_history(self, session_id, *, after=None, before=None, limit=100):
+        """Tail or append-only cursor over all committed messages, including active turns."""
+        if after is not None and before is not None:
+            raise DomainError("invalid_cursor", "Provide one message cursor")
+        query = (
+            select(
+                s.messages.c.ordinal.label("seq"),
+                s.admissions.c.ordinal.label("turn"),
+                s.messages.c.payload.label("message"),
+            )
+            .join(s.admissions, s.admissions.c.id == s.messages.c.admission_id)
+            .where(s.messages.c.session_id == session_id)
+        )
+        if after is not None:
+            query = query.where(s.messages.c.ordinal > after).order_by(s.messages.c.ordinal)
+        else:
+            if before is not None:
+                query = query.where(s.messages.c.ordinal < before)
+            query = query.order_by(s.messages.c.ordinal.desc())
+        async with self.engine.connect() as conn:
+            result = await conn.execute(query.limit(limit + 1))
+            rows = [dict(row) for row in result.mappings()]
+        visible = rows[:limit]
+        if after is None:
+            visible.reverse()
+        return {"items": visible, "has_more": len(rows) > limit}
+
     async def history_page(self, session_id: str, *, after: str = "", limit: int = 50):
         """Page committed completed turns in stable conversational order."""
         if not 1 <= limit <= 100:
@@ -469,18 +496,19 @@ class BusinessStore:
             )
             return [json.loads(row[0]) for row in rows]
 
-    async def event_history(self, session_id: str, after: int = 0) -> list[dict]:
+    async def event_history(self, session_id: str, after: int = 0, *, tail=False) -> list[dict]:
+        order = s.events.c.seq.desc() if tail else s.events.c.seq
         async with self.engine.connect() as conn:
             rows = await conn.execute(
                 select(s.events)
-                .where(
-                    s.events.c.session_id == session_id,
-                    s.events.c.seq > after,
-                )
-                .order_by(s.events.c.seq)
-                .limit(500)
+                .where(s.events.c.session_id == session_id, s.events.c.seq > after)
+                .order_by(order)
+                .limit(100 if tail else 500)
             )
-            return [dict(row) for row in rows.mappings()]
+            result = [dict(row) for row in rows.mappings()]
+        if tail:
+            result.reverse()
+        return result
 
     async def append_event(self, conn, session_id: str, kind: str, payload: dict) -> None:
         await conn.execute(

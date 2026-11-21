@@ -1,6 +1,7 @@
 """Explicit profile MCP servers; discover and re-check tool schemas before dispatch."""
 
 import asyncio
+import ipaddress
 import json
 import os
 import re
@@ -211,8 +212,13 @@ class McpRegistry:
                     scope=config.scope,
                     issuer=config.issuer,
                 )
+            hostname = urlparse(config.url).hostname
+            try:
+                loopback = ipaddress.ip_address(hostname).is_loopback
+            except ValueError:
+                loopback = hostname == "localhost"
             http_client = await stack.enter_async_context(
-                httpx2.AsyncClient(headers=headers, auth=auth, timeout=60)
+                httpx2.AsyncClient(headers=headers, auth=auth, timeout=60, trust_env=not loopback)
             )
             source = streamable_http_client(config.url, http_client=http_client)
         return await stack.enter_async_context(Client(source, read_timeout_seconds=60))

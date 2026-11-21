@@ -36,3 +36,27 @@ async def test_completed_history_pages_do_not_repeat_or_skip_messages(tmp_path):
             await app.store.history_page(session.id, after="9999999999999999999:1")
     finally:
         await host.close()
+
+
+async def test_live_history_reads_tail_older_pages_and_only_new_commits(tmp_path):
+    host = ProjectHost(tmp_path / "state", tmp_path, recover_queued=False)
+    try:
+        app = await host.application("one")
+        session = await app.create_session("create", "Prompt")
+        for number in range(4):
+            await app.store.admit(
+                session, principal="operator", submission_id=str(number), text=str(number)
+            )
+        tail = await app.store.live_history(session.id, limit=2)
+        assert tail["has_more"]
+        assert [row["message"]["content"] for row in tail["items"]] == ["2", "3"]
+        before, after = (row["seq"] for row in tail["items"])
+        older = await app.store.live_history(session.id, before=before, limit=2)
+        assert [row["message"]["content"] for row in older["items"]] == ["0", "1"]
+        assert not older["has_more"]
+        assert (await app.store.live_history(session.id, after=after))["items"] == []
+        await app.store.admit(session, principal="operator", submission_id="4", text="4")
+        delta = await app.store.live_history(session.id, after=after)
+        assert [row["message"]["content"] for row in delta["items"]] == ["4"]
+    finally:
+        await host.close()

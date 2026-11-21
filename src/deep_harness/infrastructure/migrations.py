@@ -9,7 +9,16 @@ from uuid import uuid4
 from deep_harness.domain.models import DomainError
 from deep_harness.infrastructure import schema as s
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
+HOT_INDEXES = (
+    "events(session_id, seq)",
+    "model_receipts(admission_id)",
+    "effects(admission_id)",
+    "admissions(session_id, status, ordinal)",
+    "messages(admission_id, ordinal)",
+    "messages(session_id, ordinal)",
+    "interactions(admission_id, decision)",
+)
 BASE_TABLES = {
     "sessions",
     "admissions",
@@ -95,6 +104,16 @@ async def migrate(engine, home):
                         await conn.exec_driver_sql(
                             f"ALTER TABLE sessions ADD COLUMN {name} {definition}"
                         )
+                if "context_heads" in tables:
+                    context_columns = {
+                        row[1]
+                        for row in await conn.exec_driver_sql("PRAGMA table_info(context_heads)")
+                    }
+                    if "summary_version" not in context_columns:
+                        await conn.exec_driver_sql(
+                            "ALTER TABLE context_heads ADD COLUMN summary_version INTEGER "
+                            "NOT NULL DEFAULT 0"
+                        )
                 if "delegations" in tables:
                     delegation_columns = {
                         row[1]
@@ -141,6 +160,29 @@ async def migrate(engine, home):
                 "INSERT OR REPLACE INTO memories_fts(rowid, profile_id, memory_id, content) "
                 "SELECT rowid, profile_id, id, content FROM memories"
             )
+            for target in HOT_INDEXES:
+                name = target.replace("(", "_").replace(", ", "_").removesuffix(")")
+                await conn.exec_driver_sql(
+                    f"CREATE INDEX IF NOT EXISTS ix_harness_{name} ON {target}"
+                )
+            if version < 10:
+                await conn.exec_driver_sql(
+                    "INSERT OR IGNORE INTO tool_attempts(admission_id, call_id) "
+                    "SELECT a.id, substr(e.id, length(a.id) + 2) FROM effects e "
+                    "JOIN admissions a ON e.admission_id = a.id "
+                    "UNION SELECT a.id, d.parent_tool_call_id FROM delegations d "
+                    "JOIN admissions a ON d.admission_id = a.id "
+                    "UNION SELECT a.id, json_extract(m.payload, '$.tool_call_id') "
+                    "FROM messages m JOIN admissions a ON m.admission_id = a.id "
+                    "WHERE json_extract(m.payload, '$.role') = 'tool' "
+                    "AND json_extract(m.payload, '$.tool_call_id') IS NOT NULL"
+                )
+                await conn.exec_driver_sql(
+                    "INSERT OR IGNORE INTO approval_revocations(admission_id) "
+                    "SELECT json_extract(payload, '$.admission_id') FROM events "
+                    "WHERE type='approval.reuse_revoked' "
+                    "AND json_extract(payload, '$.admission_id') IS NOT NULL"
+                )
             await conn.exec_driver_sql(f"PRAGMA user_version={SCHEMA_VERSION}")
             await conn.commit()
         except BaseException:

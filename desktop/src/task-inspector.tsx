@@ -1,7 +1,7 @@
 import { useStore } from '@nanostores/react'
 import { useState } from 'react'
 import { Json } from './components'
-import { $busy, $conversation, $runtime, api, perform, refreshConversation } from './state'
+import { $busy, $conversation, $runtime, api, perform, refreshConversation, refreshInspector, report } from './state'
 
 function proposalScope(proposal: unknown): string | null {
   if (proposal && typeof proposal === 'object' && 'scope_key' in proposal) {
@@ -35,7 +35,10 @@ export function TaskInspector() {
           ['delegations', '子任务'],
           ['state', '状态']
         ].map(([key, label]) => (
-          <button className={tab === key ? 'selected' : ''} onClick={() => setTab(key)} key={key}>
+          <button className={tab === key ? 'selected' : ''} onClick={() => {
+            setTab(key)
+            void refreshInspector(key).catch(report)
+          }} key={key}>
             {label}
           </button>
         ))}

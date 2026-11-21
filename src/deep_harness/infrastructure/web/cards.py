@@ -39,20 +39,22 @@ def evidence_pack(
         if source.note:
             entry.append(f"状态: {source.note}")
         body = " ".join(source.text.split()) if source.text else ""
-        if body:
-            truncated = len(body) > per_source
-            shown = body[:per_source]
-            if truncated:
-                shown += f" …[TRUNCATED，原文 {len(body)} 字符，可用 web_fetch 的 offset 续读]"
-            entry.append(untrusted_block(shown))
-        else:
-            entry.append("(该来源未提供正文，仅有搜索摘要)")
-        text = "\n".join(entry) + "\n"
+        prefix = "\n".join(entry) + "\n"
         remaining = budget - used
+        if body:
+            # Budget the wrapper before clipping so a partial page cannot cut its closing tag.
+            body_limit = max(0, min(per_source, remaining - len(prefix) - 96))
+            shown = body[:body_limit]
+            if body_limit < len(body):
+                shown += " …[TRUNCATED，可用 web_fetch 续读]"
+            payload = untrusted_block(shown)
+        else:
+            payload = "(该来源未提供正文，仅有搜索摘要)"
+        text = prefix + payload + "\n"
         if len(text) > remaining:
             marker = "\n…[证据包达到字符预算上限]\n"
-            if remaining > len(marker) + 40:
-                chunks.append(text[: remaining - len(marker)] + marker)
+            if remaining >= len(marker):
+                chunks.append(marker)
             break
         chunks.append(text)
         used += len(text)

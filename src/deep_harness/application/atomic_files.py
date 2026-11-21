@@ -56,8 +56,9 @@ def text_content(data: bytes) -> str:
         raise DomainError("text_encoding", "File must contain valid UTF-8 text") from exc
 
 
-def read(arguments: ReadArgs, workspace_path):
+def read(arguments: ReadArgs, workspace_path, candidate_path=None):
     target = workspace_path(arguments.path)
+    candidate_path = candidate_path or workspace_path
     if target.is_dir():
         # scandir avoids materializing an unbounded directory just to return one page.
         entries = []
@@ -68,7 +69,7 @@ def read(arguments: ReadArgs, workspace_path):
             for child in children:
                 relative = (Path(arguments.path) / child.name).as_posix()
                 try:
-                    workspace_path(relative)
+                    candidate_path(relative)
                 except DomainError:
                     continue
                 skipped += 1

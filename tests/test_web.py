@@ -2,6 +2,7 @@
 
 import asyncio
 
+import httpx
 import pytest
 
 from deep_harness.application.capabilities import WEB_TOOLS
@@ -19,6 +20,7 @@ from deep_harness.infrastructure.web import FakeProvider, WebClient
 from deep_harness.infrastructure.web.cards import evidence_pack
 from deep_harness.infrastructure.web.extract import extract_text
 from deep_harness.infrastructure.web.models import SearchHit, Source
+from deep_harness.infrastructure.web.providers import StaticFetchProvider
 from deep_harness.infrastructure.web.security import validate_public_url
 from deep_harness.infrastructure.web.settings import WebSettings
 from deep_harness.runtime.models import DiagnosticModel
@@ -217,3 +219,70 @@ async def test_gateway_dispatches_web_search_with_fake_backend(tmp_path):
         assert fake.calls
     finally:
         await host.close()
+
+
+async def test_cancelling_one_waiter_preserves_shared_producer_and_bounded_cache():
+    started, release = asyncio.Event(), asyncio.Event()
+
+    class DelayedProvider(FakeProvider):
+        async def search(self, query, limit):
+            started.set()
+            await release.wait()
+            return await super().search(query, limit)
+
+    fake = DelayedProvider(hits=hits())
+    web = WebClient(web_settings(max_cache_entries=1), providers={"fake": fake})
+    try:
+        first = asyncio.create_task(web.search("same", 3, 2000))
+        await started.wait()
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        second = asyncio.create_task(web.search("same", 3, 2000))
+        release.set()
+        assert "Alpha" in await second
+        assert fake.calls == [("search", "same", 3)]
+        await web.search("other", 3, 2000)
+        assert web.health()["cache_entries"] == 1
+    finally:
+        await web.close()
+
+
+async def test_direct_page_fetch_pins_public_address_and_rechecks_redirect(monkeypatch):
+    loop = asyncio.get_running_loop()
+    lookups = []
+
+    async def resolve(host, port, **kwargs):
+        lookups.append(host)
+        address = "8.8.8.8" if host == "public.example" else "127.0.0.1"
+        return [(None, None, None, "", (address, port))]
+
+    def transport(request):
+        assert request.url.host == "8.8.8.8"
+        assert request.headers["host"] == "public.example"
+        assert request.extensions["sni_hostname"] == "public.example"
+        return httpx.Response(302, headers={"location": "https://redirect.example/page"})
+
+    monkeypatch.setattr(loop, "getaddrinfo", resolve)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
+        with pytest.raises(DomainError) as error:
+            await StaticFetchProvider(client).fetch("https://public.example/page")
+    assert error.value.code == "web_private_url"
+    assert lookups == ["public.example", "redirect.example"]
+
+
+async def test_research_applies_operator_source_cap_and_distinguishes_unavailable():
+    fake = FakeProvider(hits=hits())
+    web = WebClient(web_settings(max_sources=1), providers={"fake": fake})
+    try:
+        result = await web.research("compare", [], 12, 2000)
+        assert "Alpha" in result and "Beta" not in result
+    finally:
+        await web.close()
+
+    bad = WebClient(web_settings(), providers={"fake": FakeProvider(fail=True)})
+    try:
+        with pytest.raises(DomainError, match="所有研究子查询"):
+            await bad.research("q", [], 3, 2000)
+    finally:
+        await bad.close()

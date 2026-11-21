@@ -1,6 +1,8 @@
 """URL boundaries and prompt-injection containment for external content."""
 
+import asyncio
 import ipaddress
+import socket
 from urllib.parse import urlsplit
 
 from deep_harness.domain.models import DomainError
@@ -19,7 +21,11 @@ def validate_public_url(raw: str, *, allow_private: bool = False) -> str:
     if not isinstance(raw, str) or not raw.strip() or len(raw) > MAX_URL_LENGTH:
         raise DomainError("web_url", "URL must be a non-empty http(s) address under 2048 chars")
     value = raw.strip()
-    parts = urlsplit(value)
+    try:
+        parts = urlsplit(value)
+        _ = parts.port
+    except ValueError as exc:
+        raise DomainError("web_url", "Malformed URL") from exc
     if parts.scheme.lower() not in {"http", "https"} or not parts.hostname:
         raise DomainError("web_url", "Only http and https URLs are supported")
     if parts.username or parts.password:
@@ -33,15 +39,27 @@ def validate_public_url(raw: str, *, allow_private: bool = False) -> str:
         address = ipaddress.ip_address(host)
     except ValueError:
         address = None
-    if address is not None and (
-        address.is_private
-        or address.is_loopback
-        or address.is_link_local
-        or address.is_reserved
-        or address.is_multicast
-    ):
-        raise DomainError("web_private_url", "Private or local network URLs are refused")
+    if address is not None:
+        require_global_address(address)
     return value
+
+
+def require_global_address(address):
+    if not address.is_global or address.is_multicast or address.is_reserved:
+        raise DomainError("web_private_url", "Private or local network URLs are refused")
+
+
+async def resolve_fetch_addresses(host, port, *, allow_private):
+    rows = await asyncio.get_running_loop().getaddrinfo(
+        host, port, type=socket.SOCK_STREAM
+    )
+    addresses = tuple(dict.fromkeys(row[4][0] for row in rows))
+    if not addresses:
+        raise DomainError("web_backend", "No address available for page fetch")
+    if not allow_private:
+        for address in addresses:
+            require_global_address(ipaddress.ip_address(address))
+    return addresses
 
 
 def untrusted_block(text: str) -> str:

@@ -3,7 +3,7 @@
 from typing import Annotated, TypedDict
 
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import Command, interrupt
+from langgraph.types import interrupt
 from pydantic import ValidationError
 from sqlalchemy import select
 
@@ -12,6 +12,7 @@ from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import DomainError, ToolCall
 from deep_harness.infrastructure import schema as s
 from deep_harness.infrastructure.branches import BranchLedger
+from deep_harness.runtime.approval_checkpoint import approval_ids, resume_command
 from deep_harness.runtime.context import ContextProjector
 from deep_harness.runtime.inference import Inference, usage_totals
 
@@ -126,9 +127,6 @@ class StandardRuntime:
         if can_reuse and await self.receipts.scope_granted(
             self.claim, scope_key, self.session.permission_revision, exclude_key=key
         ):
-            await self.receipts.record_approval_event(
-                self.claim, "approval.reused", scope_key, call.name
-            )
             return True
         proposal = {"tool_name": call.name, "arguments": call.arguments}
         if self.session.permission_mode != "legacy":
@@ -162,8 +160,11 @@ class StandardRuntime:
     async def _tools(self, state: State) -> dict:
         results = []
         count = state.get("tool_count", 0)
-        if count + len(state["messages"][-1]["tool_calls"]) > self.limits.max_tool_calls:
-            raise DomainError("budget_exhausted", "Per-run tool call budget exhausted")
+        await self.executions.reserve_tools(
+            self.claim,
+            (raw["id"] for raw in state["messages"][-1]["tool_calls"]),
+            self.limits.max_tool_calls,
+        )
         for raw in state["messages"][-1]["tool_calls"]:
             call = ToolCall(raw["id"], raw["name"], raw["args"])
             message_id = f"{self.claim.admission.id}:tool:{call.id}"
@@ -178,7 +179,15 @@ class StandardRuntime:
                 self.gateway.validate(call)
                 approval_required = self.gateway.approval_reason(call) is not None
                 approved = not approval_required or await self._approval(call)
-                content = await self.gateway.execute(call) if approved else "Tool denied by user."
+                content = "Tool denied by user."
+                if approved:
+                    try:
+                        content = await self.gateway.execute(call)
+                    except DomainError as exc:
+                        if exc.code != "approval_missing":
+                            raise
+                        if await self._approval(call):
+                            content = await self.gateway.execute(call)
             except (ValidationError, OSError, UnicodeError) as exc:
                 content = f"Tool error: {type(exc).__name__}: {exc}"
             except DomainError as exc:
@@ -204,7 +213,7 @@ class StandardRuntime:
 
     async def run(self, *, resume: bool = False) -> dict:
         if resume:
-            value = Command(resume=True)
+            value = resume_command(await self.graph.aget_state(self.config))
         else:
             checkpoint = await self.graph.aget_state(self.config)
             inherited = (
@@ -225,7 +234,13 @@ class StandardRuntime:
             }
         result = await self.graph.ainvoke(value, config=self.config, durability="sync")
         if result.get("__interrupt__"):
-            return {"status": "waiting_approval", "result": None}
+            return {
+                "status": "waiting_approval",
+                "result": None,
+                "interactions": approval_ids(
+                    result["__interrupt__"], self.claim.admission.generation
+                ),
+            }
         return {"status": "completed", "result": result["messages"][-1]["content"]}
 
     async def open_interactions(self) -> list[dict]:

@@ -153,9 +153,11 @@ def create_api(host, token: str) -> FastAPI:
         "/profiles/{profile_id}/sessions/{session_id}/status",
         dependencies=[Depends(authenticate)],
     )
-    async def status(profile_id: str, session_id: str):
+    async def status(profile_id: str, session_id: str, include_runtime: bool = True):
         service = await host.application(profile_id)
-        return jsonable_encoder(await service.sessions.status(session_id))
+        if include_runtime:
+            return jsonable_encoder(await service.sessions.status(session_id))
+        return jsonable_encoder(await service.store.session_status(session_id, "operator"))
 
     @app.get(
         "/profiles/{profile_id}/sessions/{session_id}/usage",
@@ -292,16 +294,32 @@ def create_api(host, token: str) -> FastAPI:
         return {"session": asdict(session), "messages": await service.store.history(session_id)}
 
     @app.get(
+        "/profiles/{profile_id}/sessions/{session_id}/messages/live",
+        dependencies=[Depends(authenticate)],
+    )
+    async def live_messages(
+        profile_id: str,
+        session_id: str,
+        after: Annotated[int | None, Query(ge=0, le=2**53 - 1)] = None,
+        before: Annotated[int | None, Query(ge=1, le=2**53 - 1)] = None,
+        limit: Annotated[int, Query(ge=1, le=100)] = 100,
+    ):
+        service = await host.application(profile_id)
+        await service.store.get_session(session_id, "operator")
+        return await service.store.live_history(session_id, after=after, before=before, limit=limit)
+
+    @app.get(
         "/profiles/{profile_id}/sessions/{session_id}/events", dependencies=[Depends(authenticate)]
     )
     async def event_history(
         profile_id: str,
         session_id: str,
         after: Annotated[int, Query(ge=0, le=2**63 - 1)] = 0,
+        tail: bool = False,
     ):
         service = await host.application(profile_id)
         await service.store.get_session(session_id, "operator")
-        return {"events": await service.store.event_history(session_id, after)}
+        return {"events": await service.store.event_history(session_id, after, tail=tail)}
 
     @app.get(
         "/profiles/{profile_id}/sessions/{session_id}/admissions/{admission_id}",

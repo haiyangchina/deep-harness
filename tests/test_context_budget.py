@@ -65,7 +65,10 @@ async def test_compaction_keeps_transcript_and_uses_archived_summary(tmp_path):
         history = await app.store.history(session.id)
         assert len(history) == 8
         assert [row["content"] for row in history[::2]] == [str(i) * 380 for i in range(4)]
-        assert any(row["role"] == "system" for row in model.requests[-1])
+        summary = next(
+            row for row in model.requests[-1] if row["id"].startswith("context-summary:")
+        )
+        assert summary["role"] == "user"
         async with app.store.engine.connect() as conn:
             archives = list((await conn.execute(select(s.context_archives))).mappings())
         assert archives and archives[0]["messages"]
@@ -181,9 +184,7 @@ async def test_current_turn_tool_output_is_clipped_not_rejected():
         {"id": "a1:model:0", "role": "assistant", "content": ""},
         {"id": "a1:tool:1", "role": "tool", "tool_call_id": "1", "content": original},
     ]
-    projected = await projector.project(
-        _claim(), "prompt", [], messages, max_context_bytes=122_880
-    )
+    projected = await projector.project(_claim(), "prompt", [], messages, max_context_bytes=122_880)
     tool = next(row for row in projected if row["role"] == "tool")
     assert TRUNCATION_MARKER in tool["content"]
     assert len(tool["content"]) < len(original)

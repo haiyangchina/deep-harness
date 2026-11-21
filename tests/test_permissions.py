@@ -338,3 +338,29 @@ async def test_api_validates_modes_and_enforces_profile_and_operator_access(tmp_
             assert changed.status_code == 200 and changed.json()["permission_mode"] == "full"
     finally:
         await host.close()
+
+
+async def test_recursive_workspace_read_keeps_sensitive_candidates_outside_grant(tmp_path):
+    calls = [
+        {"name": "read", "args": {"path": "."}},
+        {"name": "list_files", "args": {"path": "."}},
+        {"name": "search_files", "args": {"path": ".", "query": "example"}},
+    ]
+    host = project(tmp_path, calls)
+    workspace = tmp_path / "workspace"
+    (workspace / ".env").write_text("example-sensitive", encoding="utf-8")
+    (workspace / "public.txt").write_text("example-public", encoding="utf-8")
+    try:
+        app = await host.application("one")
+        session = await app.create_session(
+            "create", "Prompt", ("read", "list_files", "search_files"), permission_mode="ask"
+        )
+        admission = await app.submit(session.id, "scan", "inspect workspace")
+        await app.wait_idle()
+        final = await app.store.get_admission(admission.id, session.id)
+        assert final.status == "completed"
+        assert ".env" not in final.result
+        assert "example-sensitive" not in final.result
+        assert "example-public" in final.result
+    finally:
+        await host.close()

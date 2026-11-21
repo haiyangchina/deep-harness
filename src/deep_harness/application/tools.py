@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from deep_harness.application.atomic_files import EditArgs, ReadArgs, WriteArgs, mutate, read
 from deep_harness.application.capabilities import READ_ONLY_SCOPES
-from deep_harness.application.permissions import approval_reason, approval_scope
+from deep_harness.application.permissions import approval_reason, approval_scope, sensitive_path
 from deep_harness.application.shell import BashArgs, bash, shell_command
 from deep_harness.application.terminal import CommandArgs, run_command, validate_command
 from deep_harness.application.web_tools import (
@@ -226,37 +226,23 @@ class ToolGateway:
         """Return (scope_key, decision, reusable) for this call."""
         return approval_scope(call, self.session, self.scope, self.path)
 
-    async def reused_in_round(self, call: ToolCall) -> bool:
-        scope_key, _, can_reuse = self.approval_scope(call)
-        if not can_reuse:
-            return False
-        return await self.receipts.scope_granted(
-            self.claim,
-            scope_key,
-            self.session.permission_revision,
-            exclude_key=f"{self.claim.admission.id}:{call.id}",
-        )
-
     async def execute(self, call: ToolCall) -> str:
         arguments = self.validate(call)
         await self._preflight(call, arguments)
         key = f"{self.claim.admission.id}:{call.id}"
         digest = fingerprint({"name": call.name, "arguments": call.arguments})
-        if self.session.permission_mode == "full":
-            scope_key, _, _ = self.approval_scope(call)
-            if scope_key not in READ_ONLY_SCOPES:
-                await self.receipts.record_approval_event(
-                    self.claim, "approval.exempt", scope_key, call.name
-                )
-        if self.session.permission_mode != "legacy" and self.approval_reason(call) is not None:
-            if not await self.reused_in_round(call) and not await self.receipts.approved(
-                key, digest
-            ):
-                raise DomainError("approval_missing", "This operation needs a durable approval")
+        scope_key, _, reusable = self.approval_scope(call)
+        approval = None
+        audit = None
+        if self.approval_reason(call) is not None:
+            approval = (digest, scope_key, self.session.permission_revision, reusable)
+            audit = ("direct", scope_key, call.name)
+        elif self.session.permission_mode == "full" and scope_key not in READ_ONLY_SCOPES:
+            audit = ("full", scope_key, call.name)
         existing = await self.receipts.prepare_effect(self.claim, key, digest)
         if existing and existing["status"] == "succeeded":
             return existing["result"]
-        await self.receipts.dispatch_effect(self.claim, key)
+        await self.receipts.dispatch_effect(self.claim, key, approval=approval, audit=audit)
         try:
             result = await self._invoke(call.name, arguments, key)
         except (OSError, UnicodeError, DomainError, TimeoutError) as exc:
@@ -329,13 +315,22 @@ class ToolGateway:
                 arguments.content, "agent", memory_id=key
             )
             return json.dumps({"memory_id": memory["id"]})
-        handlers = {
-            "read": read,
-            "write": self._mutate,
-            "edit": self._mutate,
-            "list_files": list_files,
-            "search_files": search_files,
-        }
+        if name in {"read", "list_files", "search_files"}:
+            handler = {"read": read, "list_files": list_files, "search_files": search_files}[name]
+            root = self.path(arguments.path)
+
+            def candidate_path(path):
+                target = self.path(path)
+                if self.session.permission_mode in {"ask", "auto"} and (
+                    not target.is_relative_to(root)
+                    or (sensitive_path(target) and not sensitive_path(root))
+                ):
+                    raise DomainError("path_denied", "Nested path is outside the approved scope")
+                return target
+
+            value = await asyncio.to_thread(handler, arguments, self.path, candidate_path)
+            return json.dumps(value, ensure_ascii=False)
+        handlers = {"write": self._mutate, "edit": self._mutate}
         if name in handlers:
             value = await asyncio.to_thread(handlers[name], arguments, self.path)
             return json.dumps(value, ensure_ascii=False)
