@@ -12,22 +12,32 @@ import asyncio
 import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 
 import httpx
 
 from deep_harness.domain.models import DomainError
 from deep_harness.infrastructure.web.cards import evidence_pack
-from deep_harness.infrastructure.web.models import FetchResult, SearchHit, Source
+from deep_harness.infrastructure.web.models import (
+    BackendAttempt,
+    FetchResult,
+    SearchBatch,
+    SearchHit,
+    SearchOptions,
+    Source,
+)
 from deep_harness.infrastructure.web.providers import (
     USER_AGENT,
     SearchProvider,
     build_providers,
 )
+from deep_harness.infrastructure.web.relevance import rank_hits, relevance, research_queries
 from deep_harness.infrastructure.web.security import normalize_url, validate_public_url
 from deep_harness.infrastructure.web.settings import WebSettings
 from deep_harness.server_config import number
 
 _SEARCH_EXCLUDED = {"static"}
+_DEFAULT_OPTIONS = SearchOptions()
 
 
 class WebClient:
@@ -70,6 +80,7 @@ class WebClient:
             if name not in _SEARCH_EXCLUDED
             and name in self.providers
             and self.providers[name].available
+            and getattr(self.providers[name], "search_available", True)
         ]
         self.fetch_chain = [
             self.providers[name]
@@ -134,81 +145,127 @@ class WebClient:
                 self._inflight[key] = task
         return await asyncio.shield(task)
 
-    async def _search_hits(self, query: str, limit: int):
-        key = ("search", query.strip().lower(), limit)
+    async def _search_hits(self, query: str, limit: int, options: SearchOptions) -> SearchBatch:
+        key = ("search", query.strip(), limit, options)
         return await self._coalesced(
-            key, lambda: self._search_uncached(query, limit), lambda _: True
+            key,
+            lambda: self._search_uncached(query, limit, options),
+            lambda batch: bool(batch.hits)
+            and all(
+                attempt.status in {"ok", "merged", "empty", "low_relevance"}
+                for attempt in batch.attempts
+            ),
         )
 
-    async def _search_uncached(self, query: str, limit: int):
-        errors: list[str] = []
-        clean_empty = False
-        for provider in self.search_chain:
+    async def _search_uncached(
+        self, query: str, limit: int, options: SearchOptions
+    ) -> SearchBatch:
+        groups: list[tuple[str, list[SearchHit]]] = []
+        attempts: list[BackendAttempt] = []
+        chain = sorted(
+            self.search_chain,
+            key=lambda provider: len(_ignored_filters(provider, options)),
+        )
+        for provider in chain[:self.settings.max_search_backends]:
+            started = time.monotonic()
+            ignored = _ignored_filters(provider, options)
+            confident = False
             try:
-                hits = await provider.search(query, limit)
-            except DomainError as exc:
-                errors.append(f"{provider.name}:{exc.code}")
-                continue
+                async with asyncio.timeout(self.settings.provider_timeout_seconds):
+                    specialized = getattr(provider, "search_with_options", None)
+                    hits = (
+                        await specialized(query, limit, options)
+                        if specialized is not None
+                        else await provider.search(query, limit)
+                    )
+            except (DomainError, TimeoutError) as exc:
+                status = exc.code if isinstance(exc, DomainError) else "web_timeout"
             except Exception:
-                errors.append(f"{provider.name}:error")
-                continue
-            hits = [hit for hit in hits if hit.url][:limit]
-            if hits:
-                return hits, provider.name, errors
-            clean_empty = True
-        if not self.search_chain:
-            raise DomainError(
-                "web_unavailable",
-                "没有可用的联网检索后端：请配置 API key、SearXNG 地址，或安装免密钥 ddgs 后端",
-            )
-        if errors and not clean_empty:
-            raise DomainError("web_unavailable", f"检索后端均不可用（{'、'.join(errors[:3])}）")
-        return [], "none", errors
+                status = "web_backend"
+            else:
+                relevant = []
+                for hit in hits:
+                    try:
+                        url = validate_public_url(hit.url, allow_private=False)
+                    except DomainError:
+                        continue
+                    score = relevance(query, hit)
+                    if score is None or score >= self.settings.relevance_threshold:
+                        relevant.append(
+                            replace(hit, url=url, provider=hit.provider or provider.name)
+                        )
+                        confident |= score is None or score >= self.settings.relevance_fast_path
+                groups.append((query, relevant))
+                if relevant:
+                    status = "filters_unsupported" if ignored else "ok" if confident else "merged"
+                else:
+                    status = "low_relevance" if hits else "empty"
+            attempts.append(BackendAttempt(provider.name, status, _elapsed_ms(started)))
+            if confident:
+                break
+        return SearchBatch(tuple(rank_hits(groups, limit)), tuple(attempts), bool(groups))
 
     async def _fetch_result(self, url: str) -> FetchResult:
         key = ("fetch", url)
         return await self._coalesced(
             key,
             lambda: self._fetch_uncached(url),
-            lambda result: result.status in {"ok", "partial"},
+            lambda result: bool(result.text) and result.status in {"ok", "partial"},
         )
 
     async def _fetch_uncached(self, url: str) -> FetchResult:
         errors: list[str] = []
+        attempts: list[BackendAttempt] = []
+        empty_result = None
         for provider in self.fetch_chain:
+            started = time.monotonic()
+            result = None
             try:
-                result = await provider.fetch(url)
-            except DomainError as exc:
-                if exc.code in {"web_url", "web_private_url"}:
+                async with asyncio.timeout(self.settings.provider_timeout_seconds):
+                    result = await provider.fetch(url)
+            except (DomainError, TimeoutError) as exc:
+                code = exc.code if isinstance(exc, DomainError) else "web_timeout"
+                if code in {"web_url", "web_private_url"}:
                     raise
-                errors.append(f"{provider.name}:{exc.code}")
-                continue
+                errors.append(f"{provider.name}:{code}")
             except Exception:
-                errors.append(f"{provider.name}:error")
-                continue
-            if result is not None and result.text:
-                return result
+                code = "web_backend"
+                errors.append(f"{provider.name}:{code}")
+            else:
+                code = result.status if result is not None else "empty"
+            attempts.append(BackendAttempt(provider.name, code, _elapsed_ms(started)))
+            if result is not None:
+                if result.text.strip():
+                    return replace(result, attempts=tuple(attempts))
+                if empty_result is None:
+                    empty_result = result
+        if empty_result is not None:
+            return replace(empty_result, attempts=tuple(attempts))
         detail = f"（{'、'.join(errors[:2])}）" if errors else "：无可用读取后端"
-        return FetchResult(url=url, status="error", note="未能读取页面" + detail)
+        return FetchResult(
+            url=url, status="error", note="未能读取页面" + detail, attempts=tuple(attempts)
+        )
 
-    async def search(self, query: str, limit: int, max_chars: int) -> str:
+    async def search(
+        self, query: str, limit: int, max_chars: int, options: SearchOptions = _DEFAULT_OPTIONS
+    ) -> str:
         max_chars = min(max_chars, self.settings.max_response_chars)
-        hits, provider, skipped = await self._search_hits(query, limit)
-        sources = [
-            Source(
-                title=hit.title,
-                url=hit.url,
-                text=hit.text or hit.snippet,
-                provider=hit.provider or provider,
+        batch = await self._search_hits(query, limit, options)
+        if not batch.reachable:
+            raise DomainError(
+                "web_unavailable",
+                f"检索后端均不可用（{_describe_attempts(batch.attempts)}）",
             )
-            for hit in hits
-        ]
-        meta = f"后端={provider}；回退={','.join(skipped) or '无'}"
+        sources = [_source_from_hit(hit) for hit in batch.hits]
+        provider = batch.hits[0].provider if batch.hits else "none"
+        skipped = [f"{a.backend}:{a.status}" for a in batch.attempts if a.status != "ok"]
         return evidence_pack(
             f"联网检索：{query[: number('web.heading_preview_chars')]}",
             sources,
             budget=max_chars,
-            meta=meta,
+            meta=f"后端={provider}；回退={','.join(skipped) or '无'}",
+            status=_search_status(sources, batch.attempts),
+            diagnostics=_describe_attempts(batch.attempts),
         )
 
     async def fetch(self, url: str, max_chars: int, offset: int = 0) -> str:
@@ -221,6 +278,8 @@ class WebClient:
                 [],
                 budget=max_chars,
                 meta=f"URL={url}；状态={result.status}；{result.note}",
+                status="unavailable" if result.status in {"error", "blocked"} else "no_results",
+                diagnostics=_describe_attempts(result.attempts),
             )
         remaining = result.text[offset:]
         truncated = len(remaining) > max_chars or result.truncated
@@ -230,6 +289,8 @@ class WebClient:
             url=result.url or url,
             text=remaining[:max_chars],
             provider=result.provider,
+            original_url=url,
+            published_at=result.published_at,
             note=(
                 f"offset={offset}；"
                 + (
@@ -246,6 +307,8 @@ class WebClient:
             [source],
             budget=max_chars + number("web.fetch_evidence_overhead_chars"),
             meta=f"URL={url}；后端={result.provider}",
+            status="partial" if truncated else "ok",
+            diagnostics=_describe_attempts(result.attempts),
         )
 
     async def extract(self, urls: list[str], max_chars: int) -> str:
@@ -253,32 +316,33 @@ class WebClient:
         validated = [
             validate_public_url(url, allow_private=self.settings.allow_private_urls) for url in urls
         ]
-        results = await asyncio.gather(
-            *(self._safe_fetch(url) for url in validated), return_exceptions=False
-        )
-        per_page = max(number("web.source_min_chars"), max_chars // max(1, len(results)))
-        sources = [
-            Source(
-                title=result.title,
-                url=result.url,
-                text=result.text[:per_page],
-                provider=result.provider,
-                note=result.status if result.status != "ok" else "",
-            )
-            for result in results
-        ]
+        deadline = asyncio.get_running_loop().time() + self.settings.total_timeout_seconds
+        results = await _collect([self._safe_fetch(url) for url in validated], deadline)
+        sources = []
+        failures = []
+        attempts = []
+        for url, result in zip(validated, results, strict=True):
+            if result is not None and result.attempts:
+                attempts.append(_describe_attempts(result.attempts))
+            if result is None or not result.text.strip():
+                failures.append(f"{url}（{result.note if result else '超时'}）")
+                continue
+            sources.append(_source_from_page(url, result))
+        status = "partial" if sources and failures else "ok" if sources else "unavailable"
         return evidence_pack(
             "网页批量读取",
-            sources,
+            _distinct_sources(sources),
             budget=max_chars + number("web.fetch_evidence_overhead_chars"),
-            meta="批量抓取",
+            status=status,
+            diagnostics="；".join([*failures, *attempts]),
         )
 
     async def _safe_fetch(self, url: str) -> FetchResult:
         try:
             return await self._fetch_result(url)
-        except DomainError as exc:
-            return FetchResult(url=url, status="error", note=exc.code)
+        except (DomainError, TimeoutError) as exc:
+            note = exc.code if isinstance(exc, DomainError) else "web_timeout"
+            return FetchResult(url=url, status="error", note=note)
 
     async def research(
         self,
@@ -286,94 +350,86 @@ class WebClient:
         queries: list[str],
         max_sources: int,
         max_chars: int,
+        options: SearchOptions = _DEFAULT_OPTIONS,
     ) -> str:
-        """One-call deep research: fan out, de-duplicate, enrich, pack evidence."""
-        effective = [query.strip() for query in (queries or [question]) if query.strip()]
-        if not effective:
-            effective = [question]
-        effective = effective[: self.settings.max_queries]
+        """Search and enrich within one deadline, retaining completed evidence."""
+        effective = research_queries(question, queries, self.settings.max_queries)
         max_sources = min(max_sources, self.settings.max_sources)
         max_chars = min(max_chars, self.settings.max_response_chars)
         limit = max(
             number("web.min_results_per_research_query"),
             min(number("web.max_results_per_research_query"), max_sources),
         )
-
-        async def one(query: str):
+        now = asyncio.get_running_loop().time()
+        total = self.settings.total_timeout_seconds
+        deadline = now + total
+        async def search_query(query: str) -> SearchBatch:
             try:
-                return await self._search_hits(query, limit)
-            except (DomainError, TimeoutError):
-                return [], "unavailable", ["all backends failed"]
+                return await self._search_hits(query, limit, options)
+            except TimeoutError:
+                return SearchBatch((), (BackendAttempt("search", "web_timeout", 0),), False)
 
-        bundles = await asyncio.gather(*(one(query) for query in effective))
-        if all(bundle[1] == "unavailable" for bundle in bundles):
-            raise DomainError("web_unavailable", "所有研究子查询的检索后端均不可用")
-        ranked = [list(bundle[0]) for bundle in bundles]
-        merged: list[SearchHit] = []
-        seen: set[str] = set()
-        for position in range(limit):
-            for hits in ranked:
-                if position >= len(hits):
-                    continue
-                hit = hits[position]
-                try:
-                    public = validate_public_url(
-                        hit.url, allow_private=self.settings.allow_private_urls
-                    )
-                except DomainError:
-                    continue
-                key = normalize_url(public)
-                if key in seen:
-                    continue
-                seen.add(key)
-                merged.append(hit)
-                if len(merged) >= max_sources:
-                    break
-            if len(merged) >= max_sources:
-                break
-
-        async def enrich(hit: SearchHit) -> SearchHit:
-            if hit.text.strip():
-                return hit
-            try:
-                url = validate_public_url(hit.url, allow_private=self.settings.allow_private_urls)
-            except DomainError:
-                return hit
-            try:
-                result = await self._fetch_result(url)
-            except (DomainError, TimeoutError):
-                return hit
-            if not result.text:
-                return hit
-            return SearchHit(
-                title=hit.title or result.title,
-                url=hit.url,
-                snippet=hit.snippet,
-                text=result.text[: number("web.enriched_source_chars")],
-                provider=hit.provider or result.provider,
+        batches = await _collect(
+            [search_query(query) for query in effective],
+            now + total * self.settings.research_search_fraction,
+        )
+        if not any(batch and batch.reachable for batch in batches):
+            detail = _describe_attempts(
+                tuple(attempt for batch in batches if batch for attempt in batch.attempts)
             )
+            raise DomainError("web_unavailable", f"所有研究子查询的检索后端均不可用（{detail}）")
 
-        enriched = await asyncio.gather(*(enrich(hit) for hit in merged))
-        sources = [
-            Source(
-                title=hit.title,
-                url=hit.url,
-                text=hit.text or hit.snippet,
-                provider=hit.provider,
-            )
-            for hit in enriched
+        groups = [batch.hits for batch in batches if batch is not None]
+        relevant_groups = [
+            (question, [hit for hit in hits if relevance(question, hit) != 0])
+            for hits in groups
         ]
-        providers = ",".join(dict.fromkeys(bundle[1] for bundle in bundles))
-        failures = sum(bundle[1] == "unavailable" for bundle in bundles)
-        meta = (
-            f"问题={question[: number('web.metadata_preview_chars')]}；子查询={len(effective)}；"
-            f"后端={providers}；失败子查询={failures}；去重后来源={len(sources)}"
+        merged = rank_hits(relevant_groups, max_sources)
+        fetches = []
+        for hit in merged:
+            if not hit.text.strip():
+                fetches.append(self._safe_fetch(hit.url))
+        fetched = iter(await _collect(fetches, deadline))
+        sources = []
+        gaps = []
+        fetch_attempts = []
+        for hit in merged:
+            if hit.text.strip():
+                sources.append(_source_from_hit(hit))
+                continue
+            page = next(fetched)
+            if page is not None and page.attempts:
+                fetch_attempts.append(_describe_attempts(page.attempts))
+            if page is not None and page.text.strip():
+                sources.append(_source_from_page(hit.url, page, hit=hit))
+            else:
+                note = page.note if page is not None else "抓取超时"
+                gaps.append(f"{hit.url}（{note}）")
+                if hit.snippet.strip():
+                    sources.append(replace(_source_from_hit(hit), note=note))
+        sources = _distinct_sources(sources)
+        failures = sum(batch is None or not batch.reachable for batch in batches)
+        attempts = [
+            _describe_attempts(batch.attempts) if batch is not None else "子查询超时"
+            for batch in batches
+        ]
+        filters_missing = any(
+            attempt.status == "filters_unsupported"
+            for batch in batches if batch for attempt in batch.attempts
+        )
+        status = (
+            "partial" if sources and (failures or gaps or filters_missing)
+            else "ok" if sources
+            else "unavailable" if gaps
+            else "no_results"
         )
         return evidence_pack(
             f"深度联网研究：{question[: number('web.heading_preview_chars')]}",
             sources,
             budget=max_chars,
-            meta=meta,
+            meta=f"子查询={len(effective)}；失败子查询={failures}；去重后来源={len(sources)}",
+            status=status,
+            diagnostics="；".join([*gaps, *attempts, *fetch_attempts]),
         )
 
     def health(self) -> dict:
@@ -397,3 +453,78 @@ class WebClient:
         self._cache.clear()
         if self._owns_client:
             await asyncio.gather(self.client.aclose(), self._public_client.aclose())
+
+
+def _elapsed_ms(started: float) -> int:
+    return round((time.monotonic() - started) * 1000)
+
+
+def _describe_attempts(attempts) -> str:
+    return "，".join(f"{a.backend}:{a.status} {a.elapsed_ms}ms" for a in attempts) or "无可用后端"
+
+
+def _ignored_filters(provider, options: SearchOptions) -> set[str]:
+    detect = getattr(provider, "supported_filters", None)
+    supported = detect(options) if detect is not None else set()
+    return {
+        name for name in ("language", "region", "freshness") if getattr(options, name)
+    } - supported
+
+
+def _search_status(sources, attempts) -> str:
+    if not sources:
+        return "no_results"
+    return "partial" if any(a.status == "filters_unsupported" for a in attempts) else "ok"
+
+
+def _distinct_sources(sources: list[Source]) -> list[Source]:
+    result = {}
+    for source in sources:
+        key = normalize_url(source.url)
+        current = result.get(key)
+        if current is None or source.kind == "正文" and current.kind != "正文":
+            result[key] = source
+    return list(result.values())
+
+
+async def _collect(calls, deadline: float) -> list:
+    """Return completed items in input order, cancelling only this request's waiters."""
+    tasks = [asyncio.create_task(call) for call in calls]
+    if not tasks:
+        return []
+    try:
+        timeout = max(0, deadline - asyncio.get_running_loop().time())
+        done, _ = await asyncio.wait(tasks, timeout=timeout)
+        return [task.result() if task in done else None for task in tasks]
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _source_from_hit(hit: SearchHit) -> Source:
+    return Source(
+        title=hit.title,
+        url=hit.url,
+        text=hit.text or hit.snippet,
+        provider=hit.provider,
+        published_at=hit.published_at,
+        kind="正文" if hit.text.strip() else "搜索摘要",
+    )
+
+
+def _source_from_page(url: str, page: FetchResult, *, hit: SearchHit | None = None) -> Source:
+    provider = page.provider
+    if hit is not None and hit.provider and hit.provider != page.provider:
+        provider = f"{hit.provider} / {page.provider}" if page.provider else hit.provider
+    limit = number("web.enriched_source_chars")
+    return Source(
+        title=page.title or (hit.title if hit else ""),
+        url=page.url or url,
+        text=page.text[:limit],
+        provider=provider,
+        note="正文已截断" if page.truncated or len(page.text) > limit else "",
+        original_url=url,
+        published_at=page.published_at or (hit.published_at if hit else ""),
+    )

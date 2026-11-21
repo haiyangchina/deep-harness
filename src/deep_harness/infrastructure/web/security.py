@@ -3,7 +3,7 @@
 import asyncio
 import ipaddress
 import socket
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 from deep_harness.domain.models import DomainError
 from deep_harness.server_config import number
@@ -24,6 +24,8 @@ def validate_public_url(raw: str, *, allow_private: bool = False) -> str:
             "web_url", "URL must be a non-empty http(s) address within the configured limit"
         )
     value = raw.strip()
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise DomainError("web_url", "URLs with control characters are refused")
     try:
         parts = urlsplit(value)
         _ = parts.port
@@ -74,4 +76,10 @@ def normalize_url(url: str) -> str:
     parts = urlsplit(url.strip())
     host = (parts.hostname or "").lower().rstrip(".")
     path = parts.path.rstrip("/") or "/"
-    return f"{host}{path}?{parts.query}" if parts.query else f"{host}{path}"
+    authority = f"{host}:{parts.port}" if parts.port not in (None, 80, 443) else host
+    params = [
+        (key, value)
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        if not key.lower().startswith("utm_") and key.lower() not in {"gclid", "fbclid", "msclkid"}
+    ]
+    return f"{authority}{path}?{urlencode(params)}" if params else f"{authority}{path}"

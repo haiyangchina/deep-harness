@@ -1,6 +1,15 @@
 """Pure result shapes; these types do not depend on any framework."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class SearchOptions:
+    language: str | None = None
+    region: str | None = None
+    freshness: str | None = None
 
 
 @dataclass(frozen=True)
@@ -12,6 +21,7 @@ class SearchHit:
     snippet: str = ""
     text: str = ""
     provider: str = ""
+    published_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -25,6 +35,8 @@ class FetchResult:
     status: str = "ok"
     note: str = ""
     truncated: bool = False
+    published_at: str = ""
+    attempts: tuple[BackendAttempt, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -36,3 +48,20 @@ class Source:
     text: str
     provider: str = ""
     note: str = ""
+    original_url: str = ""
+    published_at: str = ""
+    kind: str = "正文"
+
+
+@dataclass(frozen=True)
+class BackendAttempt:
+    backend: str
+    status: str
+    elapsed_ms: int
+
+
+@dataclass(frozen=True)
+class SearchBatch:
+    hits: tuple[SearchHit, ...]
+    attempts: tuple[BackendAttempt, ...]
+    reachable: bool

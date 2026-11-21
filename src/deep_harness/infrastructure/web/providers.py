@@ -16,14 +16,16 @@ import httpx
 
 from deep_harness.domain.models import DomainError
 from deep_harness.infrastructure.web.bing_cn import BROWSER_UA, parse_bing_results
-from deep_harness.infrastructure.web.extract import MAX_HTML_BYTES, extract_text
-from deep_harness.infrastructure.web.models import FetchResult, SearchHit
+from deep_harness.infrastructure.web.extract import MAX_HTML_BYTES, extract_page, publication_date
+from deep_harness.infrastructure.web.models import FetchResult, SearchHit, SearchOptions
 from deep_harness.infrastructure.web.security import resolve_fetch_addresses, validate_public_url
 from deep_harness.server_config import number, setting
 
 USER_AGENT = "deep-harness/1.0 (bounded web research)"
 MAX_BACKEND_TEXT = number("web.max_backend_text_chars")
 _URL_RE = re.compile(r"https?://[^\s)\]>\"']+")
+_HAN_TEXT = re.compile(r"[\u3400-\u9fff]{2,}")
+_KANA_TEXT = re.compile(r"[\u3040-\u30ff]")
 
 
 @runtime_checkable
@@ -47,6 +49,9 @@ def _hit(row: dict, *, title: str, url: str, snippet: str, text: str = "", provi
         snippet=str(row.get(snippet) or "")[: number("web.provider_snippet_chars")],
         text=str(row.get(text) or "")[:MAX_BACKEND_TEXT] if text else "",
         provider=provider,
+        published_at=publication_date(
+            row.get("publishedDate") or row.get("published_date") or row.get("page_age")
+        ),
     )
 
 
@@ -82,6 +87,12 @@ class HttpProvider:
                 )
         except httpx.TimeoutException as exc:
             raise DomainError("web_timeout", f"{self.name} request timed out") from exc
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            code = {401: "web_auth", 403: "web_forbidden", 429: "web_rate_limited"}.get(
+                status, "web_redirect" if exc.response.has_redirect_location else "web_backend"
+            )
+            raise DomainError(code, f"{self.name} HTTP {status}") from exc
         except httpx.HTTPError as exc:
             raise DomainError("web_backend", f"{self.name} request failed") from exc
 
@@ -148,11 +159,29 @@ class ExaProvider(HttpProvider):
 class BraveProvider(HttpProvider):
     name = "brave"
 
+    @staticmethod
+    def supported_filters(options: SearchOptions) -> set[str]:
+        return {"language", "region", "freshness"}
+
     async def search(self, query: str, limit: int) -> list[SearchHit]:
+        return await self.search_with_options(query, limit, SearchOptions())
+
+    async def search_with_options(
+        self, query: str, limit: int, options: SearchOptions
+    ) -> list[SearchHit]:
+        params = {"q": query, "count": limit}
+        if options.language:
+            params["search_lang"] = options.language
+        if options.region:
+            params["country"] = options.region
+        if options.freshness:
+            params["freshness"] = {"day": "pd", "week": "pw", "month": "pm", "year": "py"}[
+                options.freshness
+            ]
         response = await self._request(
             "GET",
             "https://api.search.brave.com/res/v1/web/search",
-            params={"q": query, "count": limit},
+            params=params,
             headers={"X-Subscription-Token": self.key or "", "Accept": "application/json"},
         )
         rows = response.json().get("web", {}).get("results", [])
@@ -186,16 +215,36 @@ class SearxngProvider(HttpProvider):
 
     name = "searxng"
 
+    @staticmethod
+    def supported_filters(options: SearchOptions) -> set[str]:
+        supported = {"language"}
+        if options.language:
+            supported.add("region")
+        if options.freshness in {"day", "month", "year"}:
+            supported.add("freshness")
+        return supported
+
     def __init__(self, client: httpx.AsyncClient, base_url: str | None):
         super().__init__(client, key=base_url)
         self.base_url = (base_url or "").rstrip("/")
         self.available = bool(self.base_url)
 
     async def search(self, query: str, limit: int) -> list[SearchHit]:
+        return await self.search_with_options(query, limit, SearchOptions())
+
+    async def search_with_options(
+        self, query: str, limit: int, options: SearchOptions
+    ) -> list[SearchHit]:
+        locale = options.language or "all"
+        if options.region and options.language:
+            locale = f"{options.language.split('-')[0]}-{options.region}"
+        params = {"q": query, "format": "json", "language": locale}
+        if options.freshness in {"day", "month", "year"}:
+            params["time_range"] = options.freshness
         response = await self._request(
             "GET",
             f"{self.base_url}/search",
-            params={"q": query, "format": "json", "language": "all"},
+            params=params,
         )
         rows = response.json().get("results", [])
         return [
@@ -219,20 +268,30 @@ class BingCnProvider(HttpProvider):
         self.available = True
 
     async def search(self, query: str, limit: int) -> list[SearchHit]:
-        response = await self._request(
-            "GET",
-            "https://cn.bing.com/search",
-            params={
-                "q": query,
-                "count": max(limit * 2, number("web.bing_min_candidate_count")),
-                "setlang": setting("web.bing_language"),
-            },
-            headers={
-                "User-Agent": BROWSER_UA,
-                "Accept": "text/html",
-                "Accept-Language": setting("web.bing_accept_language"),
-            },
-        )
+        language = setting("web.bing_language")
+        params = {
+            "q": query,
+            "count": max(limit * 2, number("web.bing_min_candidate_count")),
+            "setlang": language,
+        }
+        headers = {
+            "User-Agent": BROWSER_UA,
+            "Accept": "text/html",
+            "Accept-Language": setting("web.bing_accept_language"),
+        }
+        try:
+            response = await self._request(
+                "GET", "https://cn.bing.com/search", params=params, headers=headers
+            )
+        except DomainError as exc:
+            if exc.code != "web_redirect":
+                raise
+            # The China endpoint can send clients to Bing's homepage. Use its fixed
+            # search endpoint, retaining the query and market from this request.
+            response = await self._request(
+                "GET", "https://www.bing.com/search", params={**params, "mkt": language},
+                headers=headers,
+            )
         return parse_bing_results(response.text, limit, self.name)
 
 
@@ -279,7 +338,7 @@ def _parse_jina_search(text: str, limit: int, provider: str) -> list[SearchHit]:
 
 
 class JinaProvider(HttpProvider):
-    """Keyless-capable search plus the r.jina.ai reader."""
+    """Authenticated search plus the keyless-capable r.jina.ai reader."""
 
     name = "jina"
 
@@ -287,6 +346,7 @@ class JinaProvider(HttpProvider):
         super().__init__(client, key=None)
         self.api_key = key
         self.available = True
+        self.search_available = bool(key)
 
     def _headers(self) -> dict[str, str]:
         headers = {"Accept": "text/plain"}
@@ -295,6 +355,8 @@ class JinaProvider(HttpProvider):
         return headers
 
     async def search(self, query: str, limit: int) -> list[SearchHit]:
+        if not self.search_available:
+            return []
         response = await self._request(
             "GET", f"https://s.jina.ai/{quote(query, safe='')}", headers=self._headers()
         )
@@ -363,8 +425,8 @@ class DdgsProvider:
     name = "ddgs"
 
     def __init__(self):
-        self._worker: asyncio.Task | None = None
-        self._slot = asyncio.Lock()
+        self._workers: set[asyncio.Task] = set()
+        self._slots = asyncio.Semaphore(number("web.ddgs_max_workers"))
         try:
             from ddgs import DDGS
 
@@ -375,30 +437,48 @@ class DdgsProvider:
             self.available = False
 
     async def search(self, query: str, limit: int) -> list[SearchHit]:
+        return await self.search_with_options(query, limit, SearchOptions())
+
+    @staticmethod
+    def supported_filters(options: SearchOptions) -> set[str]:
+        return {"language", "region", "freshness"} if (
+            options.language and (options.region or "-" in options.language)
+        ) else {"freshness"}
+
+    async def search_with_options(
+        self, query: str, limit: int, options: SearchOptions
+    ) -> list[SearchHit]:
         if not self.available:
             return []
 
         def run():
             engine = self._engine(timeout=number("web.ddgs_engine_timeout_seconds"))
+            params = {"max_results": limit}
+            lang, _, country = (options.language or "").partition("-")
+            country = options.region or country
+            if lang and country:
+                params["region"] = f"{country.lower()}-{lang}"
+            elif not lang and not country:
+                if _KANA_TEXT.search(query):
+                    params["region"] = "jp-jp"
+                elif _HAN_TEXT.search(query):
+                    params["region"] = "cn-zh"
+            if options.freshness:
+                params["timelimit"] = options.freshness[0]
             try:
-                return list(engine.text(query, max_results=limit))
+                return list(engine.text(query, **params))
             finally:
                 close = getattr(engine, "close", None)
                 if close:
                     close()
 
         try:
-            async with self._slot:
-                if self._worker is not None and not self._worker.done():
-                    raise DomainError("web_backend", "ddgs worker is still busy")
-                self._worker = asyncio.create_task(asyncio.to_thread(run))
-                self._worker.add_done_callback(
-                    lambda task: None if task.cancelled() else task.exception()
-                )
-                worker = self._worker
-            rows = await asyncio.wait_for(
-                asyncio.shield(worker), timeout=number("web.ddgs_wait_seconds")
-            )
+            async with asyncio.timeout(number("web.ddgs_wait_seconds")):
+                await self._slots.acquire()
+                worker = asyncio.create_task(asyncio.to_thread(run))
+                self._workers.add(worker)
+                worker.add_done_callback(self._worker_finished)
+                rows = await asyncio.shield(worker)
         except TimeoutError as exc:
             raise DomainError("web_timeout", "ddgs search timed out") from exc
         except DomainError:
@@ -410,6 +490,12 @@ class DdgsProvider:
             for row in rows[:limit]
             if isinstance(row, dict) and row.get("href")
         ]
+
+    def _worker_finished(self, worker: asyncio.Task) -> None:
+        self._workers.discard(worker)
+        self._slots.release()
+        if not worker.cancelled():
+            worker.exception()
 
     async def fetch(self, url: str) -> FetchResult | None:
         return None
@@ -478,7 +564,9 @@ class StaticFetchProvider:
             raise DomainError("web_timeout", "page fetch timed out") from exc
         except (httpx.HTTPError, OSError, ValueError) as exc:
             raise DomainError("web_backend", "Page request failed") from exc
-        text, title = await asyncio.to_thread(extract_text, html, max_chars=self.max_chars)
+        text, title, published_at = await asyncio.to_thread(
+            extract_page, html, max_chars=self.max_chars
+        )
         return FetchResult(
             url=str(target),
             title=title,
@@ -487,6 +575,7 @@ class StaticFetchProvider:
             status="ok" if text else "partial",
             note="" if text else "页面未提取到正文",
             truncated=truncated or len(text) >= self.max_chars,
+            published_at=published_at,
         )
 
     async def _connect(self, target, addresses):

@@ -80,13 +80,13 @@
 
 `server.yaml` 的 `web` 段与 `--config` 覆盖文件均可配置。默认检索链为
 `tavily → exa → brave → serper → searxng → bing_cn → ddgs → jina`，只有已配置
-（有 API key、有 SearXNG 地址、已安装 `ddgs`）的后端才进入链；`bing_cn` 免密钥、
-始终可用。API key 不写进 TOML，只引用环境变量名：
+（有 API key、有 SearXNG 地址、已安装 `ddgs`）的后端才进入链。`bing_cn` 和 `ddgs`
+免密钥，实际可用性取决于网络。Jina Search 需要密钥，Jina Reader 仍可无密钥使用。
+配置文件只引用环境变量名：
 `TAVILY_API_KEY`、`EXA_API_KEY`、`BRAVE_SEARCH_API_KEY`、`SERPER_API_KEY`、
 `JINA_API_KEY`、`FIRECRAWL_API_KEY`。
 
-**国内网络**：`ddgs`（DuckDuckGo）与 `s.jina.ai` / `r.jina.ai` 常读超时，零配置时
-优先使用 `bing_cn`（`cn.bing.com`，直连或经系统代理均可，约 0.4s）。它用标准库
+零配置时优先使用 `bing_cn`（`cn.bing.com`，按网络环境直连或经系统代理）。它用标准库
 `HTMLParser` 解析 `li.b_algo`，无额外依赖；**必须发送完整浏览器 User-Agent**，
 否则 Bing 只返回空页或挑战页。自建 SearXNG 设置
 `searxng_url = "http://127.0.0.1:8888"`（运维自有端点，不受私网 URL 校验约束）。页面读取
@@ -96,9 +96,17 @@
 `total_timeout_seconds` 控制工具总时限，`max_concurrency` 和 `max_cache_entries`
 分别限制 Profile 的请求并发与缓存规模。
 
-查询建议：`bing_cn` 对简短关键词效果最好。过长的自然语言查询（例如
-「武汉未来三天天气预报」）可能被 Bing 理解为城市实体而返回百科/门户页，这与
-`setlang` 参数无关；`web_research` 的子查询建议控制在 3–6 个关键词。
+搜索会验证链接并按标题、摘要与查询的相关性评估结果。高相关候选走快速路径，候选不足时
+尝试后续后端并合并去重。研究模式保留原问题及有效子查询，在同一截止时间内分配搜索和
+网页读取预算。单个页面失败时仍会返回已取得的正文或摘要，标记未完成部分。
+
+`web_search` 和 `web_research` 支持可选的 `language`、`region` 和 `freshness`
+（`day`、`week`、`month`、`year`）。工具优先选择支持所需筛选项的后端，回退到
+不支持所有筛选项的后端时会在诊断中标记。后端次数、单次超时、搜索预算比例和相关性阈值
+均在 `server.yaml` 的 `web` 段配置。
+
+桌面会话会在工具结果上显示检索状态，展开后可查看后端耗时、抓取失败原因和引用来源。
+升级前创建且冻结了旧联网工具定义的会话可按界面提示分支，以绑定更新后的工具定义。
 
 ### 审批与 Deep 研究模式
 

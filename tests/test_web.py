@@ -14,13 +14,19 @@ from deep_harness.application.tools import (
     ToolGateway,
     tool_definitions,
 )
+from deep_harness.application.web_tools import WebResearchArgs, execute_web_tool
 from deep_harness.bootstrap import ProjectHost
 from deep_harness.domain.models import DomainError, ToolCall
 from deep_harness.infrastructure.web import FakeProvider, WebClient
 from deep_harness.infrastructure.web.cards import evidence_pack
 from deep_harness.infrastructure.web.extract import extract_text
-from deep_harness.infrastructure.web.models import SearchHit, Source
-from deep_harness.infrastructure.web.providers import StaticFetchProvider
+from deep_harness.infrastructure.web.models import FetchResult, SearchHit, SearchOptions, Source
+from deep_harness.infrastructure.web.providers import (
+    BraveProvider,
+    JinaProvider,
+    StaticFetchProvider,
+)
+from deep_harness.infrastructure.web.relevance import research_queries
 from deep_harness.infrastructure.web.security import validate_public_url
 from deep_harness.infrastructure.web.settings import WebSettings
 from deep_harness.runtime.models import DiagnosticModel
@@ -70,6 +76,138 @@ async def test_router_falls_back_to_the_next_backend():
         await web.close()
 
 
+async def test_fetch_keeps_empty_page_diagnostics_without_caching():
+    url = "https://example.org/empty"
+    fake = FakeProvider(pages={url: FetchResult(url, status="partial", note="empty page")})
+    web = WebClient(web_settings(), providers={"fake": fake})
+    try:
+        for _ in range(2):
+            result = await web.fetch(url, 1200)
+            assert "partial" in result
+            assert "empty page" in result
+        assert fake.calls == [("fetch", url), ("fetch", url)]
+    finally:
+        await web.close()
+
+
+@pytest.mark.parametrize(
+    ("query", "unrelated", "related"),
+    [
+        ("上海未来一周天气预报", "上海市人民政府", "上海七天天气预报"),
+        ("杭州未来一周天气预报", "杭州市地图", "杭州七天天气预报"),
+        ("Python 3.12 asyncio timeout", "Python 2.7 download", "Python 3.12 asyncio timeout"),
+        ("武汉近期公交票价政策", "武汉城市地图", "武汉公交票价政策发布"),
+    ],
+)
+async def test_low_relevance_from_first_backend_triggers_fallback(query, unrelated, related):
+    poor = FakeProvider(name="poor", hits=[SearchHit(unrelated, "https://example.org/poor")])
+    good = FakeProvider(name="good", hits=[SearchHit(related, "https://example.org/good")])
+    settings = web_settings(routing=("poor", "good"))
+    web = WebClient(settings, providers={"poor": poor, "good": good})
+    try:
+        result = await web.search(query, 3, 2000)
+        assert "https://example.org/good" in result
+        assert "poor:low_relevance" in result
+        assert "https://example.org/poor" not in result
+    finally:
+        await web.close()
+
+
+async def test_research_keeps_finished_evidence_after_enrichment_deadline():
+    fast, slow = "https://example.org/fast", "https://example.org/slow"
+
+    class SlowPageProvider(FakeProvider):
+        async def fetch(self, url):
+            if url == slow:
+                await asyncio.sleep(10)
+            return await super().fetch(url)
+
+    fake = SlowPageProvider(
+        hits=[SearchHit("Library", fast), SearchHit("Library update", slow, snippet="summary")],
+        pages={fast: FetchResult(fast, text="First paragraph\n\nSecond paragraph")},
+    )
+    web = WebClient(web_settings(total_timeout_seconds=0.25), providers={"fake": fake})
+    try:
+        result = await execute_web_tool(
+            "web_research", WebResearchArgs(question="library"), web
+        )
+        assert "检索状态: partial" in result
+        assert "First paragraph\n\nSecond paragraph" in result
+        assert "抓取超时" in result and "证据类型: 搜索摘要" in result
+    finally:
+        await web.close()
+
+
+async def test_batch_extract_counts_only_sources_with_content():
+    empty, original, final = (
+        "https://example.org/empty", "https://example.org/start", "https://example.org/final"
+    )
+    fake = FakeProvider(pages={
+        empty: FetchResult(empty, status="partial", note="页面未提取到正文"),
+        original: FetchResult(final, text="A paragraph", published_at="2026-11-20"),
+    })
+    web = WebClient(web_settings(), providers={"fake": fake})
+    try:
+        result = await web.extract([empty, original], 2000)
+        assert "检索状态: partial" in result
+        assert "来源数：1" in result and "[2]" not in result
+        assert "页面未提取到正文" in result
+        assert f"原始 URL: {original}" in result and f"URL: {final}" in result
+        assert "发布日期: 2026-11-20" in result
+    finally:
+        await web.close()
+
+
+async def test_search_options_choose_supporting_provider_and_reach_request():
+    sent = []
+
+    def handler(request):
+        sent.append(request.url.params)
+        return httpx.Response(200, json={"web": {"results": [
+            {"title": "Python release notes", "url": "https://example.org/release"},
+        ]}})
+
+    fake = FakeProvider(hits=hits())
+    settings = web_settings(routing=("fake", "brave"))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        brave = BraveProvider(client, key="test-key")
+        web = WebClient(settings, providers={"fake": fake, "brave": brave}, client=client)
+        try:
+            result = await web.search("Python release notes", 3, 2000, SearchOptions(
+                language="en", region="GB", freshness="week",
+            ))
+            assert "后端=brave" in result and not fake.calls
+            assert dict(sent[0]) == {
+                "q": "Python release notes", "count": "3", "search_lang": "en",
+                "country": "GB", "freshness": "pw",
+            }
+        finally:
+            await web.close()
+
+
+def test_query_variants_preserve_constraints_and_collapse_duplicates():
+    question = "请查询上海未来一周天气 Python 3.12"
+    variants = research_queries(question, [question, "  " + question], 4)
+    assert variants[0] == question and len(variants) == len(set(variants)) > 1
+    assert all("上海" in query and "未来一周" in query and "3.12" in query for query in variants)
+
+
+async def test_jina_without_key_is_a_reader_only():
+    def handler(request):
+        assert request.url.host == "r.jina.ai"
+        return httpx.Response(200, text="Retrieved text")
+
+    settings = web_settings(routing=("jina",), extract_routing=("jina",))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        web = WebClient(settings, providers={"jina": JinaProvider(client)}, client=client)
+        try:
+            assert web.health()["search_backends"] == []
+            result = await web.fetch("https://example.org", 1000)
+            assert "Retrieved text" in result
+        finally:
+            await web.close()
+
+
 async def test_all_backends_failing_raises_domain_error():
     broken = FakeProvider(fail=True, name="broken")
     web = WebClient(web_settings(routing=("broken",)), providers={"broken": broken})
@@ -106,9 +244,10 @@ async def test_research_fans_out_queries_and_deduplicates():
     web = WebClient(web_settings(), providers={"fake": fake})
     try:
         result = await web.research("compare", ["q1", "q2", "q3"], 4, 3000)
-        assert "深度联网研究" in result and "子查询=3" in result
+        assert "深度联网研究" in result and "子查询=4" in result
+        assert ("search", "compare", 4) in fake.calls
         assert len(fake.calls) >= 3
-        assert result.count("https://example.org/a") == 1
+        assert result.splitlines().count("URL: https://example.org/a") == 1
         assert len(result) <= 3400
     finally:
         await web.close()

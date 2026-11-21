@@ -13,11 +13,17 @@ class _ReadableParser(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.title = ""
+        self.published_at = ""
         self._in_title = False
         self._depth = 0
         self._parts: list[str] = []
 
     def handle_starttag(self, tag, attrs):
+        if tag == "meta" and not self.published_at:
+            values = dict(attrs)
+            key = values.get("property") or values.get("name") or values.get("itemprop")
+            if key in {"article:published_time", "datePublished", "pubdate"}:
+                self.published_at = publication_date(values.get("content"))
         if tag == "title":
             self._in_title = True
         if tag in _SKIP_TAGS:
@@ -47,12 +53,19 @@ def fallback_title(html: str) -> str:
     return re.sub(r"\s+", " ", match.group(1)).strip() if match else ""
 
 
-def extract_text(
+def publication_date(value: object) -> str:
+    """Keep explicit ISO publication dates without inferring one from article text."""
+    if isinstance(value, str) and re.match(r"^\d{4}-\d{2}-\d{2}(?:$|[T ])", value):
+        return value[:10]
+    return ""
+
+
+def extract_page(
     html: str, *, max_chars: int = number("web.max_response_chars_max")
-) -> tuple[str, str]:
-    """Return (clean_text, title). Never raises on malformed HTML."""
+) -> tuple[str, str, str]:
+    """Return clean text, title and any explicit publication date."""
     if not isinstance(html, str) or not html:
-        return "", ""
+        return "", "", ""
     sample = html[:MAX_HTML_BYTES]
     clean = ""
     try:
@@ -73,4 +86,11 @@ def extract_text(
     if not clean:
         clean = parser.text()
     clean = re.sub(r"\n{3,}", "\n\n", clean).strip()
-    return clean[:max_chars], title[: number("web.provider_title_chars")]
+    return clean[:max_chars], title[: number("web.provider_title_chars")], parser.published_at
+
+
+def extract_text(
+    html: str, *, max_chars: int = number("web.max_response_chars_max")
+) -> tuple[str, str]:
+    text, title, _ = extract_page(html, max_chars=max_chars)
+    return text, title

@@ -95,11 +95,11 @@ async def test_bing_cn_sends_browser_ua_and_short_circuits_foreign_fallback():
         WebSettings(routing=("bing_cn", "ddgs", "jina"), extract_routing=()), client=client
     )
     try:
-        result = await web.search("武汉天气", 2, 1500)
+        result = await web.search("First result", 2, 1500)
         # A short/custom UA makes Bing serve a challenge page: this is the key regression.
         assert len(seen) == 1
         assert seen[0].headers["User-Agent"] == BROWSER_UA
-        assert seen[0].url.params["q"] == "武汉天气"
+        assert seen[0].url.params["q"] == "First result"
         assert "后端=bing_cn" in result and "回退=无" in result
         assert "https://example.com/one" in result
         assert "ddgs" not in result and "jina" not in result
@@ -107,6 +107,24 @@ async def test_bing_cn_sends_browser_ua_and_short_circuits_foreign_fallback():
     finally:
         await web.close()
         await client.aclose()
+
+
+async def test_bing_redirect_retries_fixed_search_endpoint_with_original_query():
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if request.url.host == "cn.bing.com":
+            return httpx.Response(301, headers={"Location": "https://www.bing.com/"})
+        return httpx.Response(200, text=SERP)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        backend = build_providers(WebSettings(), client)["bing_cn"]
+        hits = await backend.search("First result", 2)
+    assert len(hits) == 2
+    assert [request.url.host for request in requests] == ["cn.bing.com", "www.bing.com"]
+    assert all(request.url.path == "/search" for request in requests)
+    assert all(request.url.params["q"] == "First result" for request in requests)
 
 
 class FailingProvider:

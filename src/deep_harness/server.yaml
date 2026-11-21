@@ -30,6 +30,11 @@ web:
   - static
   request_timeout_seconds: 15
   total_timeout_seconds: 30
+  provider_timeout_seconds: 10
+  max_search_backends: 4
+  research_search_fraction: 0.65
+  relevance_threshold: 0.45
+  relevance_fast_path: 0.66
   max_cache_entries: 128
   max_response_chars: 8000
   max_sources: 6
@@ -77,12 +82,14 @@ web:
   exa_text_chars: 4000
   bing_min_candidate_count: 10
   jina_snippet_chars: 400
-  ddgs_engine_timeout_seconds: 10
+  ddgs_engine_timeout_seconds: 6
   ddgs_wait_seconds: 15
+  ddgs_max_workers: 2
   max_redirect_attempts: 6
   static_body_multiplier: 4
   evidence_footer_reserve_chars: 64
   evidence_wrapper_reserve_chars: 96
+  evidence_diagnostic_chars: 1000
   jina_preview_lines: 3
 execution:
   max_model_calls: 16

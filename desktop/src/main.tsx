@@ -25,6 +25,7 @@ import {
 import type { Admission } from './protocol'
 import { TaskComposer } from './task-composer'
 import { TaskInspector } from './task-inspector'
+import { webResultStatus } from './web-result'
 import './styles.css'
 
 // Injected by build.mjs from package.json so the sidebar label always matches
@@ -188,7 +189,7 @@ function Chat({ newSession }: { newSession: () => void }) {
                 </div>
                 {message.role === 'tool' ? (
                   <details>
-                    <summary>工具执行结果 · 展开查看</summary>
+                    <summary>{webResultStatus(message.content) ?? '工具执行结果'} · 展开查看</summary>
                     <div className="message-content">
                       {typeof message.content === 'string' ? message.content : JSON.stringify(message.content, null, 2)}
                     </div>

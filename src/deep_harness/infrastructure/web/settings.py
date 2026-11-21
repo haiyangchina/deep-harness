@@ -42,6 +42,19 @@ class WebSettings(BaseModel):
         default=number("web.cache_ttl_seconds"), ge=0, le=number("web.cache_ttl_seconds_max")
     )
     allow_private_urls: bool = setting("web.allow_private_urls")
+    provider_timeout_seconds: float = Field(
+        default=number("web.provider_timeout_seconds"),
+        gt=0,
+        le=number("web.request_timeout_seconds_max"),
+    )
+    max_search_backends: int = Field(
+        default=number("web.max_search_backends"), ge=1, le=number("web.max_queries_max")
+    )
+    research_search_fraction: float = Field(
+        default=number("web.research_search_fraction"), gt=0, lt=1
+    )
+    relevance_threshold: float = Field(default=number("web.relevance_threshold"), gt=0, le=1)
+    relevance_fast_path: float = Field(default=number("web.relevance_fast_path"), gt=0, le=1)
 
     searxng_url: str | None = setting("web.searxng_url")
     firecrawl_url: str | None = setting("web.firecrawl_url")
