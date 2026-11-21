@@ -13,6 +13,9 @@ from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import Admission, DomainError, ExecutionClaim, Session
 from deep_harness.infrastructure import schema as s
 from deep_harness.infrastructure.migrations import migrate
+from deep_harness.server_config import number
+
+LIVE_PAGE_SIZE = number("pagination.live_page_size")
 
 
 def admission_from(row) -> Admission:
@@ -34,7 +37,7 @@ class BusinessStore:
         self.changed = asyncio.Condition()
         self.engine = create_async_engine(
             f"sqlite+aiosqlite:///{(home / 'business.db').as_posix()}",
-            connect_args={"timeout": 10},
+            connect_args={"timeout": number("storage.sqlite_busy_timeout_seconds")},
         )
 
     async def open(self) -> None:
@@ -71,8 +74,10 @@ class BusinessStore:
                     f"Profile workspace is {previous}; use that workspace or a new profile",
                 )
 
-    async def list_sessions(self, principal: str, *, after: str = "", limit: int = 50):
-        if not 1 <= limit <= 100:
+    async def list_sessions(
+        self, principal: str, *, after: str = "", limit: int = number("pagination.page_size")
+    ):
+        if not 1 <= limit <= number("pagination.max_page_size"):
             raise DomainError("invalid_limit", "Session page size must be between 1 and 100")
         async with self.engine.connect() as conn:
             rows = await conn.execute(
@@ -192,7 +197,7 @@ class BusinessStore:
     async def wait_for_change(self, revision: int) -> None:
         async with self.changed:
             try:
-                async with asyncio.timeout(15):
+                async with asyncio.timeout(number("transport.event_keepalive_seconds")):
                     await self.changed.wait_for(lambda: self.revision != revision)
             except TimeoutError:
                 return
@@ -421,7 +426,7 @@ class BusinessStore:
             )
             return list(rows.scalars())
 
-    async def live_history(self, session_id, *, after=None, before=None, limit=100):
+    async def live_history(self, session_id, *, after=None, before=None, limit=LIVE_PAGE_SIZE):
         """Tail or append-only cursor over all committed messages, including active turns."""
         if after is not None and before is not None:
             raise DomainError("invalid_cursor", "Provide one message cursor")
@@ -448,9 +453,11 @@ class BusinessStore:
             visible.reverse()
         return {"items": visible, "has_more": len(rows) > limit}
 
-    async def history_page(self, session_id: str, *, after: str = "", limit: int = 50):
+    async def history_page(
+        self, session_id: str, *, after: str = "", limit: int = number("pagination.page_size")
+    ):
         """Page committed completed turns in stable conversational order."""
-        if not 1 <= limit <= 100:
+        if not 1 <= limit <= number("pagination.max_page_size"):
             raise DomainError("invalid_limit", "History page size must be between 1 and 100")
         first = second = 0
         if after:
@@ -492,8 +499,14 @@ class BusinessStore:
             cursor = f"{last['turn_ordinal']}:{last['message_ordinal']}"
         return {"messages": [row["payload"] for row in visible], "next_cursor": cursor}
 
-    async def search_history(self, session_id: str, query: str, *, limit: int = 20):
-        if not query.strip() or len(query) > 200 or not 1 <= limit <= 50:
+    async def search_history(
+        self, session_id: str, query: str, *, limit: int = number("pagination.search_results")
+    ):
+        if (
+            not query.strip()
+            or len(query) > number("pagination.search_query_chars")
+            or not 1 <= limit <= number("pagination.max_search_results")
+        ):
             raise DomainError("invalid_search", "Search needs 1-200 characters and 1-50 results")
         phrase = '"' + query.strip().replace('"', '""') + '"'
         escaped = query.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
@@ -528,7 +541,11 @@ class BusinessStore:
                 select(s.events)
                 .where(s.events.c.session_id == session_id, s.events.c.seq > after)
                 .order_by(order)
-                .limit(100 if tail else 500)
+                .limit(
+                    number("pagination.event_tail_size")
+                    if tail
+                    else number("pagination.event_batch_size")
+                )
             )
             result = [dict(row) for row in rows.mappings()]
         if tail:

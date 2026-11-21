@@ -3,7 +3,9 @@
 import re
 from html.parser import HTMLParser
 
-MAX_HTML_BYTES = 2_000_000
+from deep_harness.server_config import number
+
+MAX_HTML_BYTES = number("web.max_http_body_bytes")
 _SKIP_TAGS = {"script", "style", "nav", "header", "footer", "aside", "form", "noscript", "svg"}
 
 
@@ -45,7 +47,9 @@ def fallback_title(html: str) -> str:
     return re.sub(r"\s+", " ", match.group(1)).strip() if match else ""
 
 
-def extract_text(html: str, *, max_chars: int = 32_000) -> tuple[str, str]:
+def extract_text(
+    html: str, *, max_chars: int = number("web.max_response_chars_max")
+) -> tuple[str, str]:
     """Return (clean_text, title). Never raises on malformed HTML."""
     if not isinstance(html, str) or not html:
         return "", ""
@@ -69,4 +73,4 @@ def extract_text(html: str, *, max_chars: int = 32_000) -> tuple[str, str]:
     if not clean:
         clean = parser.text()
     clean = re.sub(r"\n{3,}", "\n\n", clean).strip()
-    return clean[:max_chars], title[:200]
+    return clean[:max_chars], title[: number("web.provider_title_chars")]

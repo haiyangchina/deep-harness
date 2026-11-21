@@ -1,8 +1,16 @@
 """Model routing defaults and explicit offline/remote overrides."""
 
+import os
+import subprocess
+import sys
+
 import pytest
 
-from deep_harness.application.config import load_model_settings
+from deep_harness.application.config import (
+    load_execution_settings,
+    load_model_settings,
+    load_web_settings,
+)
 from deep_harness.cli import build_host, parser
 from deep_harness.runtime.models import DiagnosticModel
 
@@ -97,3 +105,56 @@ def test_ollama_response_error_surfaces_safe_http_status():
         raise ResponseError("upstream details", status_code=502)
     assert error.value.code == "ollama_response_error"
     assert "upstream details" not in str(error.value)
+
+
+def test_yaml_runtime_config_can_contain_only_execution_settings(tmp_path):
+    path = tmp_path / "runtime.yaml"
+    path.write_text("execution:\n  max_model_calls: 24\n", encoding="utf-8")
+    assert load_execution_settings(path).max_model_calls == 24
+    assert load_model_settings(path).name == "qwen3.5:9b"
+    assert load_web_settings(path).request_timeout_seconds == 15
+    assert load_model_settings(path, name="cli-priority").name == "cli-priority"
+
+
+def test_server_yaml_overrides_both_defaults_and_tool_validation(tmp_path):
+    path = tmp_path / "server.yml"
+    path.write_text(
+        "model:\n  base_url: null\n"
+        "execution:\n  max_model_calls: 30\n"
+        "shell:\n  timeout_seconds: 7\n  timeout_seconds_max: 9\n"
+        "pagination:\n  page_size: 42\n"
+        "workspace:\n  skip_directories: [.git, vendor]\n"
+        "web:\n  routing: [bing_cn]\n  tavily_api_key_env: CUSTOM_TAVILY_KEY\n",
+        encoding="utf-8",
+    )
+    probe = """
+from pydantic import ValidationError
+from deep_harness.application.config import ExecutionSettings, load_model_settings
+from deep_harness.application.shell import BashArgs
+from deep_harness.application.workspace import SKIP_DIRECTORIES
+from deep_harness.cli import parser
+from deep_harness.infrastructure.web.settings import WebSettings
+
+assert "vendor" in SKIP_DIRECTORIES
+assert load_model_settings().base_url is None
+assert WebSettings().routing == ("bing_cn",)
+assert WebSettings().tavily_api_key_env == "CUSTOM_TAVILY_KEY"
+assert ExecutionSettings().max_model_calls == 30
+assert BashArgs(command="hello").timeout_seconds == 7
+assert parser().parse_args(["--state-dir", "unused", "sessions"]).limit == 42
+try:
+    BashArgs(command="hello", timeout_seconds=10)
+except ValidationError:
+    pass
+else:
+    raise AssertionError("The YAML limit was ignored")
+"""
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", probe],
+        env={**os.environ, "DEEP_HARNESS_SERVER_CONFIG": str(path)},
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr

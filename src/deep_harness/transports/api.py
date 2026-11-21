@@ -11,10 +11,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from deep_harness.application.capabilities import manifest
-from deep_harness.application.jobs import CreateJob
+from deep_harness.application.jobs import CreateJob, JobBudget
 from deep_harness.application.workspace import PROJECT_PROMPT
 from deep_harness.domain.models import DomainError, Harness
 from deep_harness.runtime.inference import usage_totals
+from deep_harness.server_config import number
 from deep_harness.transports.events import stream_events
 from deep_harness.transports.operations import operations_router
 
@@ -24,8 +25,8 @@ class RequestModel(BaseModel):
 
 
 class CreateSession(RequestModel):
-    request_id: str = Field(min_length=1, max_length=128)
-    prompt: str = Field(default=PROJECT_PROMPT, max_length=32_000)
+    request_id: str = Field(min_length=1, max_length=number("api.request_id_max_length"))
+    prompt: str = Field(default=PROJECT_PROMPT, max_length=number("api.prompt_max_length"))
     tools: tuple[str, ...] | None = None
     engine: Literal["standard", "deep"] = "standard"
     harness: Harness = "general"
@@ -42,16 +43,16 @@ class ChangePermissions(RequestModel):
 
 
 class RevokeReuse(RequestModel):
-    admission_id: str = Field(min_length=1, max_length=256)
+    admission_id: str = Field(min_length=1, max_length=number("api.admission_id_max_length"))
 
 
 class SubmitInput(RequestModel):
-    submission_id: str = Field(min_length=1, max_length=128)
-    text: str = Field(min_length=1, max_length=128_000)
+    submission_id: str = Field(min_length=1, max_length=number("api.submission_id_max_length"))
+    text: str = Field(min_length=1, max_length=number("api.text_max_length"))
 
 
 class ApprovalResponse(RequestModel):
-    interaction_id: str = Field(min_length=1, max_length=256)
+    interaction_id: str = Field(min_length=1, max_length=number("api.interaction_id_max_length"))
     generation: int = Field(ge=1)
     decision: Literal["approve", "deny"]
 
@@ -59,11 +60,11 @@ class ApprovalResponse(RequestModel):
 class JobCommand(RequestModel):
     action: Literal["pause", "resume", "cancel", "accept"]
     position: int | None = Field(default=None, ge=0)
-    evidence: str | None = Field(default=None, max_length=2000)
+    evidence: str | None = Field(default=None, max_length=number("api.evidence_max_length"))
 
 
 class ForkSession(RequestModel):
-    request_id: str = Field(min_length=1, max_length=128)
+    request_id: str = Field(min_length=1, max_length=number("api.request_id_max_length"))
 
 
 class BindRuntime(RequestModel):
@@ -71,7 +72,7 @@ class BindRuntime(RequestModel):
 
 
 def create_api(host, token: str) -> FastAPI:
-    if len(token) < 32:
+    if len(token) < number("transport.min_operator_token_chars"):
         raise ValueError("Local operator token must contain at least 32 characters")
 
     @asynccontextmanager
@@ -105,6 +106,16 @@ def create_api(host, token: str) -> FastAPI:
     async def create_job(profile_id: str, body: CreateJob):
         service = await host.application(profile_id)
         return await service.create_job(body)
+
+    @app.get("/profiles/{profile_id}/jobs/defaults", dependencies=[Depends(authenticate)])
+    async def job_defaults(profile_id: str):
+        await host.application(profile_id)
+        return {
+            "wall_seconds": JobBudget().wall_seconds,
+            "wall_seconds_max": number("job_budget.wall_seconds_max"),
+            "stages_max": number("jobs.stages_max_length"),
+            "parallelism_max": number("jobs.parallelism_max"),
+        }
 
     @app.get("/profiles/{profile_id}/jobs/{job_id}", dependencies=[Depends(authenticate)])
     async def job_detail(profile_id: str, job_id: str):
@@ -171,7 +182,9 @@ def create_api(host, token: str) -> FastAPI:
     async def sessions(
         profile_id: str,
         after: str = "",
-        limit: Annotated[int, Query(ge=1, le=100)] = 50,
+        limit: Annotated[int, Query(ge=1, le=number("pagination.max_page_size"))] = number(
+            "pagination.page_size"
+        ),
     ):
         service = await host.application(profile_id)
         return jsonable_encoder(
@@ -247,7 +260,9 @@ def create_api(host, token: str) -> FastAPI:
         profile_id: str,
         session_id: str,
         after: str = "",
-        limit: Annotated[int, Query(ge=1, le=100)] = 50,
+        limit: Annotated[int, Query(ge=1, le=number("pagination.max_page_size"))] = number(
+            "pagination.page_size"
+        ),
     ):
         service = await host.application(profile_id)
         await service.store.get_session(session_id, "operator")
@@ -260,8 +275,10 @@ def create_api(host, token: str) -> FastAPI:
     async def search_messages(
         profile_id: str,
         session_id: str,
-        q: Annotated[str, Query(min_length=1, max_length=200)],
-        limit: Annotated[int, Query(ge=1, le=50)] = 20,
+        q: Annotated[str, Query(min_length=1, max_length=number("pagination.search_query_chars"))],
+        limit: Annotated[int, Query(ge=1, le=number("pagination.max_search_results"))] = number(
+            "pagination.search_results"
+        ),
     ):
         service = await host.application(profile_id)
         await service.store.get_session(session_id, "operator")
@@ -336,7 +353,9 @@ def create_api(host, token: str) -> FastAPI:
         session_id: str,
         after: Annotated[int | None, Query(ge=0, le=2**53 - 1)] = None,
         before: Annotated[int | None, Query(ge=1, le=2**53 - 1)] = None,
-        limit: Annotated[int, Query(ge=1, le=100)] = 100,
+        limit: Annotated[int, Query(ge=1, le=number("pagination.max_page_size"))] = number(
+            "pagination.live_page_size"
+        ),
     ):
         service = await host.application(profile_id)
         await service.store.get_session(session_id, "operator")

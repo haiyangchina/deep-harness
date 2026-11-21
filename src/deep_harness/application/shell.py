@@ -13,13 +13,16 @@ from pydantic import BaseModel, ConfigDict, Field
 from deep_harness.application.process_environment import command_environment
 from deep_harness.domain.models import DomainError
 from deep_harness.infrastructure.windows_job import WindowsJob
+from deep_harness.server_config import number
 
 
 class BashArgs(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    command: str = Field(min_length=1, max_length=32_000)
+    command: str = Field(min_length=1, max_length=number("shell.command_max_length"))
     cwd: str = Field(default=".", min_length=1)
-    timeout_seconds: float = Field(default=30, ge=1, le=120)
+    timeout_seconds: float = Field(
+        default=number("shell.timeout_seconds"), ge=1, le=number("shell.timeout_seconds_max")
+    )
     shell: Literal["auto", "bash", "powershell"] = "auto"
 
 
@@ -61,9 +64,9 @@ def shell_command(arguments, workspace_path):
 async def drain_output(stream):
     data = bytearray()
     total = 0
-    while chunk := await stream.read(8192):
+    while chunk := await stream.read(number("streams.read_chunk_bytes")):
         total += len(chunk)
-        data.extend(chunk[: max(0, 65_536 - len(data))])
+        data.extend(chunk[: max(0, number("shell.stream_limit_bytes") - len(data))])
     return data.decode("utf-8", errors="replace"), total > len(data)
 
 

@@ -4,6 +4,7 @@ import asyncio
 from functools import wraps
 
 from deep_harness.domain.models import DomainError
+from deep_harness.server_config import number
 
 
 def mutation(method):
@@ -32,7 +33,9 @@ async def drain_tasks(tasks, grace_seconds):
     for task in pending:
         task.cancel()
     if pending:
-        _, stuck = await asyncio.wait(pending, timeout=max(1, grace_seconds))
+        _, stuck = await asyncio.wait(
+            pending, timeout=max(number("lifecycle.cancel_grace_min_seconds"), grace_seconds)
+        )
         if stuck:
             raise DomainError(
                 "shutdown_incomplete", "Some owned tasks did not stop before shutdown"

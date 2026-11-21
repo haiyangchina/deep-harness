@@ -5,12 +5,13 @@ from sqlalchemy import insert, select, update
 from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import DomainError
 from deep_harness.infrastructure import schema as s
+from deep_harness.server_config import number
 
 
 async def reconcile(store, session_id, admission_id, generation, evidence, effects):
-    if not evidence.strip() or len(evidence) > 16_000:
+    if not evidence.strip() or len(evidence) > number("reconciliation.evidence_max_length"):
         raise DomainError(
-            "invalid_evidence", "Provide 1–16000 characters of reconciliation evidence"
+            "invalid_evidence", "Provide evidence within the configured character limit"
         )
     digest = fingerprint({"generation": generation, "evidence": evidence, "effects": effects})
     async with store.transaction() as conn:

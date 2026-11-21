@@ -8,6 +8,7 @@ import sys
 import uvicorn
 
 from deep_harness.cli import build_host, parser
+from deep_harness.server_config import number, setting
 from deep_harness.transports.api import create_api
 
 
@@ -18,7 +19,7 @@ async def run(args, token):
         await host.application(args.profile)
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
             listener.bind(("127.0.0.1", 0))
-            listener.listen(128)
+            listener.listen(number("transport.desktop_socket_backlog"))
             listener.setblocking(False)
 
             class DesktopServer(uvicorn.Server):
@@ -33,7 +34,9 @@ async def run(args, token):
                     await asyncio.to_thread(sys.stdin.readline)
                     self.should_exit = True
 
-            config = uvicorn.Config(create_api(host, token), log_level="warning")
+            config = uvicorn.Config(
+                create_api(host, token), log_level=setting("transport.desktop_log_level")
+            )
             server = DesktopServer(config)
             await server.serve(sockets=[listener])
     finally:
@@ -46,7 +49,7 @@ def main():
         raise SystemExit("Desktop transport requires serve")
     request = json.loads(sys.stdin.readline())
     token = request["token"]
-    if not isinstance(token, str) or len(token) < 32:
+    if not isinstance(token, str) or len(token) < number("transport.min_operator_token_chars"):
         raise SystemExit("Invalid desktop capability")
     asyncio.run(run(args, token))
 

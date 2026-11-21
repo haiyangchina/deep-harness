@@ -1,21 +1,25 @@
 """Explicit model configuration without ambient provider auto-selection."""
 
-import tomllib
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from deep_harness.infrastructure.web.settings import WebSettings
+from deep_harness.server_config import defaults_for, number, read_operator_config
 
 
 class ModelSettings(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, validate_default=True)
     provider: Literal["ollama", "openai", "diagnostic"]
     name: str = Field(min_length=1)
     base_url: str | None = None
-    request_timeout_seconds: float = Field(gt=0, le=1800)
-    context_window_tokens: int = Field(default=32768, ge=4096, le=1_000_000)
+    request_timeout_seconds: float = Field(gt=0, le=number("model.request_timeout_seconds_max"))
+    context_window_tokens: int = Field(
+        default=number("model.context_window_tokens"),
+        ge=number("model.context_window_tokens_min"),
+        le=number("model.context_window_tokens_max"),
+    )
     # Thinking-enabled Ollama models (qwen3.5 and friends) put the answer in a
     # separate `thinking` field when reasoning is on. langchain-ollama does not
     # surface that streamed text in AIMessageChunk.content, so the adapter sees
@@ -26,39 +30,64 @@ class ModelSettings(BaseModel):
 
 class ExecutionSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
-    max_model_calls: int = Field(default=16, ge=1, le=128)
-    max_tool_calls: int = Field(default=64, ge=1, le=1024)
-    max_run_tokens: int = Field(default=100_000, ge=100, le=10_000_000)
+    max_model_calls: int = Field(
+        default=number("execution.max_model_calls"),
+        ge=1,
+        le=number("execution.max_model_calls_max"),
+    )
+    max_tool_calls: int = Field(
+        default=number("execution.max_tool_calls"), ge=1, le=number("execution.max_tool_calls_max")
+    )
+    max_run_tokens: int = Field(
+        default=number("execution.max_run_tokens"),
+        ge=number("execution.max_run_tokens_min"),
+        le=number("execution.max_run_tokens_max"),
+    )
     # A single `read` page can return OUTPUT_CHARS (24_000) characters. Leave room for
     # several such pages plus prompt, tool schemas and summary instead of letting one
     # full-page read consume the entire budget. The provider byte budget from
     # context_window_tokens remains the effective cap for small windows.
-    max_context_characters: int = Field(default=96_000, ge=2000, le=1_000_000)
-    summary_characters: int = Field(default=2000, ge=256, le=4000)
-    wall_seconds: float = Field(default=600, ge=1, le=3600)
+    max_context_characters: int = Field(
+        default=number("execution.max_context_characters"),
+        ge=number("execution.max_context_characters_min"),
+        le=number("execution.max_context_characters_max"),
+    )
+    summary_characters: int = Field(
+        default=number("execution.summary_characters"),
+        ge=number("execution.summary_characters_min"),
+        le=number("execution.summary_characters_max"),
+    )
+    wall_seconds: float = Field(
+        default=number("execution.wall_seconds"), ge=1, le=number("execution.wall_seconds_max")
+    )
 
     @model_validator(mode="after")
     def context_reserve(self):
-        if self.max_context_characters - self.summary_characters < 1024:
-            raise ValueError("Context budget must leave at least 1024 characters after summary")
+        reserve = number("execution.min_context_reserve_chars")
+        if self.max_context_characters - self.summary_characters < reserve:
+            raise ValueError(
+                f"Context budget must leave at least {reserve} characters after summary"
+            )
         return self
 
 
-def load_execution_settings(path: Path | None = None):
-    if path is None:
-        return ExecutionSettings()
-    with path.open("rb") as stream:
-        return ExecutionSettings.model_validate(tomllib.load(stream).get("execution", {}))
+def _operator_section(path, section, model):
+    values = read_operator_config(path).get(section, {})
+    shared = defaults_for(section, values)
+    return {
+        key: value
+        for key, value in values.items()
+        if key in model.model_fields or key not in shared
+    }
+
+
+def load_execution_settings(path: Path | None = None) -> ExecutionSettings:
+    return ExecutionSettings.model_validate(_operator_section(path, "execution", ExecutionSettings))
 
 
 def load_model_settings(path: Path | None = None, **overrides) -> ModelSettings:
-    defaults_path = Path(__file__).parents[1] / "defaults.toml"
-    with defaults_path.open("rb") as stream:
-        settings = tomllib.load(stream)["model"]
-    file_settings = {}
-    if path is not None:
-        with path.open("rb") as stream:
-            file_settings = tomllib.load(stream)["model"]
+    settings = defaults_for("model", ModelSettings.model_fields)
+    file_settings = _operator_section(path, "model", ModelSettings)
     provider = overrides.get("provider") or file_settings.get("provider", settings["provider"])
     if provider != settings["provider"]:
         settings["base_url"] = None
@@ -68,11 +97,7 @@ def load_model_settings(path: Path | None = None, **overrides) -> ModelSettings:
 
 
 def load_web_settings(path: Path | None = None) -> WebSettings:
-    """Read [web] from packaged defaults, then overlay an operator TOML file."""
-    defaults_path = Path(__file__).parents[1] / "defaults.toml"
-    with defaults_path.open("rb") as stream:
-        settings = dict(tomllib.load(stream).get("web", {}))
-    if path is not None and path.exists():
-        with path.open("rb") as stream:
-            settings.update(tomllib.load(stream).get("web", {}))
+    """Overlay per-launch settings on the common YAML defaults."""
+    settings = defaults_for("web", WebSettings.model_fields)
+    settings.update(_operator_section(path, "web", WebSettings))
     return WebSettings.model_validate(settings)

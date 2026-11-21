@@ -19,9 +19,10 @@ from deep_harness.infrastructure.web.bing_cn import BROWSER_UA, parse_bing_resul
 from deep_harness.infrastructure.web.extract import MAX_HTML_BYTES, extract_text
 from deep_harness.infrastructure.web.models import FetchResult, SearchHit
 from deep_harness.infrastructure.web.security import resolve_fetch_addresses, validate_public_url
+from deep_harness.server_config import number, setting
 
 USER_AGENT = "deep-harness/1.0 (bounded web research)"
-MAX_BACKEND_TEXT = 64_000
+MAX_BACKEND_TEXT = number("web.max_backend_text_chars")
 _URL_RE = re.compile(r"https?://[^\s)\]>\"']+")
 
 
@@ -41,9 +42,9 @@ def _key(env_name: str) -> str | None:
 
 def _hit(row: dict, *, title: str, url: str, snippet: str, text: str = "", provider: str = ""):
     return SearchHit(
-        title=str(row.get(title) or "")[:200],
+        title=str(row.get(title) or "")[: number("web.provider_title_chars")],
         url=str(row.get(url) or ""),
-        snippet=str(row.get(snippet) or "")[:600],
+        snippet=str(row.get(snippet) or "")[: number("web.provider_snippet_chars")],
         text=str(row.get(text) or "")[:MAX_BACKEND_TEXT] if text else "",
         provider=provider,
     )
@@ -65,7 +66,9 @@ class HttpProvider:
             async with self.client.stream(method, url, **kwargs) as response:
                 response.raise_for_status()
                 content = bytearray()
-                async for chunk in response.aiter_bytes(chunk_size=8192):
+                async for chunk in response.aiter_bytes(
+                    chunk_size=number("streams.read_chunk_bytes")
+                ):
                     if len(content) + len(chunk) > MAX_HTML_BYTES:
                         raise DomainError(
                             "web_response_large", f"{self.name} response exceeded limit"
@@ -124,7 +127,7 @@ class ExaProvider(HttpProvider):
             json={
                 "query": query,
                 "numResults": limit,
-                "contents": {"text": {"maxCharacters": 4000}},
+                "contents": {"text": {"maxCharacters": number("web.exa_text_chars")}},
             },
         )
         rows = response.json().get("results", [])
@@ -219,11 +222,15 @@ class BingCnProvider(HttpProvider):
         response = await self._request(
             "GET",
             "https://cn.bing.com/search",
-            params={"q": query, "count": max(limit * 2, 10), "setlang": "zh-CN"},
+            params={
+                "q": query,
+                "count": max(limit * 2, number("web.bing_min_candidate_count")),
+                "setlang": setting("web.bing_language"),
+            },
             headers={
                 "User-Agent": BROWSER_UA,
                 "Accept": "text/html",
-                "Accept-Language": "zh-CN,zh;q=0.9",
+                "Accept-Language": setting("web.bing_accept_language"),
             },
         )
         return parse_bing_results(response.text, limit, self.name)
@@ -251,16 +258,18 @@ def _parse_jina_search(text: str, limit: int, provider: str) -> list[SearchHit]:
             following = next(
                 (
                     lines[j]
-                    for j in range(index + 1, min(len(lines), index + 4))
+                    for j in range(
+                        index + 1, min(len(lines), index + 1 + number("web.jina_preview_lines"))
+                    )
                     if lines[j] and not _URL_RE.search(lines[j])
                 ),
                 "",
             )
             hits.append(
                 SearchHit(
-                    title=re.sub(r"^\[\d+\]\s*", "", previous)[:160],
+                    title=re.sub(r"^\[\d+\]\s*", "", previous)[: number("web.display_title_chars")],
                     url=url,
-                    snippet=following[:400],
+                    snippet=following[: number("web.jina_snippet_chars")],
                     provider=provider,
                 )
             )
@@ -339,7 +348,9 @@ class FirecrawlProvider(HttpProvider):
             return None
         return FetchResult(
             url=url,
-            title=str(data.get("metadata", {}).get("title") or "")[:200],
+            title=str(data.get("metadata", {}).get("title") or "")[
+                : number("web.provider_title_chars")
+            ],
             text=text,
             provider=self.name,
             status="ok",
@@ -368,7 +379,7 @@ class DdgsProvider:
             return []
 
         def run():
-            engine = self._engine(timeout=10)
+            engine = self._engine(timeout=number("web.ddgs_engine_timeout_seconds"))
             try:
                 return list(engine.text(query, max_results=limit))
             finally:
@@ -385,7 +396,9 @@ class DdgsProvider:
                     lambda task: None if task.cancelled() else task.exception()
                 )
                 worker = self._worker
-            rows = await asyncio.wait_for(asyncio.shield(worker), timeout=15)
+            rows = await asyncio.wait_for(
+                asyncio.shield(worker), timeout=number("web.ddgs_wait_seconds")
+            )
         except TimeoutError as exc:
             raise DomainError("web_timeout", "ddgs search timed out") from exc
         except DomainError:
@@ -409,7 +422,11 @@ class StaticFetchProvider:
     available = True
 
     def __init__(
-        self, client: httpx.AsyncClient, *, max_chars: int = 32_000, allow_private: bool = False
+        self,
+        client: httpx.AsyncClient,
+        *,
+        max_chars: int = number("web.max_response_chars_max"),
+        allow_private: bool = False,
     ):
         self.client = client
         self.max_chars = max_chars
@@ -421,7 +438,7 @@ class StaticFetchProvider:
     async def fetch(self, url: str) -> FetchResult | None:
         target = httpx.URL(validate_public_url(url, allow_private=self.allow_private))
         try:
-            for _ in range(6):
+            for _ in range(number("web.max_redirect_attempts")):
                 validate_public_url(str(target), allow_private=self.allow_private)
                 addresses = await resolve_fetch_addresses(
                     target.raw_host.decode("ascii"),
@@ -443,7 +460,9 @@ class StaticFetchProvider:
                         raise DomainError("web_backend", "Unexpected compressed page response")
                     data = bytearray()
                     truncated = False
-                    async for chunk in response.aiter_bytes(chunk_size=8192):
+                    async for chunk in response.aiter_bytes(
+                        chunk_size=number("streams.read_chunk_bytes")
+                    ):
                         remaining = MAX_HTML_BYTES - len(data)
                         data.extend(chunk[:remaining])
                         if len(chunk) > remaining:
@@ -532,7 +551,7 @@ def build_providers(
         "ddgs": DdgsProvider(),
         "static": StaticFetchProvider(
             public_client or client,
-            max_chars=settings.max_response_chars * 4,
+            max_chars=settings.max_response_chars * number("web.static_body_multiplier"),
             allow_private=settings.allow_private_urls,
         ),
     }

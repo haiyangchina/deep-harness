@@ -78,7 +78,7 @@
 
 ### 后端与配置
 
-`defaults.toml` 的 `[web]` 段与 `--config` 覆盖文件均可配置。默认检索链为
+`server.yaml` 的 `web` 段与 `--config` 覆盖文件均可配置。默认检索链为
 `tavily → exa → brave → serper → searxng → bing_cn → ddgs → jina`，只有已配置
 （有 API key、有 SearXNG 地址、已安装 `ddgs`）的后端才进入链；`bing_cn` 免密钥、
 始终可用。API key 不写进 TOML，只引用环境变量名：
@@ -330,17 +330,30 @@ python scripts/dependencies.py add "alembic>=1.16,<2"
 
 ## 默认使用本机 Ollama
 
-项目默认配置位于 src/deep_harness/defaults.toml：
+服务端公共配置为 `src/deep_harness/server.yaml`。默认模型、执行预算、工具参数、
+分页、连接超时及容量等数值均从该文件读取。例如：
 
-~~~toml
-[model]
-provider = "ollama"
-name = "qwen3.5:9b"
-base_url = "http://127.0.0.1:11434"
-request_timeout_seconds = 180
-context_window_tokens = 32768
-reasoning = false
+~~~yaml
+model:
+  provider: ollama
+  name: qwen3.5:9b
+  base_url: http://127.0.0.1:11434
+  request_timeout_seconds: 180
+  context_window_tokens: 32768
+  reasoning: false
+execution:
+  max_model_calls: 16
 ~~~
+
+`workspace.skip_directories` 控制扫描忽略目录，`transport.cli_log_level` 和
+`transport.desktop_log_level` 控制日志级别。Web 的搜索路由、服务地址和凭据的环境变量名
+也在同一文件，密钥值从环境读取。
+
+部署可设置 `DEEP_HARNESS_SERVER_CONFIG` 指向一份只包含需覆盖字段的 YAML 文件，重启
+服务后应用。该方式允许覆盖所有公共配置段。现有 `--config` 或桌面运行设置支持
+YAML 与 TOML，按本次运行覆盖 `model`、`execution` 和 `web`。优先级为内置 YAML、
+部署 YAML、本次运行配置、显式 CLI 参数。运行预算或工具 schema 变更后，以新会话
+使用新配置。工具和协议版本号、HTTP 状态码和游标位宽仍按对应协议实现。
 
 `qwen3.5:9b` 是带 thinking 能力的模型。Ollama 开启 reasoning 时，回答会写入
 `message.thinking` 而不是 `message.content`，LangChain 适配器只读取 `content`，
@@ -356,7 +369,7 @@ deep-harness --state-dir .state --workspace . chat "请使用 read_file 工具�
 ~~~
 
 模型不可用时报告执行错误，不自动降级到诊断输出。--model 可覆盖模型名称，
---base-url 可覆盖 Ollama 原生 API 地址（不加 /v1）。--config 可加载自定义 TOML 模型配置。
+--base-url 可覆盖 Ollama 原生 API 地址（不加 /v1）。--config 可加载自定义 YAML 或 TOML 运行配置。
 
 离线运行集成诊断时须明确指定：
 

@@ -11,6 +11,7 @@ from deep_harness.application.capabilities import CORE_TOOLS, READ_ONLY_CORE
 from deep_harness.application.workspace import PROJECT_PROMPT
 from deep_harness.domain.models import DomainError
 from deep_harness.runtime.inference import usage_totals
+from deep_harness.server_config import number
 
 
 def display(value):
@@ -149,7 +150,7 @@ async def search(app, args):
 
 async def skill_add(app, args):
     with args.file.open("r", encoding="utf-8") as stream:
-        document = stream.read(20_001)
+        document = stream.read(number("skills.document_max_length") + 1)
     display(await app.install_skill(document))
     return 0
 

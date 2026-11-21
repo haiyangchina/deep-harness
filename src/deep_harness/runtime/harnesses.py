@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import DomainError
+from deep_harness.server_config import number
 
 GUIDES = {
     "general": "",
@@ -46,17 +47,19 @@ GUIDES = {
 
 class Evidence(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    source: str = Field(min_length=1, max_length=1000)
-    observation: str = Field(min_length=1, max_length=4000)
+    source: str = Field(min_length=1, max_length=number("harness_evidence.source_max_length"))
+    observation: str = Field(
+        min_length=1, max_length=number("harness_evidence.observation_max_length")
+    )
 
 
 class HarnessReport(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    summary: str = Field(min_length=1, max_length=8000)
-    evidence: list[Evidence] = Field(max_length=32)
-    changes: list[str] = Field(max_length=32)
-    tests: list[str] = Field(max_length=32)
-    limitations: list[str] = Field(max_length=32)
+    summary: str = Field(min_length=1, max_length=number("harness_report.summary_max_length"))
+    evidence: list[Evidence] = Field(max_length=number("harness_report.evidence_max_length"))
+    changes: list[str] = Field(max_length=number("harness_report.changes_max_length"))
+    tests: list[str] = Field(max_length=number("harness_report.tests_max_length"))
+    limitations: list[str] = Field(max_length=number("harness_report.limitations_max_length"))
 
 
 def harness_prompt(base: str, harness: str) -> str:
@@ -69,7 +72,7 @@ def harness_contract(harness: str) -> str:
 
 
 def parse_report(content: str) -> str:
-    if not isinstance(content, str) or len(content) > 64_000:
+    if not isinstance(content, str) or len(content) > number("harness_report.max_chars"):
         raise DomainError("harness_output", "Specialized harness result is not bounded text")
     value = content.strip()
     if value.startswith("```json") and value.endswith("```"):

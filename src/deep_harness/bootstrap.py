@@ -40,6 +40,10 @@ from deep_harness.runtime.deep import DeepRuntime
 from deep_harness.runtime.mcp import McpRegistry
 from deep_harness.runtime.models import DiagnosticModel
 from deep_harness.runtime.standard import StandardRuntime
+from deep_harness.server_config import number
+
+SHUTDOWN_GRACE_SECONDS = number("lifecycle.shutdown_grace_seconds")
+
 
 logger = logging.getLogger(__name__)
 
@@ -148,7 +152,7 @@ class ProfileApplication:
                     "Approval checkpoint for %s unavailable [%s]", admission.id, type(exc).__name__
                 )
 
-    async def close(self, grace_seconds=5):
+    async def close(self, grace_seconds=SHUTDOWN_GRACE_SECONDS):
         async with self.control:
             if self.closed:
                 return
@@ -606,7 +610,7 @@ class ProfileApplication:
         task = self.active.get(admission_id)
         if admission.status == "started" and task is not None:
             task.cancel()
-            await asyncio.wait({task}, timeout=5)
+            await asyncio.wait({task}, timeout=number("lifecycle.cancel_wait_seconds"))
             return await self.store.get_admission(admission_id, session_id)
         result = await self.executions.cancel_pending(session_id, admission_id)
         if result.status == "cancelled":
@@ -622,13 +626,15 @@ class ProfileApplication:
             others = self.mutations - {asyncio.current_task()}
         try:
             if others:
-                _, pending = await asyncio.wait(others, timeout=30)
+                _, pending = await asyncio.wait(
+                    others, timeout=number("lifecycle.backup_mutation_drain_seconds")
+                )
                 if pending:
                     raise DomainError(
                         "maintenance_busy", "Profile mutations did not finish in time"
                     )
             clock = asyncio.get_running_loop().time
-            deadline = clock() + 30
+            deadline = clock() + number("lifecycle.backup_execution_drain_seconds")
             while running := {task for task in self.tasks if not task.done()}:
                 _, pending = await asyncio.wait(running, timeout=max(0, deadline - clock()))
                 if pending:
@@ -714,7 +720,7 @@ class ProjectHost:
                 ).start()
             return self.apps[profile_id]
 
-    async def close(self, grace_seconds=5):
+    async def close(self, grace_seconds=SHUTDOWN_GRACE_SECONDS):
         for app in self.apps.values():
             await app.close(grace_seconds=grace_seconds)
         self.apps.clear()

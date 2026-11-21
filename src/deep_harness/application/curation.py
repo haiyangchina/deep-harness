@@ -8,6 +8,7 @@ from pathlib import Path
 from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import DomainError
 from deep_harness.infrastructure.curator import CuratorLedger
+from deep_harness.server_config import number
 
 CURATOR_PROMPT = (
     "Extract at most five stable facts or preferences explicitly stated by the user. "
@@ -34,7 +35,7 @@ class CurationService:
         retained = []
         size = 0
         for text in reversed(texts):
-            if size + len(text) > 8000:
+            if size + len(text) > number("curation.model_input_chars"):
                 break
             retained.append(text)
             size += len(text)
@@ -73,7 +74,7 @@ def auto_curation_enabled(profile_home: Path) -> bool:
 
 
 def parse_candidates(content):
-    if not isinstance(content, str) or len(content) > 10_000:
+    if not isinstance(content, str) or len(content) > number("curation.model_output_chars"):
         raise DomainError("curation_response", "Curator response is not a bounded JSON string")
     value = content.strip()
     if value.startswith("```json") and value.endswith("```"):
@@ -82,11 +83,13 @@ def parse_candidates(content):
         candidates = json.loads(value)
     except json.JSONDecodeError as exc:
         raise DomainError("curation_response", "Curator did not return valid JSON") from exc
-    if not isinstance(candidates, list) or len(candidates) > 5:
+    if not isinstance(candidates, list) or len(candidates) > number("curation.max_candidates"):
         raise DomainError("curation_response", "Curator must return at most five candidates")
     result = []
     for item in candidates:
-        if not isinstance(item, str) or not 1 <= len(item.strip()) <= 1000:
+        if not isinstance(item, str) or not 1 <= len(item.strip()) <= number(
+            "memory.content_max_length"
+        ):
             raise DomainError("curation_response", "Curator candidate content is invalid")
         normalized = item.strip()
         if normalized not in result:

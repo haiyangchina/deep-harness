@@ -9,34 +9,57 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from deep_harness.domain.models import DomainError
 from deep_harness.infrastructure.web.client import WebClient
+from deep_harness.server_config import number
 
 
 class WebSearchArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    query: str = Field(min_length=1, max_length=512)
-    max_results: int = Field(default=5, ge=1, le=10)
-    max_chars: int = Field(default=8000, ge=500, le=32_000)
+    query: str = Field(min_length=1, max_length=number("web_search.query_max_length"))
+    max_results: int = Field(
+        default=number("web_search.max_results"), ge=1, le=number("web_search.max_results_max")
+    )
+    max_chars: int = Field(
+        default=number("web_search.max_chars"),
+        ge=number("web_search.max_chars_min"),
+        le=number("web_search.max_chars_max"),
+    )
 
 
 class WebFetchArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    url: str = Field(min_length=1, max_length=2048)
-    max_chars: int = Field(default=8000, ge=500, le=32_000)
-    offset: int = Field(default=0, ge=0, le=200_000)
+    url: str = Field(min_length=1, max_length=number("web_fetch.url_max_length"))
+    max_chars: int = Field(
+        default=number("web_fetch.max_chars"),
+        ge=number("web_fetch.max_chars_min"),
+        le=number("web_fetch.max_chars_max"),
+    )
+    offset: int = Field(default=number("web_fetch.offset"), ge=0, le=number("web_fetch.offset_max"))
 
 
 class WebExtractArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    urls: list[str] = Field(min_length=1, max_length=8)
-    max_chars: int = Field(default=8000, ge=500, le=32_000)
+    urls: list[str] = Field(min_length=1, max_length=number("web_extract.urls_max_length"))
+    max_chars: int = Field(
+        default=number("web_extract.max_chars"),
+        ge=number("web_extract.max_chars_min"),
+        le=number("web_extract.max_chars_max"),
+    )
 
 
 class WebResearchArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    question: str = Field(min_length=1, max_length=4000)
-    queries: list[str] = Field(default_factory=list, max_length=6)
-    max_sources: int = Field(default=6, ge=1, le=12)
-    max_chars: int = Field(default=8000, ge=1000, le=32_000)
+    question: str = Field(min_length=1, max_length=number("web_research.question_max_length"))
+    queries: list[str] = Field(
+        default_factory=list, max_length=number("web_research.queries_max_length")
+    )
+    max_sources: int = Field(
+        default=number("web_research.max_sources"), ge=1, le=number("web_research.max_sources_max")
+    )
+    max_chars: int = Field(
+        default=number("web_research.max_chars"),
+        ge=number("web_research.max_chars_min"),
+        le=number("web_research.max_chars_max"),
+    )
 
 
 WEB_TOOL_ARGUMENTS = {
@@ -88,8 +111,8 @@ async def execute_web_tool(name: str, arguments, client: WebClient | None) -> st
                 return await client.fetch(arguments.url, arguments.max_chars, arguments.offset)
             if name == "web_extract":
                 for url in arguments.urls:
-                    if len(url) > 2048:
-                        raise DomainError("web_url", "URL exceeds 2048 characters")
+                    if len(url) > number("web_fetch.url_max_length"):
+                        raise DomainError("web_url", "URL exceeds the configured character limit")
                 return await client.extract(arguments.urls, arguments.max_chars)
             if name == "web_research":
                 return await client.research(

@@ -16,7 +16,7 @@ export function Setup({ onClose }: { onClose?: () => void }) {
     ['python', 'deep-harness 的 Python 3.12'],
     ['workspace', '项目工作目录'],
     ['stateDir', '独立运行状态目录'],
-    ['configFile', '模型 TOML 配置（可选）']
+    ['configFile', '服务端 YAML / TOML 配置（可选）']
   ] as const
   return (
     <div className="settings page">

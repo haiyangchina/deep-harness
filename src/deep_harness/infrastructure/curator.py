@@ -7,13 +7,16 @@ from sqlalchemy import insert, select, update
 from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import DomainError
 from deep_harness.infrastructure import schema as s
+from deep_harness.server_config import number
+
+RECENT_USER_TURNS = number("curation.max_recent_user_turns")
 
 
 class CuratorLedger:
     def __init__(self, store):
         self.store = store
 
-    async def completed_user_texts(self, session_id, limit=30):
+    async def completed_user_texts(self, session_id, limit=RECENT_USER_TURNS):
         async with self.store.engine.connect() as conn:
             rows = await conn.execute(
                 select(s.admissions.c.text)

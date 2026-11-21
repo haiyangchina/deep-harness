@@ -7,6 +7,7 @@ from sqlalchemy import and_, func, insert, select, update
 from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import DomainError
 from deep_harness.infrastructure import schema as s
+from deep_harness.server_config import number
 
 
 class JobLedger:
@@ -56,7 +57,7 @@ class JobLedger:
         if recoverable_only:
             query = query.where(s.jobs.c.status.in_(("running", "paused", "cancelling")))
         else:
-            query = query.order_by(s.jobs.c.id).limit(100)
+            query = query.order_by(s.jobs.c.id).limit(number("pagination.jobs_page_size"))
         async with self.store.engine.connect() as conn:
             return [dict(row) for row in (await conn.execute(query)).mappings()]
 

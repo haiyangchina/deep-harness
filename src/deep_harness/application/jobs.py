@@ -13,14 +13,15 @@ from deep_harness.application.workspace import PROJECT_PROMPT
 from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import DomainError
 from deep_harness.infrastructure.jobs import JobLedger
+from deep_harness.server_config import number
 
 
 class StagePlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    title: str = Field(min_length=1, max_length=120)
-    goal: str = Field(min_length=1, max_length=1600)
-    acceptance: str = Field(min_length=1, max_length=600)
+    title: str = Field(min_length=1, max_length=number("stage.title_max_length"))
+    goal: str = Field(min_length=1, max_length=number("stage.goal_max_length"))
+    acceptance: str = Field(min_length=1, max_length=number("stage.acceptance_max_length"))
     group: int | None = Field(default=None, ge=0)
     read_only: bool = False
     verify: bool = False
@@ -29,22 +30,38 @@ class StagePlan(BaseModel):
 class JobBudget(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    wall_seconds: int = Field(default=1800, ge=1, le=28_800)
-    max_model_calls: int = Field(default=48, ge=1, le=1024)
-    max_tool_calls: int = Field(default=192, ge=1, le=8192)
-    max_run_tokens: int = Field(default=300_000, ge=100, le=10_000_000)
+    wall_seconds: int = Field(
+        default=number("job_budget.wall_seconds"), ge=1, le=number("job_budget.wall_seconds_max")
+    )
+    max_model_calls: int = Field(
+        default=number("job_budget.max_model_calls"),
+        ge=1,
+        le=number("job_budget.max_model_calls_max"),
+    )
+    max_tool_calls: int = Field(
+        default=number("job_budget.max_tool_calls"),
+        ge=1,
+        le=number("job_budget.max_tool_calls_max"),
+    )
+    max_run_tokens: int = Field(
+        default=number("job_budget.max_run_tokens"),
+        ge=number("job_budget.max_run_tokens_min"),
+        le=number("job_budget.max_run_tokens_max"),
+    )
 
 
 class CreateJob(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    request_id: str = Field(min_length=1, max_length=128)
-    goal: str = Field(min_length=1, max_length=2400)
+    request_id: str = Field(min_length=1, max_length=number("jobs.request_id_max_length"))
+    goal: str = Field(min_length=1, max_length=number("jobs.goal_max_length"))
     engine: Literal["standard", "deep"] = "standard"
-    stages: list[StagePlan] = Field(min_length=1, max_length=12)
+    stages: list[StagePlan] = Field(min_length=1, max_length=number("jobs.stages_max_length"))
     budget: JobBudget = Field(default_factory=JobBudget)
-    parallelism: int = Field(default=1, ge=1, le=2)
-    deadline_seconds: int | None = Field(default=None, ge=1, le=604_800)
+    parallelism: int = Field(
+        default=number("jobs.parallelism"), ge=1, le=number("jobs.parallelism_max")
+    )
+    deadline_seconds: int | None = Field(default=None, ge=1, le=number("jobs.deadline_seconds_max"))
 
     @model_validator(mode="after")
     def validate_plan(self):
@@ -62,10 +79,9 @@ class CreateJob(BaseModel):
             raise ValueError("Stages in a shared group must be read-only")
         count = len(self.stages)
         limits = self.budget.model_dump()
-        if (
-            any(value < count for value in limits.values())
-            or limits["max_run_tokens"] < count * 100
-        ):
+        if any(value < count for value in limits.values()) or limits[
+            "max_run_tokens"
+        ] < count * number("execution.max_run_tokens_min"):
             raise ValueError("Budget is too small to assign to every stage")
         return self
 
@@ -74,9 +90,11 @@ class StageResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     status: Literal["complete", "incomplete"]
-    summary: str = Field(min_length=1, max_length=1200)
-    artifacts: list[str] = Field(max_length=16)
-    next_step: str | None = Field(default=None, max_length=800)
+    summary: str = Field(min_length=1, max_length=number("stage_report.summary_max_length"))
+    artifacts: list[str] = Field(max_length=number("stage_report.artifacts_max_length"))
+    next_step: str | None = Field(
+        default=None, max_length=number("stage_report.next_step_max_length")
+    )
 
 
 def result_for(stage):
@@ -90,7 +108,7 @@ def result_for(stage):
     if stage["admission_status"] != "completed":
         return None
     raw = stage["result"]
-    if not isinstance(raw, str) or len(raw) > 16_000:
+    if not isinstance(raw, str) or len(raw) > number("stage_report.max_chars"):
         return None
     value = raw.strip()
     if value.startswith("```json") and value.endswith("```"):
@@ -296,8 +314,11 @@ class JobService:
                 {
                     "stage": item["position"] + 1,
                     "admission_id": item["admission_id"],
-                    "summary": report["summary"][:250],
-                    "artifacts": [value[:100] for value in report["artifacts"][:2]],
+                    "summary": report["summary"][: number("stage_report.handoff_summary_chars")],
+                    "artifacts": [
+                        value[: number("stage_report.handoff_artifact_chars")]
+                        for value in report["artifacts"][: number("stage_report.handoff_artifacts")]
+                    ],
                 }
             )
         prompt = (

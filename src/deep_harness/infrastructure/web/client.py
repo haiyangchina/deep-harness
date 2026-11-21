@@ -25,6 +25,7 @@ from deep_harness.infrastructure.web.providers import (
 )
 from deep_harness.infrastructure.web.security import normalize_url, validate_public_url
 from deep_harness.infrastructure.web.settings import WebSettings
+from deep_harness.server_config import number
 
 _SEARCH_EXCLUDED = {"static"}
 
@@ -45,12 +46,18 @@ class WebClient:
             timeout=httpx.Timeout(self.settings.request_timeout_seconds),
             follow_redirects=False,
             headers={"User-Agent": USER_AGENT},
-            limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
+            limits=httpx.Limits(
+                max_connections=number("web.http_max_connections"),
+                max_keepalive_connections=number("web.http_keepalive_connections"),
+            ),
         )
         self._public_client = client or httpx.AsyncClient(
             timeout=httpx.Timeout(self.settings.request_timeout_seconds),
             trust_env=False,
-            limits=httpx.Limits(max_connections=8, max_keepalive_connections=0),
+            limits=httpx.Limits(
+                max_connections=number("web.http_max_connections"),
+                max_keepalive_connections=number("web.public_http_keepalive_connections"),
+            ),
         )
         self.providers = (
             providers
@@ -197,7 +204,12 @@ class WebClient:
             for hit in hits
         ]
         meta = f"后端={provider}；回退={','.join(skipped) or '无'}"
-        return evidence_pack(f"联网检索：{query[:80]}", sources, budget=max_chars, meta=meta)
+        return evidence_pack(
+            f"联网检索：{query[: number('web.heading_preview_chars')]}",
+            sources,
+            budget=max_chars,
+            meta=meta,
+        )
 
     async def fetch(self, url: str, max_chars: int, offset: int = 0) -> str:
         max_chars = min(max_chars, self.settings.max_response_chars)
@@ -223,14 +235,16 @@ class WebClient:
                 + (
                     f"内容已截断，next_offset={next_offset}"
                     if next_offset is not None
-                    else "已达正文提取上限" if truncated else "完整读取"
+                    else "已达正文提取上限"
+                    if truncated
+                    else "完整读取"
                 )
             ),
         )
         return evidence_pack(
             "网页读取",
             [source],
-            budget=max_chars + 800,
+            budget=max_chars + number("web.fetch_evidence_overhead_chars"),
             meta=f"URL={url}；后端={result.provider}",
         )
 
@@ -242,7 +256,7 @@ class WebClient:
         results = await asyncio.gather(
             *(self._safe_fetch(url) for url in validated), return_exceptions=False
         )
-        per_page = max(300, max_chars // max(1, len(results)))
+        per_page = max(number("web.source_min_chars"), max_chars // max(1, len(results)))
         sources = [
             Source(
                 title=result.title,
@@ -253,7 +267,12 @@ class WebClient:
             )
             for result in results
         ]
-        return evidence_pack("网页批量读取", sources, budget=max_chars + 800, meta="批量抓取")
+        return evidence_pack(
+            "网页批量读取",
+            sources,
+            budget=max_chars + number("web.fetch_evidence_overhead_chars"),
+            meta="批量抓取",
+        )
 
     async def _safe_fetch(self, url: str) -> FetchResult:
         try:
@@ -275,7 +294,10 @@ class WebClient:
         effective = effective[: self.settings.max_queries]
         max_sources = min(max_sources, self.settings.max_sources)
         max_chars = min(max_chars, self.settings.max_response_chars)
-        limit = max(3, min(8, max_sources))
+        limit = max(
+            number("web.min_results_per_research_query"),
+            min(number("web.max_results_per_research_query"), max_sources),
+        )
 
         async def one(query: str):
             try:
@@ -327,7 +349,7 @@ class WebClient:
                 title=hit.title or result.title,
                 url=hit.url,
                 snippet=hit.snippet,
-                text=result.text[:8000],
+                text=result.text[: number("web.enriched_source_chars")],
                 provider=hit.provider or result.provider,
             )
 
@@ -344,10 +366,15 @@ class WebClient:
         providers = ",".join(dict.fromkeys(bundle[1] for bundle in bundles))
         failures = sum(bundle[1] == "unavailable" for bundle in bundles)
         meta = (
-            f"问题={question[:100]}；子查询={len(effective)}；"
+            f"问题={question[: number('web.metadata_preview_chars')]}；子查询={len(effective)}；"
             f"后端={providers}；失败子查询={failures}；去重后来源={len(sources)}"
         )
-        return evidence_pack(f"深度联网研究：{question[:80]}", sources, budget=max_chars, meta=meta)
+        return evidence_pack(
+            f"深度联网研究：{question[: number('web.heading_preview_chars')]}",
+            sources,
+            budget=max_chars,
+            meta=meta,
+        )
 
     def health(self) -> dict:
         return {

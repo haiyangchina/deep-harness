@@ -11,6 +11,7 @@ from langsmith import tracing_context
 from deep_harness.application.tools import tool_definitions
 from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import DomainError
+from deep_harness.server_config import number
 
 
 @contextmanager
@@ -85,7 +86,14 @@ def checked_response(response: dict) -> dict:
 
 
 class LangChainModel:
-    def __init__(self, model, request_timeout: float = 90, *, identity=None, tool_specs=None):
+    def __init__(
+        self,
+        model,
+        request_timeout: float = number("model.remote_timeout_seconds"),
+        *,
+        identity=None,
+        tool_specs=None,
+    ):
         self.model = model
         self.request_timeout = request_timeout
         self.identity = identity or {
@@ -98,11 +106,8 @@ class LangChainModel:
         window = self.identity.get("context_window_tokens")
         if not window:
             return None
-        # num_ctx counts tokens, not bytes. Reserve 2048 tokens for the response and
-        # chat framing, then convert the remainder with the usual ~4 UTF-8 bytes per
-        # token approximation. Returning ``window - 2048`` treated tokens as bytes and
-        # shrank the usable context threefold for multilingual content.
-        return (window - 2048) * 4
+        # Reserve response and framing tokens, then approximate the remaining UTF-8 bytes.
+        return (window - number("model.context_output_reserve_tokens")) * 4
 
     def with_tool_specs(self, definitions):
         return LangChainModel(
@@ -157,7 +162,7 @@ class LangChainModel:
 class DiagnosticModel:
     """No LLM or network. /read and /write exercise the real tool/approval path."""
 
-    request_timeout = 10
+    request_timeout = number("model.diagnostic_timeout_seconds")
     identity = {"provider": "diagnostic", "version": 1}
 
     async def complete(self, prompt: str, messages: list[dict], tools: tuple[str, ...]) -> dict:
@@ -192,7 +197,7 @@ def openai_model(
     model: str,
     api_key: str,
     base_url: str | None = None,
-    request_timeout: float = 90,
+    request_timeout: float = number("model.remote_timeout_seconds"),
 ):
     from langchain_openai import ChatOpenAI
 
@@ -201,7 +206,7 @@ def openai_model(
             model=model,
             api_key=api_key,
             base_url=base_url,
-            max_retries=0,
+            max_retries=number("model.remote_max_retries"),
             timeout=request_timeout,
         ),
         request_timeout,
@@ -213,8 +218,8 @@ def ollama_model(
     *,
     model: str,
     base_url: str,
-    request_timeout: float = 180,
-    context_window_tokens: int = 32768,
+    request_timeout: float = number("model.request_timeout_seconds"),
+    context_window_tokens: int = number("model.context_window_tokens"),
     reasoning: bool = False,
 ):
     from langchain_ollama import ChatOllama

@@ -12,8 +12,9 @@ from importlib.metadata import version
 from pathlib import Path, PurePosixPath
 
 from deep_harness.domain.models import DomainError
+from deep_harness.server_config import number
 
-MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
+MAX_ARCHIVE_BYTES = number("archives.max_bytes")
 DATABASES = ("business.db", "checkpoints.db")
 
 
@@ -70,7 +71,7 @@ def create_archive(scope, destination):
                 continue
             files[relative.as_posix()] = path
         if (
-            len(files) > 10_000
+            len(files) > number("archives.max_files")
             or sum(path.stat().st_size for path in files.values()) > MAX_ARCHIVE_BYTES
         ):
             raise DomainError("archive_too_large", "Profile archive exceeds local backup limits")
@@ -106,7 +107,10 @@ def create_archive(scope, destination):
 
 def validate_manifest(archive, scope):
     entries = archive.infolist()
-    if len(entries) > 10_001 or sum(entry.file_size for entry in entries) > MAX_ARCHIVE_BYTES:
+    if (
+        len(entries) > number("archives.max_files") + 1
+        or sum(entry.file_size for entry in entries) > MAX_ARCHIVE_BYTES
+    ):
         raise DomainError("archive_too_large", "Archive exceeds extraction limits")
     names = [entry.filename for entry in entries]
     if len(set(names)) != len(names) or "manifest.json" not in names:

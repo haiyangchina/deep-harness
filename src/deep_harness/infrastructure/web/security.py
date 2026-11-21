@@ -6,8 +6,9 @@ import socket
 from urllib.parse import urlsplit
 
 from deep_harness.domain.models import DomainError
+from deep_harness.server_config import number
 
-MAX_URL_LENGTH = 2048
+MAX_URL_LENGTH = number("web_fetch.url_max_length")
 _PRIVATE_HOSTS = {"localhost", "localhost.localdomain", "metadata.google.internal"}
 _PRIVATE_SUFFIXES = (".local", ".internal", ".localhost", ".home.arpa")
 
@@ -19,7 +20,9 @@ def validate_public_url(raw: str, *, allow_private: bool = False) -> str:
     go through this check; it only guards model-supplied URLs in web_fetch.
     """
     if not isinstance(raw, str) or not raw.strip() or len(raw) > MAX_URL_LENGTH:
-        raise DomainError("web_url", "URL must be a non-empty http(s) address under 2048 chars")
+        raise DomainError(
+            "web_url", "URL must be a non-empty http(s) address within the configured limit"
+        )
     value = raw.strip()
     try:
         parts = urlsplit(value)
@@ -50,9 +53,7 @@ def require_global_address(address):
 
 
 async def resolve_fetch_addresses(host, port, *, allow_private):
-    rows = await asyncio.get_running_loop().getaddrinfo(
-        host, port, type=socket.SOCK_STREAM
-    )
+    rows = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
     addresses = tuple(dict.fromkeys(row[4][0] for row in rows))
     if not addresses:
         raise DomainError("web_backend", "No address available for page fetch")

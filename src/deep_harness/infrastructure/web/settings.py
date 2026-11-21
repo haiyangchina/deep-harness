@@ -2,38 +2,53 @@
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from deep_harness.server_config import number, setting
+
 
 class WebSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    enabled: bool = True
-    routing: tuple[str, ...] = (
-        "tavily",
-        "exa",
-        "brave",
-        "serper",
-        "searxng",
-        "bing_cn",
-        "ddgs",
-        "jina",
+    enabled: bool = setting("web.enabled")
+    routing: tuple[str, ...] = tuple(setting("web.routing"))
+    extract_routing: tuple[str, ...] = tuple(setting("web.extract_routing"))
+    request_timeout_seconds: float = Field(
+        default=number("web.request_timeout_seconds"),
+        gt=0,
+        le=number("web.request_timeout_seconds_max"),
     )
-    extract_routing: tuple[str, ...] = ("static",)
-    request_timeout_seconds: float = Field(default=15, gt=0, le=120)
-    max_response_chars: int = Field(default=8000, ge=500, le=32_000)
-    max_sources: int = Field(default=6, ge=1, le=12)
-    max_queries: int = Field(default=4, ge=1, le=8)
-    max_concurrency: int = Field(default=4, ge=1, le=8)
-    total_timeout_seconds: float = Field(default=30, gt=0, le=180)
-    max_cache_entries: int = Field(default=128, ge=1, le=1024)
-    cache_ttl_seconds: int = Field(default=300, ge=0, le=86_400)
-    allow_private_urls: bool = False
+    max_response_chars: int = Field(
+        default=number("web.max_response_chars"),
+        ge=number("web.max_response_chars_min"),
+        le=number("web.max_response_chars_max"),
+    )
+    max_sources: int = Field(
+        default=number("web.max_sources"), ge=1, le=number("web.max_sources_max")
+    )
+    max_queries: int = Field(
+        default=number("web.max_queries"), ge=1, le=number("web.max_queries_max")
+    )
+    max_concurrency: int = Field(
+        default=number("web.max_concurrency"), ge=1, le=number("web.max_concurrency_max")
+    )
+    total_timeout_seconds: float = Field(
+        default=number("web.total_timeout_seconds"),
+        gt=0,
+        le=number("web.total_timeout_seconds_max"),
+    )
+    max_cache_entries: int = Field(
+        default=number("web.max_cache_entries"), ge=1, le=number("web.max_cache_entries_max")
+    )
+    cache_ttl_seconds: int = Field(
+        default=number("web.cache_ttl_seconds"), ge=0, le=number("web.cache_ttl_seconds_max")
+    )
+    allow_private_urls: bool = setting("web.allow_private_urls")
 
-    searxng_url: str | None = None
-    firecrawl_url: str | None = None
+    searxng_url: str | None = setting("web.searxng_url")
+    firecrawl_url: str | None = setting("web.firecrawl_url")
 
-    tavily_api_key_env: str = "TAVILY_API_KEY"
-    exa_api_key_env: str = "EXA_API_KEY"
-    brave_api_key_env: str = "BRAVE_SEARCH_API_KEY"
-    serper_api_key_env: str = "SERPER_API_KEY"
-    jina_api_key_env: str = "JINA_API_KEY"
-    firecrawl_api_key_env: str = "FIRECRAWL_API_KEY"
+    tavily_api_key_env: str = setting("web.tavily_api_key_env")
+    exa_api_key_env: str = setting("web.exa_api_key_env")
+    brave_api_key_env: str = setting("web.brave_api_key_env")
+    serper_api_key_env: str = setting("web.serper_api_key_env")
+    jina_api_key_env: str = setting("web.jina_api_key_env")
+    firecrawl_api_key_env: str = setting("web.firecrawl_api_key_env")

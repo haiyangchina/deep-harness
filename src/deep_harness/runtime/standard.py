@@ -20,6 +20,7 @@ from deep_harness.runtime.approval_checkpoint import (
 )
 from deep_harness.runtime.context import ContextProjector
 from deep_harness.runtime.inference import Inference, usage_totals
+from deep_harness.server_config import number
 
 
 def append_unique(current: list[dict], incoming: list[dict]) -> list[dict]:
@@ -152,7 +153,7 @@ class StandardRuntime:
         # the durable decision instead of turning a still-pending approval into a
         # permanent "Tool refused" tool result: on the next resume the same tool call
         # would then produce different content and trip message_conflict.
-        for _ in range(16):
+        for _ in range(number("execution.approval_replay_limit")):
             decision = await self.receipts.interaction(self.claim, key, digest, proposal)
             if decision is not None:
                 return decision == "approve"

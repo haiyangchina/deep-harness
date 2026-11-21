@@ -7,6 +7,8 @@ from fastapi import APIRouter, Depends
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, ConfigDict, Field
 
+from deep_harness.server_config import number
+
 
 class Request(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -20,20 +22,22 @@ class EffectDecision(Request):
 
 class Resolution(Request):
     generation: int = Field(ge=0)
-    evidence: str = Field(min_length=1, max_length=16_000)
-    effects: list[EffectDecision] = Field(default_factory=list, max_length=1000)
+    evidence: str = Field(min_length=1, max_length=number("reconciliation.evidence_max_length"))
+    effects: list[EffectDecision] = Field(
+        default_factory=list, max_length=number("reconciliation.effects_max_length")
+    )
 
 
 class ArchivePath(Request):
-    path: str = Field(min_length=1, max_length=4096)
+    path: str = Field(min_length=1, max_length=number("archives.path_max_length"))
 
 
 class SkillDocument(Request):
-    document: str = Field(min_length=1, max_length=20_000)
+    document: str = Field(min_length=1, max_length=number("skills.document_max_length"))
 
 
 class MemoryInput(Request):
-    content: str = Field(min_length=1, max_length=1000)
+    content: str = Field(min_length=1, max_length=number("memory.content_max_length"))
 
 
 class CandidateDecision(Request):

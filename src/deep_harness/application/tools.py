@@ -34,6 +34,7 @@ from deep_harness.application.workspace import (
 from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import DomainError, ExecutionClaim, ProfileScope, Session, ToolCall
 from deep_harness.infrastructure.knowledge import KnowledgeStore
+from deep_harness.server_config import number
 
 
 class FilePathArgs(BaseModel):
@@ -42,30 +43,32 @@ class FilePathArgs(BaseModel):
 
 
 class ReadFileArgs(FilePathArgs):
-    start_line: int = Field(default=1, ge=1)
-    max_lines: int = Field(default=120, ge=1, le=400)
+    start_line: int = Field(default=number("legacy_files.start_line"), ge=1)
+    max_lines: int = Field(
+        default=number("legacy_files.max_lines"), ge=1, le=number("legacy_files.max_lines_max")
+    )
 
 
 class WriteFileArgs(FilePathArgs):
-    content: str = Field(max_length=128_000)
+    content: str = Field(max_length=number("legacy_files.content_max_length"))
     expected_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
 
 class SaveMemoryArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    content: str = Field(min_length=1, max_length=1000)
+    content: str = Field(min_length=1, max_length=number("memory.content_max_length"))
 
 
 class DelegateTaskArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     kind: Literal["research", "coding"]
-    task: str = Field(min_length=1, max_length=4000)
+    task: str = Field(min_length=1, max_length=number("delegation.task_max_length"))
     background: bool = False
 
 
 class CheckDelegationArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    delegation_id: str = Field(min_length=1, max_length=256)
+    delegation_id: str = Field(min_length=1, max_length=number("api.delegation_id_max_length"))
 
 
 TOOL_ARGUMENTS = {
@@ -367,25 +370,31 @@ class ToolGateway:
         key = hashlib.sha256(os.path.normcase(str(target)).encode()).hexdigest()
         locks = self.scope.state_root / "file-locks"
         locks.mkdir(parents=True, exist_ok=True)
-        with FileLock(locks / f"{key}.lock", timeout=10):
+        with FileLock(locks / f"{key}.lock", timeout=number("files.write_lock_seconds")):
             return mutate(arguments, workspace_path)
 
     def _read(self, arguments: ReadFileArgs) -> str:
         target = self.path(arguments.path)
         with target.open("rb") as stream:
-            data = stream.read(128_001)
-        if len(data) > 128_000:
+            data = stream.read(number("legacy_files.max_bytes") + 1)
+        if len(data) > number("legacy_files.max_bytes"):
             raise DomainError("file_too_large", "File exceeds this prototype's 128 KB limit")
         lines = data.decode("utf-8").splitlines(keepends=True)
         selected = lines[arguments.start_line - 1 : arguments.start_line - 1 + arguments.max_lines]
         content = ""
         for line in selected:
-            if len(content.encode("utf-8")) + len(line.encode("utf-8")) > 6000:
+            if len(content.encode("utf-8")) + len(line.encode("utf-8")) > number(
+                "legacy_files.output_max_bytes"
+            ):
                 break
             content += line
         # A single long line still needs to be inspectable.
         if not content and selected:
-            content = selected[0].encode("utf-8")[:6000].decode("utf-8", errors="ignore")
+            content = (
+                selected[0]
+                .encode("utf-8")[: number("legacy_files.output_max_bytes")]
+                .decode("utf-8", errors="ignore")
+            )
         end_line = arguments.start_line - 1 + len(content.splitlines())
         return json.dumps(
             {

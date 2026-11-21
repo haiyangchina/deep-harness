@@ -7,6 +7,7 @@ from sqlalchemy import func, insert, select, update
 from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import DomainError
 from deep_harness.infrastructure import schema as s
+from deep_harness.server_config import number
 
 
 class DelegationLedger:
@@ -38,7 +39,7 @@ class DelegationLedger:
                         s.delegations.c.mode == "background",
                     )
                 )
-                if count.scalar_one() >= 4:
+                if count.scalar_one() >= number("delegation.max_per_admission"):
                     raise DomainError("delegation_limit", "At most four background tasks per turn")
             await conn.execute(
                 insert(s.delegations).values(

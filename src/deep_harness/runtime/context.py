@@ -7,6 +7,7 @@ from sqlalchemy import insert, select, update
 from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import DomainError
 from deep_harness.infrastructure import schema as s
+from deep_harness.server_config import number
 
 
 def serialized_size(messages, *, utf8=False):
@@ -29,7 +30,9 @@ def summarize(previous, messages, limit):
         content = message.get("content", "")
         if not isinstance(content, str):
             content = json.dumps(content, ensure_ascii=False)
-        parts.append(f"{message['role']}: {content[:512]}")
+        parts.append(
+            f"{message['role']}: {content[: number('execution.summary_per_message_chars')]}"
+        )
     summary = "\n".join(parts)
     if len(summary) > limit:
         half = limit // 2
@@ -37,7 +40,7 @@ def summarize(previous, messages, limit):
     return summary
 
 
-MIN_TOOL_CHARS = 512
+MIN_TOOL_CHARS = number("execution.min_clipped_tool_chars")
 TRUNCATION_MARKER = (
     "\n[... tool output truncated to fit the context budget; re-read with a smaller limit ...]\n"
 )
@@ -56,7 +59,7 @@ def clip_tool_outputs(messages, fits):
     caller must still fail explicitly rather than send an oversized request.
     """
     clipped = [dict(message) for message in messages]
-    for _ in range(64):
+    for _ in range(number("execution.max_clip_passes")):
         if fits(clipped):
             return clipped
         candidates = [
@@ -68,8 +71,8 @@ def clip_tool_outputs(messages, fits):
             return None
         _, index = max(candidates)
         content = _content(clipped[index])
-        keep = max(MIN_TOOL_CHARS, int(len(content) * 0.6))
-        head = int(keep * 0.7)
+        keep = max(MIN_TOOL_CHARS, int(len(content) * number("execution.clip_tool_keep_ratio")))
+        head = int(keep * number("execution.clip_tool_head_ratio"))
         tail = keep - head - len(TRUNCATION_MARKER)
         if tail <= 0:
             return None
@@ -100,7 +103,8 @@ class ContextProjector:
         legacy_summary = head is not None and head["summary_version"] == 0
         if legacy_summary:
             summary = summarize(
-                "", [message for message in messages if message["id"] in dropped],
+                "",
+                [message for message in messages if message["id"] in dropped],
                 self.limits.summary_characters,
             )
         else:
@@ -108,9 +112,13 @@ class ContextProjector:
         revision = head["revision"] if head else 0
         remaining = [message for message in messages if message["id"] not in dropped]
         archived = []
-        fixed_chars = len(prompt) + serialized_size(tools) + 256
+        fixed_chars = (
+            len(prompt) + serialized_size(tools) + number("execution.prompt_overhead_chars")
+        )
         fixed_bytes = (
-            len(prompt.encode("utf-8")) + serialized_size(tools, utf8=True) + 256
+            len(prompt.encode("utf-8"))
+            + serialized_size(tools, utf8=True)
+            + number("execution.prompt_overhead_chars")
             if max_context_bytes is not None
             else 0
         )
@@ -134,7 +142,10 @@ class ContextProjector:
             )
 
         available, byte_available = budgets()
-        if available < 256 or (byte_available is not None and byte_available < 256):
+        if available < number("execution.min_projected_input_chars") or (
+            byte_available is not None
+            and byte_available < number("execution.min_projected_input_chars")
+        ):
             raise DomainError(
                 "context_budget_exhausted", "Prompt and tools exceed the configured context budget"
             )

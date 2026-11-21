@@ -43,7 +43,7 @@ export function TaskComposer({ draft, pending, updateDraft, send }: TaskComposer
             {runtime.settings.diagnostic
               ? '离线诊断（非模型）'
               : runtime.settings.configFile
-                ? 'TOML 模型配置'
+                ? '模型配置'
                 : 'qwen3.5:9b'}
             <span> · {runtime.settings.profile}</span>
           </span>

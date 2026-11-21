@@ -7,6 +7,7 @@ from sqlalchemy import func, select
 from deep_harness.domain.models import DomainError
 from deep_harness.infrastructure import schema as s
 from deep_harness.runtime.models import with_timeout
+from deep_harness.server_config import number
 
 
 async def usage_totals(store, session_id, admission_id=None):
@@ -99,7 +100,7 @@ class Inference:
         ):
             if item["kind"] == "delta":
                 pending += item["text"]
-                if len(pending) >= 128:
+                if len(pending) >= number("execution.delta_batch_chars"):
                     await self.delta(key, sequence, pending)
                     sequence += 1
                     pending = ""

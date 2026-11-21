@@ -3,6 +3,8 @@
 import httpx
 from pydantic import BaseModel, ValidationError
 
+from deep_harness.server_config import number
+
 
 class OllamaDetails(BaseModel):
     capabilities: list[str]
@@ -17,7 +19,9 @@ async def check_model(settings, *, transport=None):
     if not settings.base_url:
         return {**result, "status": "unavailable", "code": "missing_base_url"}
     try:
-        async with httpx.AsyncClient(timeout=5, transport=transport, trust_env=False) as client:
+        async with httpx.AsyncClient(
+            timeout=number("model.probe_timeout_seconds"), transport=transport, trust_env=False
+        ) as client:
             response = await client.post(
                 settings.base_url.rstrip("/") + "/api/show",
                 json={"model": settings.name, "verbose": False},

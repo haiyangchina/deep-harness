@@ -69,7 +69,7 @@ def test_default_routing_prefers_bing_cn_over_foreign_keyless_backends():
     assert "bing_cn" in routing
     assert routing.index("bing_cn") < routing.index("ddgs")
     assert routing.index("bing_cn") < routing.index("jina")
-    # defaults.toml must not drift from the model again.
+    # The packaged YAML also supplies direct WebSettings defaults.
     assert load_web_settings().routing == routing
 
 

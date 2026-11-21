@@ -18,6 +18,13 @@ interface Stage {
   evidence: { effects: { id: string; status: string }[] } | null
 }
 
+interface Defaults {
+  wall_seconds: number
+  wall_seconds_max: number
+  stages_max: number
+  parallelism_max: number
+}
+
 interface Details extends Summary {
   stages: Stage[]
   remaining: { wall_seconds: number; max_model_calls: number; max_tool_calls: number }
@@ -39,7 +46,8 @@ export function LongTasks({ openStage }: { openStage: (id: string) => void }) {
   const [selected, setSelected] = useState<string | null>(null)
   const [current, setCurrent] = useState<Details | null>(null)
   const [goal, setGoal] = useState('')
-  const [seconds, setSeconds] = useState(1800)
+  const [seconds, setSeconds] = useState<number | null>(null)
+  const [defaults, setDefaults] = useState<Defaults | null>(null)
   const [engine, setEngine] = useState<'standard' | 'deep'>('standard')
   const [parallel, setParallel] = useState(false)
   const [stages, setStages] = useState(() => ['调研', '实现', '验证'].map(newStage))
@@ -68,6 +76,14 @@ export function LongTasks({ openStage }: { openStage: (id: string) => void }) {
     return () => { disposed = true; clearTimeout(timer) }
   }, [selected])
 
+  useEffect(() => {
+    let disposed = false
+    void api<Defaults>('/jobs/defaults').then(value => {
+      if (!disposed) setDefaults(value)
+    }).catch(error => { if (!disposed) report(error) })
+    return () => { disposed = true }
+  }, [])
+
   const task = current?.id === selected ? current : null
   function updateStage(id: string, changes: Partial<ReturnType<typeof newStage>>) {
     setStages(rows => rows.map(row => row.id === id ? { ...row, ...changes } : row))
@@ -78,8 +94,8 @@ export function LongTasks({ openStage }: { openStage: (id: string) => void }) {
       setBusy(true)
       try {
         const created = await api<Details>('/jobs', 'POST', {
-          request_id: requestId, goal, engine, parallelism: parallel ? 2 : 1,
-          budget: { wall_seconds: seconds },
+          request_id: requestId, goal, engine, parallelism: parallel ? defaults?.parallelism_max : undefined,
+          budget: seconds === null ? undefined : { wall_seconds: seconds },
           stages: stages.map(({ id: _id, group, ...row }) => ({
             ...row, group: !parallel || group === '' ? null : Number(group),
           })),
@@ -124,9 +140,9 @@ export function LongTasks({ openStage }: { openStage: (id: string) => void }) {
           <label>执行引擎<select value={engine} onChange={event => {
             setEngine(event.target.value === 'deep' ? 'deep' : 'standard'); setRequestId(crypto.randomUUID())
           }}><option value="standard">Standard</option><option value="deep">Deep</option></select></label>
-          <label>主动执行总秒数<input type="number" min={stages.length} max={28800} value={seconds}
+          <label>主动执行总秒数<input type="number" min={stages.length} max={defaults?.wall_seconds_max} value={seconds ?? defaults?.wall_seconds ?? ''}
             onChange={event => { setSeconds(Number(event.target.value)); setRequestId(crypto.randomUUID()) }} /></label>
-          <label><input type="checkbox" checked={parallel}
+          <label><input type="checkbox" checked={parallel} disabled={(defaults?.parallelism_max ?? 1) <= 1}
             onChange={event => { setParallel(event.target.checked); setRequestId(crypto.randomUUID()) }} /> 并行处理同组只读阶段</label>
         </div>
         {stages.map((stage, index) => <fieldset key={stage.id}>
@@ -145,10 +161,10 @@ export function LongTasks({ openStage }: { openStage: (id: string) => void }) {
           }}>删除阶段</button>}
         </fieldset>)}
         <div className="actions">
-          <button type="button" disabled={stages.length >= 12} onClick={() => {
+          <button type="button" disabled={!defaults || stages.length >= defaults.stages_max} onClick={() => {
             setStages(rows => [...rows, newStage()]); setRequestId(crypto.randomUUID())
           }}>添加阶段</button>
-          <button type="submit" className="primary" disabled={busy}>启动长任务</button>
+          <button type="submit" className="primary" disabled={busy || !defaults}>启动长任务</button>
         </div>
       </form>}
       {task && <>

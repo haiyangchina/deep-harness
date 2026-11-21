@@ -9,17 +9,18 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field
 
 from deep_harness.domain.models import DomainError
+from deep_harness.server_config import number
 
-MAX_FILE_BYTES = 8 * 1024 * 1024
-OUTPUT_CHARS = 24_000
+MAX_FILE_BYTES = number("files.max_bytes")
+OUTPUT_CHARS = number("files.output_chars")
 
 
 class ReadArgs(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     path: str = Field(min_length=1)
-    offset: int = Field(default=1, ge=1)
-    limit: int = Field(default=200, ge=1, le=2000)
-    column: int = Field(default=0, ge=0)
+    offset: int = Field(default=number("files.offset"), ge=1)
+    limit: int = Field(default=number("files.limit"), ge=1, le=number("files.limit_max"))
+    column: int = Field(default=number("files.column"), ge=0)
 
 
 class WriteArgs(BaseModel):
@@ -43,7 +44,7 @@ def read_bytes(target: Path) -> bytes:
     with target.open("rb") as stream:
         data = stream.read(MAX_FILE_BYTES + 1)
     if len(data) > MAX_FILE_BYTES:
-        raise DomainError("file_too_large", "File exceeds the 8 MiB file-tool limit")
+        raise DomainError("file_too_large", "File exceeds the configured file-tool limit")
     if b"\x00" in data:
         raise DomainError("binary_file", "File tools accept UTF-8 text, not binary content")
     return data
@@ -122,7 +123,7 @@ def read(arguments: ReadArgs, workspace_path, candidate_path=None):
 
 def atomic_write(target: Path, data: bytes):
     if len(data) > MAX_FILE_BYTES:
-        raise DomainError("file_too_large", "Result exceeds the 8 MiB file-tool limit")
+        raise DomainError("file_too_large", "Result exceeds the configured file-tool limit")
     mode = stat.S_IMODE(target.stat().st_mode) if target.exists() else None
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = None

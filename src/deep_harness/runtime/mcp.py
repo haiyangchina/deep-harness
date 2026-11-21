@@ -20,17 +20,18 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import DomainError
+from deep_harness.server_config import number
 
-SERVER_NAME = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
-TOOL_NAME = re.compile(r"^[A-Za-z0-9_.\-/]{1,80}$")
+SERVER_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
+TOOL_NAME = re.compile(r"^[A-Za-z0-9_.\-/]+$")
 
 
 class ServerConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
-    name: str = Field(min_length=1, max_length=32)
+    name: str = Field(min_length=1, max_length=number("mcp.name_max_length"))
     transport: str
     command: str | None = None
-    args: list[str] = Field(default_factory=list, max_length=64)
+    args: list[str] = Field(default_factory=list, max_length=number("mcp.args_max_length"))
     url: str | None = None
     token_env: str | None = None
     auth: str = "none"
@@ -121,8 +122,11 @@ def read_servers(path: Path):
         servers = [ServerConfig.model_validate(row) for row in data["servers"]]
     except ValidationError as exc:
         raise DomainError("mcp_config", "MCP server configuration is invalid") from exc
-    if len(servers) > 16 or len({server.name for server in servers}) != len(servers):
-        raise DomainError("mcp_config", "MCP server names must be unique (maximum 16)")
+    if len(servers) > number("mcp.max_servers") or len({server.name for server in servers}) != len(
+        servers
+    ):
+        maximum = number("mcp.max_servers")
+        raise DomainError("mcp_config", f"MCP server names must be unique (maximum {maximum})")
     return servers
 
 
@@ -171,7 +175,9 @@ class McpRegistry:
     async def _connect(self, name, stack):
         if name in self.objects:
             return await stack.enter_async_context(
-                Client(self.objects[name], read_timeout_seconds=60)
+                Client(
+                    self.objects[name], read_timeout_seconds=number("mcp.request_timeout_seconds")
+                )
             )
         config = self.servers.get(name)
         if config is None:
@@ -218,10 +224,17 @@ class McpRegistry:
             except ValueError:
                 loopback = hostname == "localhost"
             http_client = await stack.enter_async_context(
-                httpx2.AsyncClient(headers=headers, auth=auth, timeout=60, trust_env=not loopback)
+                httpx2.AsyncClient(
+                    headers=headers,
+                    auth=auth,
+                    timeout=number("mcp.request_timeout_seconds"),
+                    trust_env=not loopback,
+                )
             )
             source = streamable_http_client(config.url, http_client=http_client)
-        return await stack.enter_async_context(Client(source, read_timeout_seconds=60))
+        return await stack.enter_async_context(
+            Client(source, read_timeout_seconds=number("mcp.request_timeout_seconds"))
+        )
 
     async def discover(self, server_names=None):
         try:
@@ -237,12 +250,12 @@ class McpRegistry:
         requested = available if server_names is None else set(server_names)
         if not requested <= available:
             raise DomainError("mcp_not_found", "MCP server is not configured for this profile")
-        async with asyncio.timeout(90):
+        async with asyncio.timeout(number("mcp.operation_timeout_seconds")):
             for name in sorted(requested):
                 async with self.client(name) as client:
                     catalog.update(await self._list_catalog(name, client))
-                if len(catalog) > 256:
-                    raise DomainError("mcp_schema", "MCP catalog exceeds 256 tools")
+                if len(catalog) > number("mcp.max_tools"):
+                    raise DomainError("mcp_schema", "MCP catalog exceeds the configured tool limit")
         self.catalog_cache.update(catalog)
         return catalog
 
@@ -253,7 +266,9 @@ class McpRegistry:
         while True:
             page = await client.list_tools(cursor=cursor, cache_mode="refresh")
             for tool in page.tools:
-                if not TOOL_NAME.fullmatch(tool.name):
+                if len(tool.name) > number("mcp.remote_tool_name_max_chars") or not (
+                    TOOL_NAME.fullmatch(tool.name)
+                ):
                     raise DomainError("mcp_schema", "MCP tool name is unsupported")
                 safe = re.sub(r"[^A-Za-z0-9_]", "_", tool.name)
                 public = f"mcp__{name}__{safe}"
@@ -263,7 +278,7 @@ class McpRegistry:
                 if (
                     not isinstance(schema, dict)
                     or schema.get("type") != "object"
-                    or len(json.dumps(schema, ensure_ascii=False)) > 32_000
+                    or len(json.dumps(schema, ensure_ascii=False)) > number("mcp.max_schema_chars")
                 ):
                     raise DomainError("mcp_schema", "MCP tool schema is unsupported")
                 try:
@@ -273,7 +288,7 @@ class McpRegistry:
                 description = tool.description or f"MCP {name}/{tool.name}"
                 catalog[public] = {
                     "name": public,
-                    "description": description[:4096],
+                    "description": description[: number("mcp.max_description_chars")],
                     "parameters": schema,
                     "server": name,
                     "remote_name": tool.name,
@@ -284,8 +299,8 @@ class McpRegistry:
                         else "inprocess"
                     ),
                 }
-                if len(catalog) > 256:
-                    raise DomainError("mcp_schema", "MCP catalog exceeds 256 tools")
+                if len(catalog) > number("mcp.max_tools"):
+                    raise DomainError("mcp_schema", "MCP catalog exceeds the configured tool limit")
             cursor = page.next_cursor
             if not cursor:
                 break
@@ -298,7 +313,7 @@ class McpRegistry:
         parts = public_name.split("__", 2)
         if len(parts) != 3 or parts[0] != "mcp":
             raise DomainError("mcp_not_found", "MCP tool name is invalid")
-        async with asyncio.timeout(90):
+        async with asyncio.timeout(number("mcp.operation_timeout_seconds")):
             async with self.client(parts[1]) as client:
                 catalog = await self._list_catalog(parts[1], client)
                 spec = catalog.get(public_name)
@@ -309,12 +324,16 @@ class McpRegistry:
                 if before_dispatch is not None:
                     await before_dispatch()
                 result = await client.call_tool(
-                    spec["remote_name"], arguments, read_timeout_seconds=60
+                    spec["remote_name"],
+                    arguments,
+                    read_timeout_seconds=number("mcp.request_timeout_seconds"),
                 )
         payload = result.model_dump(mode="json", exclude_none=True)
         serialized = json.dumps(payload, ensure_ascii=False)
-        if len(serialized) > 64_000:
-            raise DomainError("mcp_result_large", "MCP result exceeds 64,000 characters")
+        if len(serialized) > number("mcp.max_output_chars"):
+            raise DomainError(
+                "mcp_result_large", "MCP result exceeds the configured character limit"
+            )
         if result.is_error:
             raise DomainError("mcp_tool_error", "MCP tool reported an error after dispatch")
         return serialized

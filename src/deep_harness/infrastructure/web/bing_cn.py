@@ -14,13 +14,14 @@ from html.parser import HTMLParser
 
 from deep_harness.infrastructure.web.extract import MAX_HTML_BYTES
 from deep_harness.infrastructure.web.models import SearchHit
+from deep_harness.server_config import number
 
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
-MAX_TITLE = 200
-MAX_SNIPPET = 600
+MAX_TITLE = number("web.provider_title_chars")
+MAX_SNIPPET = number("web.provider_snippet_chars")
 _HTTP_URL = re.compile(r"^https?://", re.IGNORECASE)
 
 

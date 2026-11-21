@@ -17,6 +17,7 @@ from deep_harness.application.config import (
 from deep_harness.bootstrap import ProjectHost
 from deep_harness.domain.models import DomainError
 from deep_harness.runtime.models import DiagnosticModel, ollama_model, openai_model
+from deep_harness.server_config import number, setting
 
 
 def parser():
@@ -24,7 +25,7 @@ def parser():
     result.add_argument("--state-dir", type=Path, required=True)
     result.add_argument("--workspace", type=Path, default=Path.cwd())
     result.add_argument("--profile", default="default")
-    result.add_argument("--config", type=Path, help="Model configuration TOML override")
+    result.add_argument("--config", type=Path, help="Runtime configuration YAML or TOML override")
     result.add_argument("--provider", choices=["ollama", "openai", "diagnostic"])
     result.add_argument(
         "--model",
@@ -86,7 +87,12 @@ def parser():
     repl.add_argument("--read-only", action="store_true")
     sessions = commands.add_parser("sessions")
     sessions.add_argument("--after", default="")
-    sessions.add_argument("--limit", type=int, choices=range(1, 101), default=50, metavar="1..100")
+    sessions.add_argument(
+        "--limit",
+        type=int,
+        choices=range(1, number("pagination.max_page_size") + 1),
+        default=number("pagination.page_size"),
+    )
     inspect = commands.add_parser("inspect")
     inspect.add_argument("session")
     inspect.add_argument("--messages", action="store_true")
@@ -112,11 +118,21 @@ def parser():
     history = commands.add_parser("history")
     history.add_argument("session")
     history.add_argument("--after", default="")
-    history.add_argument("--limit", type=int, choices=range(1, 101), default=50)
+    history.add_argument(
+        "--limit",
+        type=int,
+        choices=range(1, number("pagination.max_page_size") + 1),
+        default=number("pagination.page_size"),
+    )
     search = commands.add_parser("search")
     search.add_argument("session")
     search.add_argument("query")
-    search.add_argument("--limit", type=int, choices=range(1, 51), default=20)
+    search.add_argument(
+        "--limit",
+        type=int,
+        choices=range(1, number("pagination.max_search_results") + 1),
+        default=number("pagination.search_results"),
+    )
     skill_add = commands.add_parser("skill-add")
     skill_add.add_argument("file", type=Path)
     commands.add_parser("skill-list")
@@ -152,7 +168,7 @@ def parser():
     approve.add_argument("--generation", required=True, type=int)
     approve.add_argument("--decision", required=True, choices=["approve", "deny"])
     serve = commands.add_parser("serve")
-    serve.add_argument("--port", type=int, default=8765)
+    serve.add_argument("--port", type=int, default=number("transport.http_port"))
     for name in ("backup", "restore"):
         command = commands.add_parser(name)
         command.add_argument("path", type=Path)
@@ -306,12 +322,17 @@ def main():
         # Exclusive creation avoids competing launchers rotating an existing token.
         try:
             with token_path.open("x", encoding="utf-8") as stream:
-                stream.write(secrets.token_urlsafe(32))
+                stream.write(secrets.token_urlsafe(number("transport.token_random_bytes")))
         except FileExistsError:
             pass
     token = token_path.read_text(encoding="utf-8").strip()
     print(f"Operator token file: {token_path.resolve()}")
-    uvicorn.run(create_api(build_host(args), token), host="127.0.0.1", port=args.port)
+    uvicorn.run(
+        create_api(build_host(args), token),
+        host="127.0.0.1",
+        port=args.port,
+        log_level=setting("transport.cli_log_level"),
+    )
 
 
 if __name__ == "__main__":
