@@ -2,6 +2,8 @@
 
 import asyncio
 from contextlib import contextmanager
+from ipaddress import ip_address
+from urllib.parse import urlsplit
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langsmith import tracing_context
@@ -29,7 +31,17 @@ def model_errors():
                 "model.context_window_tokens in TOML), or use a smaller input/new session. "
                 "Inspect model support and available memory before increasing the window.",
             ) from exc
-        raise
+        if exc.status_code == 404:
+            message = "Ollama could not find the configured model or API endpoint."
+        elif exc.status_code in {502, 503, 504}:
+            message = f"Ollama endpoint unavailable (HTTP {exc.status_code})."
+        else:
+            message = f"Ollama rejected the model request (HTTP {exc.status_code})."
+        raise DomainError("ollama_response_error", message) from exc
+    except ConnectionError as exc:
+        raise DomainError(
+            "model_connection_failed", "Could not connect to the model endpoint."
+        ) from exc
 
 
 def to_langchain(message: dict):
@@ -213,13 +225,21 @@ def ollama_model(
     # the adapter then sees content="" and the run silently completes with no text.
     # Guard the kwarg so older langchain-ollama releases stay usable.
     options = {"reasoning": reasoning} if "reasoning" in ChatOllama.model_fields else {}
+    hostname = urlsplit(base_url).hostname
+    try:
+        loopback = ip_address(hostname).is_loopback
+    except ValueError:
+        loopback = (hostname or "").lower().rstrip(".") == "localhost"
+    client_kwargs = {"timeout": request_timeout}
+    if loopback:
+        client_kwargs["trust_env"] = False
     return LangChainModel(
         ChatOllama(
             model=model,
             base_url=base_url,
             temperature=0,
             num_ctx=context_window_tokens,
-            client_kwargs={"timeout": request_timeout},
+            client_kwargs=client_kwargs,
             **options,
         ),
         request_timeout,

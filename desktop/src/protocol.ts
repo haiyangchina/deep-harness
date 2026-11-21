@@ -91,6 +91,7 @@ export interface Approval {
   proposal: unknown
 }
 export interface SessionStatus {
+  job_id?: string
   session: Session
   latest_admission: Admission | null
   active_admissions: Admission[]

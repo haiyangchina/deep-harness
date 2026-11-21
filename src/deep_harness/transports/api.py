@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from deep_harness.application.capabilities import manifest
+from deep_harness.application.jobs import CreateJob
 from deep_harness.application.workspace import PROJECT_PROMPT
 from deep_harness.domain.models import DomainError, Harness
 from deep_harness.runtime.inference import usage_totals
@@ -55,6 +56,12 @@ class ApprovalResponse(RequestModel):
     decision: Literal["approve", "deny"]
 
 
+class JobCommand(RequestModel):
+    action: Literal["pause", "resume", "cancel", "accept"]
+    position: int | None = Field(default=None, ge=0)
+    evidence: str | None = Field(default=None, max_length=2000)
+
+
 class ForkSession(RequestModel):
     request_id: str = Field(min_length=1, max_length=128)
 
@@ -88,6 +95,28 @@ def create_api(host, token: str) -> FastAPI:
     @app.get("/health")
     async def health():
         return {"status": "ok", "stage": "development", "engines": ["standard", "deep"]}
+
+    @app.get("/profiles/{profile_id}/jobs", dependencies=[Depends(authenticate)])
+    async def list_jobs(profile_id: str):
+        service = await host.application(profile_id)
+        return await service.jobs.ledger.list()
+
+    @app.post("/profiles/{profile_id}/jobs", dependencies=[Depends(authenticate)])
+    async def create_job(profile_id: str, body: CreateJob):
+        service = await host.application(profile_id)
+        return await service.create_job(body)
+
+    @app.get("/profiles/{profile_id}/jobs/{job_id}", dependencies=[Depends(authenticate)])
+    async def job_detail(profile_id: str, job_id: str):
+        service = await host.application(profile_id)
+        return await service.jobs.detail(job_id)
+
+    @app.post("/profiles/{profile_id}/jobs/{job_id}/commands", dependencies=[Depends(authenticate)])
+    async def command_job(profile_id: str, job_id: str, body: JobCommand):
+        service = await host.application(profile_id)
+        return await service.command_job(
+            job_id, body.action, position=body.position, evidence=body.evidence
+        )
 
     @app.get("/profiles/{profile_id}/capabilities", dependencies=[Depends(authenticate)])
     async def capabilities(profile_id: str):
@@ -156,8 +185,13 @@ def create_api(host, token: str) -> FastAPI:
     async def status(profile_id: str, session_id: str, include_runtime: bool = True):
         service = await host.application(profile_id)
         if include_runtime:
-            return jsonable_encoder(await service.sessions.status(session_id))
-        return jsonable_encoder(await service.store.session_status(session_id, "operator"))
+            result = await service.sessions.status(session_id)
+        else:
+            result = await service.store.session_status(session_id, "operator")
+        stage = await service.jobs.ledger.owner(session_id)
+        if stage:
+            result["job_id"] = stage["job_id"]
+        return jsonable_encoder(result)
 
     @app.get(
         "/profiles/{profile_id}/sessions/{session_id}/usage",

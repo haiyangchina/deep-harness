@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import time
 from contextlib import AsyncExitStack
 from pathlib import Path
 from uuid import uuid4
@@ -16,6 +17,7 @@ from deep_harness.application.capabilities import (
 )
 from deep_harness.application.config import ExecutionSettings
 from deep_harness.application.curation import CurationService, auto_curation_enabled
+from deep_harness.application.jobs import JobService
 from deep_harness.application.lifecycle import drain_tasks, mutation
 from deep_harness.application.scopes import ProfileResolver
 from deep_harness.application.session_runtime import SessionRuntime
@@ -59,6 +61,7 @@ class ProfileApplication:
         self.owner = str(uuid4())
         self.store = BusinessStore(scope.home, scope.profile_id)
         self.executions = ExecutionLedger(self.store)
+        self.jobs = JobService(self)
         self.delegations = DelegationLedger(self.store, self.executions)
         self.receipts = ReceiptLedger(self.store, self.executions)
         self.knowledge = KnowledgeStore(self.store)
@@ -77,6 +80,7 @@ class ProfileApplication:
         self.locks: dict[str, asyncio.Lock] = {}
         self.saver = None
         self.closing = False
+        self.closed = False
         self.recover_queued = recover_queued
         self.control = asyncio.Lock()
         self.maintenance = False
@@ -115,6 +119,9 @@ class ProfileApplication:
             decided = await self.receipts.decided_waiting() if self.recover_queued else ()
             for pending in decided:
                 self.schedule(pending["session_id"])
+            if self.recover_queued:
+                for job in await self.jobs.ledger.list(recoverable_only=True):
+                    self.jobs.kick(job["id"], wake_existing=True)
         except BaseException:
             await self.resources.aclose()
             raise
@@ -143,10 +150,15 @@ class ProfileApplication:
 
     async def close(self, grace_seconds=5):
         async with self.control:
+            if self.closed:
+                return
             self.closing = True
+        async with self.jobs.lock:
+            await self.jobs.ledger.pause_running()
         await drain_tasks(self.tasks | self.mutations, grace_seconds)
         await drain_tasks(self.tasks, 0)
         await self.resources.aclose()
+        self.closed = True
 
     @mutation
     async def create_session(
@@ -208,6 +220,8 @@ class ProfileApplication:
         if self.closing:
             raise DomainError("draining", "Application is closing")
         session = await self.store.get_session(session_id, "operator")
+        if await self.jobs.ledger.owner(session_id) is not None:
+            raise DomainError("job_stage_managed", "Submit long-task stages from the job page")
         await self.sessions.validate(session)
         admission = await self.store.admit(
             session,
@@ -235,6 +249,16 @@ class ProfileApplication:
         finally:
             self.wakeups.discard(session_id)
             self.drains.pop(session_id, None)
+            if not self.closing:
+                await self.jobs.after_session(session_id)
+
+    @mutation
+    async def create_job(self, plan):
+        return await self.jobs.create(plan)
+
+    @mutation
+    async def command_job(self, job_id, action, *, position=None, evidence=None):
+        return await self.jobs.command(job_id, action, position=position, evidence=evidence)
 
     def track(self, task: asyncio.Task):
         self.tasks.add(task)
@@ -322,7 +346,7 @@ class ProfileApplication:
             await self.delegations.reconcile_background()
         return await self.get_delegation(session_id, delegation_id)
 
-    def runtime(self, session, claim, mcp_bindings=None):
+    def runtime(self, session, claim, mcp_bindings=None, *, stage_limits=None, job_id=None):
         runtime_type = DeepRuntime if session.engine == "deep" else StandardRuntime
         kwargs = dict(
             session=session,
@@ -333,13 +357,16 @@ class ProfileApplication:
             executions=self.executions,
             receipts=self.receipts,
             saver=self.saver,
-            limits=self.limits,
+            limits=stage_limits or self.limits,
             mcp=self.mcp,
             mcp_bindings=mcp_bindings,
             web_client=self.web,
         )
-        if runtime_type is DeepRuntime:
+        if runtime_type is DeepRuntime and stage_limits is None:
             kwargs["background_launcher"] = self.launch_background
+        if stage_limits is not None:
+            kwargs["model_lock"] = self.jobs.model_lock
+            kwargs["pause_probe"] = lambda: self.jobs.ledger.paused(job_id)
         return runtime_type(**kwargs)
 
     async def drain(self, session_id: str):
@@ -351,8 +378,13 @@ class ProfileApplication:
                 logger.warning("Session %s paused: %s", session.id, exc.code)
                 return
             while not self.closing:
-                ready = await self.receipts.decided_waiting(session_id)
-                if ready:
+                paused = await self.executions.paused_job_admission(session_id)
+                ready = await self.receipts.decided_waiting(session_id) if paused is None else ()
+                if paused is not None:
+                    claim = await self.executions.resume(
+                        paused, session_id, self.owner, job_paused=True
+                    )
+                elif ready:
                     pending = ready[0]
                     claim = await self.executions.resume(
                         pending["admission_id"],
@@ -364,7 +396,9 @@ class ProfileApplication:
                     claim = await self.executions.claim(session_id, self.owner)
                 if claim is None:
                     return
-                status = await self.execute(session, claim, resume=bool(ready))
+                status = await self.execute(
+                    session, claim, resume=bool(ready) or paused is not None
+                )
                 if status != "completed":
                     return
 
@@ -376,12 +410,25 @@ class ProfileApplication:
             await self.delegations.settle_background(session.id, "running", None)
             binding = await self.sessions.policies.get(session.id)
             mcp_bindings = binding["snapshot"].get("mcp_bindings") if binding else None
+            stage = await self.jobs.ledger.owner(session.id)
+            limits = ExecutionSettings.model_validate(stage["limits"]) if stage else self.limits
             spent = await self.executions.active_seconds(claim.admission.id)
-            remaining = self.limits.wall_seconds - spent - (clock() - started)
+            remaining = limits.wall_seconds - spent - (clock() - started)
+            if stage is not None:
+                deadline = await self.jobs.ledger.deadline(stage["job_id"])
+                if deadline is not None:
+                    remaining = min(remaining, deadline - time.time())
             if remaining <= 0:
                 raise DomainError("budget_exhausted", "Cumulative active execution time exhausted")
             async with asyncio.timeout(remaining):
-                result = await self.runtime(session, claim, mcp_bindings).run(resume=resume)
+                runtime = self.runtime(
+                    session,
+                    claim,
+                    mcp_bindings,
+                    stage_limits=limits if stage else None,
+                    job_id=stage["job_id"] if stage else None,
+                )
+                result = await runtime.run(resume=resume)
         except asyncio.CancelledError:
             await self.executions.settle(claim, "unknown", elapsed=clock() - started)
             await self.delegations.settle_background(session.id, "unknown", None)
@@ -406,11 +453,17 @@ class ProfileApplication:
                     "context_budget_exhausted",
                     "harness_output",
                     "empty_model_response",
+                    "ollama_response_error",
+                    "model_connection_failed",
                 }
                 else "unknown"
             )
             failure = f"Execution stopped [{category}]"
-            if category == "budget_exhausted" and isinstance(exc, DomainError):
+            if category in {
+                "budget_exhausted",
+                "ollama_response_error",
+                "model_connection_failed",
+            } and isinstance(exc, DomainError):
                 failure += f": {exc}"
             if category == "unknown_effect" and isinstance(exc, DomainError):
                 failure += f": {exc}"
@@ -476,6 +529,10 @@ class ProfileApplication:
 
     @mutation
     async def bind_runtime(self, session_id, expected_fingerprint):
+        if await self.jobs.ledger.owner(session_id) is not None:
+            raise DomainError(
+                "job_stage_managed", "Permissions and binding are fixed for job stages"
+            )
         async with self.locks.setdefault(session_id, asyncio.Lock()):
             session = await self.store.get_session(session_id, "operator")
             bound = await self.sessions.policies.get(session_id)
@@ -501,6 +558,10 @@ class ProfileApplication:
     async def set_permissions(
         self, session_id, mode, expected_revision, full_access_acknowledged=False
     ):
+        if await self.jobs.ledger.owner(session_id) is not None:
+            raise DomainError(
+                "job_stage_managed", "Permissions and binding are fixed for job stages"
+            )
         status = await self.store.session_status(session_id, "operator")
         if status["active_admissions"]:
             raise DomainError("permissions_busy", "Finish pending work before changing permissions")

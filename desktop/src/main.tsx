@@ -1,3 +1,4 @@
+import { LongTasks } from "./long-tasks"
 import { createRoot } from 'react-dom/client'
 import { useStore } from '@nanostores/react'
 import { useEffect, useRef, useState } from 'react'
@@ -56,7 +57,7 @@ const starters = [
     '请结合当前工作区中的文件研究以下问题，给出证据、结论与尚未验证的部分。研究问题：'
   ]
 ]
-type Page = 'chat' | 'capabilities' | 'skills' | 'memories' | 'mcp/tools' | 'settings'
+type Page = 'jobs' | 'chat' | 'capabilities' | 'skills' | 'memories' | 'mcp/tools' | 'settings'
 
 function Chat({ newSession }: { newSession: () => void }) {
   const conversation = useStore($conversation)
@@ -248,8 +249,8 @@ function Chat({ newSession }: { newSession: () => void }) {
           )}
           {interrupted && (
             <div className="notice">
-              <strong>任务已安全停止，未产生未知副作用。</strong>
-              <p>上方为具体停止原因。常见原因是单次读取内容过大或超出上下文预算；请缩小读取范围，或新建会话后重试。</p>
+              <strong>任务已停止，请查看上方原因。</strong>
+              <p>模型连接或执行预算问题解决后，可新建会话重试。</p>
               <button disabled={busy} onClick={newSession}>
                 新建会话
               </button>
@@ -257,7 +258,11 @@ function Chat({ newSession }: { newSession: () => void }) {
           )}
           <div ref={tail} />
         </div>
-        <TaskComposer draft={draft} pending={Boolean(pending)} updateDraft={updateDraft} send={send} />
+        {status?.job_id ? (
+          <p className="notice">此会话属于长任务阶段。可在右侧审批，在「长任务」页控制执行。</p>
+        ) : (
+          <TaskComposer draft={draft} pending={Boolean(pending)} updateDraft={updateDraft} send={send} />
+        )}
       </main>
       <TaskInspector />
     </div>
@@ -314,6 +319,7 @@ function App() {
           {(
             [
               ['chat', '◈', '工作台'],
+              ['jobs', '◇', '长任务'],
               ['capabilities', '◎', '能力'],
               ['skills', '◫', '技能库'],
               ['memories', '◉', '记忆'],
@@ -381,6 +387,11 @@ function App() {
           <Setup onClose={ready ? () => setPage('chat') : undefined} />
         ) : page === 'chat' ? (
           <Chat newSession={() => setCreating(true)} />
+        ) : page === 'jobs' ? (
+          <LongTasks openStage={id => {
+            setPage('chat')
+            void openSession(id).catch(report)
+          }} />
         ) : page === 'capabilities' ? (
           <Capabilities />
         ) : (

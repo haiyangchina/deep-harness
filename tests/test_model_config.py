@@ -69,3 +69,31 @@ def test_explicit_toml_and_cli_model_overrides_are_applied(tmp_path):
     settings = load_model_settings(path, name="cli-model")
     assert settings.name == "cli-model"
     assert settings.base_url == "http://127.0.0.1:22000"
+
+
+@pytest.mark.parametrize(
+    ("url", "bypasses_proxy"),
+    [
+        ("http://127.0.0.1:11434", True),
+        ("http://[::1]:11434", True),
+        ("http://localhost:11434", True),
+        ("https://ollama.example.org", False),
+    ],
+)
+def test_ollama_bypasses_environment_proxy_only_for_loopback(url, bypasses_proxy):
+    from deep_harness.runtime.models import ollama_model
+
+    model = ollama_model(model="test", base_url=url)
+    assert (model.model.client_kwargs.get("trust_env") is False) is bypasses_proxy
+
+
+def test_ollama_response_error_surfaces_safe_http_status():
+    from ollama import ResponseError
+
+    from deep_harness.domain.models import DomainError
+    from deep_harness.runtime.models import model_errors
+
+    with pytest.raises(DomainError, match="HTTP 502") as error, model_errors():
+        raise ResponseError("upstream details", status_code=502)
+    assert error.value.code == "ollama_response_error"
+    assert "upstream details" not in str(error.value)

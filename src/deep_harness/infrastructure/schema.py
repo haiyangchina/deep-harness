@@ -5,6 +5,7 @@ from sqlalchemy import (
     Column,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Integer,
     MetaData,
     String,
@@ -69,6 +70,39 @@ delegations = Table(
     Column("child_admission_id", String),
     Column("stop_requested", Integer, nullable=False, default=0),
     UniqueConstraint("admission_id", "parent_tool_call_id"),
+)
+jobs = Table(
+    "jobs",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("request_id", String, nullable=False, unique=True),
+    Column("request_hash", String, nullable=False),
+    Column("goal", Text, nullable=False),
+    Column("engine", String, nullable=False),
+    Column("runtime_hash", String, nullable=False),
+    Column("status", String, nullable=False),
+    Column("budget", JSON, nullable=False),
+    Column("parallelism", Integer, nullable=False),
+    Column("deadline", Float),
+    Column("notice", Text),
+)
+job_stages = Table(
+    "job_stages",
+    metadata,
+    Column("job_id", ForeignKey("jobs.id"), primary_key=True),
+    Column("position", Integer, primary_key=True),
+    Column("definition", JSON, nullable=False),
+    Column("accepted_evidence", Text),
+)
+job_stage_attempts = Table(
+    "job_stage_attempts",
+    metadata,
+    Column("job_id", String, primary_key=True),
+    Column("position", Integer, primary_key=True),
+    Column("attempt", Integer, primary_key=True),
+    Column("session_id", ForeignKey("sessions.id"), nullable=False, unique=True),
+    Column("limits", JSON, nullable=False),
+    ForeignKeyConstraint(["job_id", "position"], ["job_stages.job_id", "job_stages.position"]),
 )
 delegation_tool_receipts = Table(
     "delegation_tool_receipts",

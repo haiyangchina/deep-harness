@@ -9,7 +9,7 @@ from uuid import uuid4
 from deep_harness.domain.models import DomainError
 from deep_harness.infrastructure import schema as s
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 HOT_INDEXES = (
     "events(session_id, seq)",
     "model_receipts(admission_id)",

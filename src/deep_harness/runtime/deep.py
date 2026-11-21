@@ -27,7 +27,12 @@ from deep_harness.domain.models import DomainError, ToolCall
 from deep_harness.infrastructure import schema as s
 from deep_harness.infrastructure.branches import BranchLedger
 from deep_harness.infrastructure.delegations import DelegationLedger
-from deep_harness.runtime.approval_checkpoint import approval_ids, resume_command
+from deep_harness.runtime.approval_checkpoint import (
+    approval_ids,
+    interrupt_outcome,
+    pause_at_boundary,
+    resume_command,
+)
 from deep_harness.runtime.context import summarize
 from deep_harness.runtime.harnesses import harness_prompt, parse_report
 from deep_harness.runtime.inference import normalized_usage, usage_totals
@@ -40,6 +45,9 @@ class ReceiptedModel(AgentMiddleware):
 
     async def awrap_model_call(self, request, handler):
         async with self.runtime.model_lock:
+            await pause_at_boundary(
+                self.runtime.pause_probe, self.runtime.claim.admission.generation
+            )
             return await self._call(request, handler)
 
     async def _call(self, request, handler):
@@ -169,6 +177,7 @@ class DeepRuntime:
         record_messages=True,
         delegation_id=None,
         model_lock=None,
+        pause_probe=None,
         tool_lock=None,
         background_launcher=None,
     ):
@@ -184,6 +193,7 @@ class DeepRuntime:
         self.record_messages = record_messages
         self.delegation_id = delegation_id
         self.model_lock = model_lock or asyncio.Lock()
+        self.pause_probe = pause_probe
         self.tool_lock = tool_lock or asyncio.Lock()
         self.background_launcher = background_launcher
         self.scope = scope
@@ -247,6 +257,7 @@ class DeepRuntime:
         name = f"harness_{original}" if original == "read_file" else original
 
         async def invoke(runtime: ToolRuntime, **arguments):
+            await pause_at_boundary(self.pause_probe, self.claim.admission.generation)
             raw_id = (
                 runtime.tool_call_id or fingerprint({"name": original, "arguments": arguments})[:32]
             )
@@ -480,13 +491,7 @@ class DeepRuntime:
             }
         result = await self.graph.ainvoke(value, config=self.config, durability="sync")
         if result.get("__interrupt__"):
-            return {
-                "status": "waiting_approval",
-                "result": None,
-                "interactions": approval_ids(
-                    result["__interrupt__"], self.claim.admission.generation
-                ),
-            }
+            return interrupt_outcome(result["__interrupt__"], self.claim.admission.generation)
         answer = result["messages"][-1].content
         if self.session.harness != "general":
             answer = parse_report(answer)

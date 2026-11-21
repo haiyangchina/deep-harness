@@ -1,5 +1,6 @@
 """Atomic claims, fencing and explicit uncertain-outcome recovery."""
 
+import time
 from dataclasses import replace
 
 from sqlalchemy import delete, insert, select, update
@@ -8,7 +9,7 @@ from deep_harness.domain.models import DomainError, ExecutionClaim
 from deep_harness.infrastructure import schema as s
 from deep_harness.infrastructure.store import BusinessStore, admission_from
 
-BLOCKING = ("started", "waiting_approval", "unknown", "interrupted", "reconciled")
+BLOCKING = ("started", "waiting_approval", "job_paused", "unknown", "interrupted", "reconciled")
 
 
 class ExecutionLedger:
@@ -35,7 +36,7 @@ class ExecutionLedger:
                 raise DomainError(
                     "execution_busy", "Execution handoff is in progress; retry cancellation"
                 )
-            if row["status"] not in {"queued", "waiting_approval"}:
+            if row["status"] not in {"queued", "waiting_approval", "job_paused"}:
                 return admission_from(row)
             status = "cancelled" if row["status"] == "queued" else "interrupted"
             await conn.execute(
@@ -53,8 +54,22 @@ class ExecutionLedger:
             )
         return await self.store.get_admission(admission_id, session_id)
 
+    async def _job_allows_claim(self, conn, session_id):
+        row = (
+            await conn.execute(
+                select(s.jobs.c.status, s.jobs.c.deadline)
+                .join(s.job_stage_attempts, s.job_stage_attempts.c.job_id == s.jobs.c.id)
+                .where(s.job_stage_attempts.c.session_id == session_id)
+            )
+        ).first()
+        return row is None or (
+            row.status == "running" and (row.deadline is None or row.deadline > time.time())
+        )
+
     async def claim(self, session_id: str, owner: str) -> ExecutionClaim | None:
         async with self.store.transaction() as conn:
+            if not await self._job_allows_claim(conn, session_id):
+                return None
             stopped = (
                 await conn.execute(
                     select(s.delegations.c.id).where(
@@ -195,17 +210,35 @@ class ExecutionLedger:
                 },
             )
 
+    async def paused_job_admission(self, session_id):
+        async with self.store.engine.connect() as conn:
+            return await conn.scalar(
+                select(s.admissions.c.id).where(
+                    s.admissions.c.session_id == session_id,
+                    s.admissions.c.status == "job_paused",
+                )
+            )
+
     async def resume(
-        self, admission_id: str, session_id: str, owner: str, *, expected_generation=None
+        self,
+        admission_id: str,
+        session_id: str,
+        owner: str,
+        *,
+        expected_generation=None,
+        job_paused=False,
     ) -> ExecutionClaim | None:
         async with self.store.transaction() as conn:
+            if not await self._job_allows_claim(conn, session_id):
+                return None
             row = (
                 (
                     await conn.execute(
                         select(s.admissions).where(
                             s.admissions.c.id == admission_id,
                             s.admissions.c.session_id == session_id,
-                            s.admissions.c.status == "waiting_approval",
+                            s.admissions.c.status
+                            == ("job_paused" if job_paused else "waiting_approval"),
                         )
                     )
                 )
@@ -216,37 +249,38 @@ class ExecutionLedger:
                 expected_generation is not None and row["generation"] != expected_generation
             ):
                 return None
-            wait = (
-                (
-                    await conn.execute(
-                        select(s.approval_waits).where(
-                            s.approval_waits.c.admission_id == admission_id,
-                            s.approval_waits.c.generation == row["generation"],
+            if not job_paused:
+                wait = (
+                    (
+                        await conn.execute(
+                            select(s.approval_waits).where(
+                                s.approval_waits.c.admission_id == admission_id,
+                                s.approval_waits.c.generation == row["generation"],
+                            )
                         )
                     )
+                    .mappings()
+                    .first()
                 )
-                .mappings()
-                .first()
-            )
-            if wait is None or not wait["interaction_ids"]:
-                return None
-            decisions = (
-                (
-                    await conn.execute(
-                        select(s.interactions.c.decision).where(
-                            s.interactions.c.admission_id == admission_id,
-                            s.interactions.c.id.in_(wait["interaction_ids"]),
+                if wait is None or not wait["interaction_ids"]:
+                    return None
+                decisions = (
+                    (
+                        await conn.execute(
+                            select(s.interactions.c.decision).where(
+                                s.interactions.c.admission_id == admission_id,
+                                s.interactions.c.id.in_(wait["interaction_ids"]),
+                            )
                         )
                     )
+                    .scalars()
+                    .all()
                 )
-                .scalars()
-                .all()
-            )
-            if len(decisions) != len(wait["interaction_ids"]) or None in decisions:
-                return None
-            await conn.execute(
-                delete(s.approval_waits).where(s.approval_waits.c.admission_id == admission_id)
-            )
+                if len(decisions) != len(wait["interaction_ids"]) or None in decisions:
+                    return None
+                await conn.execute(
+                    delete(s.approval_waits).where(s.approval_waits.c.admission_id == admission_id)
+                )
             admission = replace(
                 admission_from(row),
                 status="started",

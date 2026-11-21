@@ -1,5 +1,6 @@
 """A single explicit LangGraph loop using project-owned receipts and approvals."""
 
+from contextlib import nullcontext
 from typing import Annotated, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -12,7 +13,11 @@ from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import DomainError, ToolCall
 from deep_harness.infrastructure import schema as s
 from deep_harness.infrastructure.branches import BranchLedger
-from deep_harness.runtime.approval_checkpoint import approval_ids, resume_command
+from deep_harness.runtime.approval_checkpoint import (
+    interrupt_outcome,
+    pause_at_boundary,
+    resume_command,
+)
 from deep_harness.runtime.context import ContextProjector
 from deep_harness.runtime.inference import Inference, usage_totals
 
@@ -54,6 +59,8 @@ class StandardRuntime:
         mcp=None,
         mcp_bindings=None,
         web_client=None,
+        model_lock=None,
+        pause_probe=None,
     ):
         self.session = session
         self.claim = claim
@@ -62,6 +69,8 @@ class StandardRuntime:
         self.executions = executions
         self.receipts = receipts
         self.limits = limits
+        self.model_lock = model_lock
+        self.pause_probe = pause_probe
         self.tool_specs = tool_definitions(session.tools, mcp_bindings)
         if hasattr(model, "with_tool_specs"):
             self.model = model.with_tool_specs(self.tool_specs)
@@ -88,6 +97,7 @@ class StandardRuntime:
         }
 
     async def _model(self, state: State) -> dict:
+        await pause_at_boundary(self.pause_probe, self.claim.admission.generation)
         if state["step"] >= self.limits.max_model_calls:
             raise DomainError("budget_exhausted", "Model call limit reached")
         key = f"{state['admission_id']}:model:{state['step']}"
@@ -109,7 +119,8 @@ class StandardRuntime:
         if response is None:
             async with self.store.transaction() as conn:
                 await self.executions.assert_claim(conn, self.claim)
-            response = await Inference(self).invoke(key, projected)
+            async with self.model_lock or nullcontext():
+                response = await Inference(self).invoke(key, projected)
             response = {**response, "id": key}
             await self.receipts.save_model(self.claim, key, digest, response)
         totals = await usage_totals(self.store, self.session.id, self.claim.admission.id)
@@ -166,6 +177,7 @@ class StandardRuntime:
             self.limits.max_tool_calls,
         )
         for raw in state["messages"][-1]["tool_calls"]:
+            await pause_at_boundary(self.pause_probe, self.claim.admission.generation)
             call = ToolCall(raw["id"], raw["name"], raw["args"])
             message_id = f"{self.claim.admission.id}:tool:{call.id}"
             # An approval resume replays this node from the start. Reuse the committed
@@ -234,13 +246,7 @@ class StandardRuntime:
             }
         result = await self.graph.ainvoke(value, config=self.config, durability="sync")
         if result.get("__interrupt__"):
-            return {
-                "status": "waiting_approval",
-                "result": None,
-                "interactions": approval_ids(
-                    result["__interrupt__"], self.claim.admission.generation
-                ),
-            }
+            return interrupt_outcome(result["__interrupt__"], self.claim.admission.generation)
         return {"status": "completed", "result": result["messages"][-1]["content"]}
 
     async def open_interactions(self) -> list[dict]:

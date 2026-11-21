@@ -103,6 +103,7 @@ class BusinessStore:
                             "queued",
                             "started",
                             "waiting_approval",
+                            "job_paused",
                             "unknown",
                             "interrupted",
                             "reconciled",

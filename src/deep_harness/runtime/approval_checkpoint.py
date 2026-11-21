@@ -1,6 +1,6 @@
 """Translate checkpoint interrupts into business approval IDs and resume commands."""
 
-from langgraph.types import Command
+from langgraph.types import Command, interrupt
 
 from deep_harness.domain.models import DomainError
 
@@ -20,6 +20,22 @@ def approval_ids(interrupts, generation):
             raise DomainError("approval_missing", "Checkpoint has no verifiable approval ID")
         ids.extend(current)
     return tuple(dict.fromkeys(ids))
+
+
+async def pause_at_boundary(probe, generation):
+    while probe is not None and await probe():
+        interrupt({"generation": generation, "job_pause": True})
+
+
+def interrupt_outcome(interrupts, generation):
+    approvals = [item for item in interrupts if not item.value.get("job_pause")]
+    if not approvals:
+        return {"status": "job_paused", "result": None}
+    return {
+        "status": "waiting_approval",
+        "result": None,
+        "interactions": approval_ids(approvals, generation),
+    }
 
 
 def resume_command(state):
