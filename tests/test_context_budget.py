@@ -201,3 +201,36 @@ async def test_oversize_user_input_still_fails_explicitly():
     with pytest.raises(DomainError) as error:
         await projector.project(_claim(), "prompt", [], messages)
     assert error.value.code == "context_budget_exhausted"
+
+
+def test_deep_projection_keeps_current_tool_exchange_and_drops_old_external_content():
+    from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+    from deep_harness.runtime.deep import ReceiptedModel
+
+    class Request:
+        tools = []
+
+        def __init__(self, messages):
+            self.messages = messages
+
+        def override(self, *, messages):
+            return Request(messages)
+
+    limits = ExecutionSettings(max_context_characters=2000, summary_characters=256)
+    middleware = ReceiptedModel(SimpleNamespace(limits=limits, model=DiagnosticModel()))
+    current = [
+        HumanMessage(content="new question"),
+        AIMessage(content="", tool_calls=[{"name": "read", "args": {}, "id": "new"}]),
+        ToolMessage(content="current evidence", tool_call_id="new"),
+    ]
+    old = [
+        HumanMessage(content="original goal"),
+        AIMessage(content="", tool_calls=[{"name": "read", "args": {}, "id": "old"}]),
+        ToolMessage(content="untrusted old details " * 200, tool_call_id="old"),
+        AIMessage(content="old answer"),
+    ]
+    projected, _ = middleware._project(Request(old + current), None)
+    assert projected.messages[-3:] == current
+    assert "original goal" in projected.messages[0].content
+    assert "untrusted old" not in projected.messages[0].content

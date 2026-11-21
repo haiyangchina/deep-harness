@@ -1,5 +1,8 @@
 """Real LangGraph, SQLite and tool execution with no paid model calls."""
 
+import sqlite3
+from contextlib import closing
+
 import pytest
 
 from deep_harness.bootstrap import ProjectHost
@@ -88,8 +91,12 @@ async def test_write_waits_and_resumes_after_entire_host_restarts(tmp_path):
         assert final.status == "completed"
         assert (tmp_path / "result.txt").read_text(encoding="utf-8") == "approved"
         assert len(await app.store.history(session.id)) == 4
-        with pytest.raises(DomainError, match="generation|answered"):
+        assert (
             await app.approve(session.id, interaction_id, pending.generation, "approve")
+            == pending.id
+        )
+        with pytest.raises(DomainError, match="cannot be changed"):
+            await app.approve(session.id, interaction_id, pending.generation, "deny")
     finally:
         await restarted.close()
 
@@ -124,7 +131,8 @@ async def test_second_owner_is_rejected_and_lock_releases_on_close(tmp_path):
         await two.close()
 
 
-async def test_durable_decision_is_resumed_if_process_stopped_before_claim(tmp_path):
+@pytest.mark.parametrize("upgrade_v10", [False, True])
+async def test_durable_decision_is_resumed_if_process_stopped_before_claim(tmp_path, upgrade_v10):
     state = tmp_path / "state"
     host = ProjectHost(state, tmp_path)
     app = await host.application("writer")
@@ -137,6 +145,12 @@ async def test_durable_decision_is_resumed_if_process_stopped_before_claim(tmp_p
         "approve",
     )
     await host.close()
+    if upgrade_v10:
+        with closing(sqlite3.connect(state / "profiles" / "writer" / "business.db")) as conn:
+            conn.execute("DROP TABLE approval_decisions")
+            conn.execute("ALTER TABLE admissions DROP COLUMN active_seconds")
+            conn.execute("PRAGMA user_version=10")
+            conn.commit()
     restarted = ProjectHost(state, tmp_path)
     try:
         app = await restarted.application("writer")
@@ -187,9 +201,7 @@ async def test_approval_resume_does_not_replay_committed_tool_calls(tmp_path):
     host = ProjectHost(tmp_path / "state", tmp_path, lambda scope: TwoWriteModel())
     try:
         app = await host.application("one")
-        session = await app.create_session(
-            "create", "Frozen", ("write",), permission_mode="ask"
-        )
+        session = await app.create_session("create", "Frozen", ("write",), permission_mode="ask")
         admission = await app.submit(session.id, "send", "go")
         await app.wait_idle()
         for _ in range(4):
@@ -207,5 +219,61 @@ async def test_approval_resume_does_not_replay_committed_tool_calls(tmp_path):
         tools = [row for row in await app.store.history(session.id) if row["role"] == "tool"]
         assert len(tools) == 2
         assert all("Tool refused" not in row["content"] for row in tools)
+    finally:
+        await host.close()
+
+
+async def test_approval_redelivery_repairs_failed_work_handoff(tmp_path, monkeypatch):
+    host = ProjectHost(tmp_path / "state", tmp_path)
+    try:
+        app = await host.application("writer")
+        session = await app.create_session("create", "Frozen", ("write",), permission_mode="ask")
+        pending = await send(app, session, "send", "/write recovered.txt once")
+        key = (await app.store.session_status(session.id, "operator"))["approvals"][0]["id"]
+        schedule = app.schedule
+
+        def fail_to_notify(session_id):
+            raise RuntimeError("injected after durable approval")
+
+        monkeypatch.setattr(app, "schedule", fail_to_notify)
+        with pytest.raises(RuntimeError, match="injected"):
+            await app.approve(session.id, key, pending.generation, "approve")
+        assert (await app.store.get_admission(pending.id, session.id)).status == "waiting_approval"
+        monkeypatch.setattr(app, "schedule", schedule)
+        assert await app.approve(session.id, key, pending.generation, "approve") == pending.id
+        await app.wait_idle()
+        assert (await app.store.get_admission(pending.id, session.id)).status == "completed"
+        assert (tmp_path / "recovered.txt").read_text(encoding="utf-8") == "once"
+        events = await app.store.event_history(session.id)
+        assert sum(event["type"] == "interaction.resolved" for event in events) == 1
+        assert sum(event["type"] == "approval.dispatched" for event in events) == 1
+    finally:
+        await host.close()
+
+
+async def test_approval_resume_does_not_reset_active_time_budget(tmp_path):
+    from sqlalchemy import update
+
+    from deep_harness.application.config import ExecutionSettings
+    from deep_harness.infrastructure import schema as s
+
+    host = ProjectHost(
+        tmp_path / "state", tmp_path, execution_limits=ExecutionSettings(wall_seconds=5)
+    )
+    try:
+        app = await host.application("writer")
+        session = await app.create_session("create", "Frozen", ("write",), permission_mode="ask")
+        pending = await send(app, session, "send", "/write must-not-exist.txt value")
+        key = (await app.store.session_status(session.id, "operator"))["approvals"][0]["id"]
+        async with app.store.transaction() as conn:
+            await conn.execute(
+                update(s.admissions).where(s.admissions.c.id == pending.id).values(active_seconds=5)
+            )
+        await app.approve(session.id, key, pending.generation, "approve")
+        await app.wait_idle()
+        result = await app.store.get_admission(pending.id, session.id)
+        assert result.status == "interrupted"
+        assert "Cumulative active execution time" in result.result
+        assert not (tmp_path / "must-not-exist.txt").exists()
     finally:
         await host.close()

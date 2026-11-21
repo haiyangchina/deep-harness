@@ -8,9 +8,11 @@ import {
   $error,
   $runtime,
   $sessions,
+  $sessionCursor,
   api,
   initialize,
   loadSessions,
+  loadMoreSessions,
   openSession,
   perform,
   refreshConversation,
@@ -91,7 +93,10 @@ function Chat({ newSession }: { newSession: () => void }) {
       if (!submission.text) return
       localStorage.setItem(storageKey('pending', sessionId), JSON.stringify(submission))
       setPending(submission)
-      await api<Admission>(`/sessions/${sessionId}/inputs`, 'POST', submission)
+      const existing = pending ? await api<Admission | null>(
+        `/sessions/${sessionId}/submission?submission_id=${encodeURIComponent(submission.submission_id)}`
+      ) : null
+      if (!existing) await api<Admission>(`/sessions/${sessionId}/inputs`, 'POST', submission)
       localStorage.removeItem(storageKey('pending', sessionId))
       localStorage.removeItem(storageKey('draft', sessionId))
       if ($conversation.get()?.id === sessionId) {
@@ -262,6 +267,7 @@ function Chat({ newSession }: { newSession: () => void }) {
 function App() {
   const runtime = useStore($runtime)
   const sessions = useStore($sessions)
+  const sessionCursor = useStore($sessionCursor)
   const conversation = useStore($conversation)
   const error = useStore($error)
   const [page, setPage] = useState<Page>('chat')
@@ -351,6 +357,7 @@ function App() {
               </div>
             </button>
           ))}
+          {sessionCursor && <button onClick={() => void perform(loadMoreSessions)}>加载更多会话</button>}
         </div>
         <div className="sidebar-bottom">
           <button onClick={() => setPage('settings')}>⚙ 运行设置</button>

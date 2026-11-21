@@ -28,6 +28,7 @@ from deep_harness.infrastructure import schema as s
 from deep_harness.infrastructure.branches import BranchLedger
 from deep_harness.infrastructure.delegations import DelegationLedger
 from deep_harness.runtime.approval_checkpoint import approval_ids, resume_command
+from deep_harness.runtime.context import summarize
 from deep_harness.runtime.harnesses import harness_prompt, parse_report
 from deep_harness.runtime.inference import normalized_usage, usage_totals
 from deep_harness.runtime.models import LangChainModel, model_errors, to_langchain
@@ -43,8 +44,8 @@ class ReceiptedModel(AgentMiddleware):
 
     async def _call(self, request, handler):
         owner = self.runtime
-        messages = [message.model_dump(mode="json") for message in request.messages]
         prompt = request.system_message.model_dump(mode="json") if request.system_message else None
+        request, messages = self._project(request, prompt)
         digest = fingerprint({"prompt": prompt, "messages": messages, "tools": owner.tool_specs})
         key = f"{owner.claim.admission.id}:deep:model:{digest[:32]}"
         saved = await owner.receipts.model_result(key, digest)
@@ -55,18 +56,6 @@ class ReceiptedModel(AgentMiddleware):
             raise DomainError("budget_exhausted", "Model call limit reached")
         if totals["total_tokens"] >= owner.limits.max_run_tokens:
             raise DomainError("budget_exhausted", "Per-run token budget exhausted")
-        context_size = len(
-            json.dumps(
-                {"prompt": prompt, "messages": messages, "tools": request.tools},
-                ensure_ascii=False,
-                default=str,
-            ).encode("utf-8")
-        )
-        budget = getattr(owner.model, "context_budget_bytes", None)
-        if context_size > min(owner.limits.max_context_characters, budget or 1_000_000):
-            raise DomainError(
-                "context_budget_exhausted", "Deep context exceeds the configured budget"
-            )
         async with owner.store.transaction() as conn:
             await owner.executions.assert_claim(conn, owner.claim)
             await owner.store.append_event(conn, owner.session.id, "model.started", {"id": key})
@@ -102,6 +91,63 @@ class ReceiptedModel(AgentMiddleware):
             raise DomainError("budget_exhausted", "Per-run token budget exceeded by model output")
         answer.id = key
         return response
+
+    def _project(self, request, prompt):
+        owner = self.runtime
+        budget = getattr(owner.model, "context_budget_bytes", None)
+        original = request.messages
+        messages = [message.model_dump(mode="json") for message in original]
+        fixed = json.dumps(
+            {"prompt": prompt, "tools": request.tools}, ensure_ascii=False, default=str
+        )
+
+        char_limit = owner.limits.max_context_characters - len(fixed)
+        byte_limit = budget - len(fixed.encode()) if budget is not None else None
+
+        def fits(chars, size):
+            return chars <= char_limit and (byte_limit is None or size <= byte_limit)
+
+        rendered = [json.dumps(row, ensure_ascii=False, default=str) for row in messages]
+        chars = size = 2  # JSON array brackets
+        first_turn = None
+        for index in range(len(original) - 1, -1, -1):
+            separator = 2 if index + 1 < len(original) else 0
+            chars += len(rendered[index]) + separator
+            size += len(rendered[index].encode()) + separator
+            if not fits(chars, size):
+                break
+            if index == 0:
+                return request, messages
+            previous = original[index - 1]
+            if (
+                isinstance(original[index], HumanMessage)
+                and isinstance(previous, AIMessage)
+                and not previous.tool_calls
+            ):
+                first_turn = index
+        if first_turn is not None:
+            retained = original[first_turn:]
+            retained_payload = messages[first_turn:]
+            user_history = [
+                {"role": "user", "content": message.content}
+                for message in original[:first_turn]
+                if isinstance(message, HumanMessage)
+            ]
+            summary = summarize("", user_history, owner.limits.summary_characters)
+            if summary:
+                note = HumanMessage(
+                    id=f"deep-context:{fingerprint(summary)}",
+                    content=f"Archived user inputs (historical context):\n{summary}",
+                )
+                projected = [note.model_dump(mode="json"), *retained_payload]
+                history = json.dumps(projected, ensure_ascii=False, default=str)
+                if fits(len(history), len(history.encode())):
+                    return request.override(messages=[note, *retained]), projected
+            return request.override(messages=retained), retained_payload
+        raise DomainError(
+            "context_budget_exhausted",
+            "Deep current turn, tool outputs or schemas exceed the configured context budget",
+        )
 
 
 class DeepRuntime:

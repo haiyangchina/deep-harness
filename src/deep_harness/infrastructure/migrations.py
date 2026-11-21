@@ -9,7 +9,7 @@ from uuid import uuid4
 from deep_harness.domain.models import DomainError
 from deep_harness.infrastructure import schema as s
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 HOT_INDEXES = (
     "events(session_id, seq)",
     "model_receipts(admission_id)",
@@ -36,6 +36,8 @@ async def validate_tables(conn, tables, required, *, legacy=False):
     for name in sorted(required):
         columns = {row[1] for row in await conn.exec_driver_sql(f"PRAGMA table_info({name})")}
         expected = set(s.metadata.tables[name].columns.keys())
+        if legacy and name == "admissions":
+            expected.discard("active_seconds")
         if legacy and name == "sessions":
             expected.discard("harness")
             expected.difference_update({"permission_mode", "permission_revision"})
@@ -104,6 +106,13 @@ async def migrate(engine, home):
                         await conn.exec_driver_sql(
                             f"ALTER TABLE sessions ADD COLUMN {name} {definition}"
                         )
+                admission_columns = {
+                    row[1] for row in await conn.exec_driver_sql("PRAGMA table_info(admissions)")
+                }
+                if "active_seconds" not in admission_columns:
+                    await conn.exec_driver_sql(
+                        "ALTER TABLE admissions ADD COLUMN active_seconds REAL NOT NULL DEFAULT 0"
+                    )
                 if "context_heads" in tables:
                     context_columns = {
                         row[1]
@@ -164,6 +173,14 @@ async def migrate(engine, home):
                 name = target.replace("(", "_").replace(", ", "_").removesuffix(")")
                 await conn.exec_driver_sql(
                     f"CREATE INDEX IF NOT EXISTS ix_harness_{name} ON {target}"
+                )
+            if version < 11:
+                await conn.exec_driver_sql(
+                    "INSERT OR IGNORE INTO approval_decisions(interaction_id, generation) "
+                    "SELECT i.id, w.generation FROM approval_waits w "
+                    "JOIN json_each(w.interaction_ids) j "
+                    "JOIN interactions i ON i.id=j.value AND i.admission_id=w.admission_id "
+                    "WHERE i.decision IS NOT NULL"
                 )
             if version < 10:
                 await conn.exec_driver_sql(

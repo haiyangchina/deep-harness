@@ -147,8 +147,20 @@ class ExecutionLedger:
                     [{"admission_id": admission_id, "call_id": key} for key in sorted(fresh)],
                 )
 
+    async def active_seconds(self, admission_id):
+        async with self.store.engine.connect() as conn:
+            return await conn.scalar(
+                select(s.admissions.c.active_seconds).where(s.admissions.c.id == admission_id)
+            )
+
     async def settle(
-        self, claim: ExecutionClaim, status: str, result: str | None = None, *, interactions=()
+        self,
+        claim: ExecutionClaim,
+        status: str,
+        result: str | None = None,
+        *,
+        interactions=(),
+        elapsed=0.0,
     ):
         async with self.store.transaction() as conn:
             await self.assert_claim(conn, claim)
@@ -165,13 +177,22 @@ class ExecutionLedger:
                 .where(
                     s.admissions.c.id == claim.admission.id,
                 )
-                .values(status=status, result=result)
+                .values(
+                    status=status,
+                    result=result,
+                    active_seconds=s.admissions.c.active_seconds + elapsed,
+                )
             )
             await self.store.append_event(
                 conn,
                 claim.admission.session_id,
                 f"execution.{status}",
-                {"admission_id": claim.admission.id, "result": result},
+                {
+                    "admission_id": claim.admission.id,
+                    "generation": claim.admission.generation,
+                    "elapsed_seconds": round(elapsed, 3),
+                    "result": result,
+                },
             )
 
     async def resume(

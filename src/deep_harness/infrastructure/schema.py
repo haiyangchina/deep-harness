@@ -3,6 +3,7 @@
 from sqlalchemy import (
     JSON,
     Column,
+    Float,
     ForeignKey,
     Integer,
     MetaData,
@@ -49,6 +50,7 @@ admissions = Table(
     Column("generation", Integer, nullable=False, default=0),
     Column("owner", String),
     Column("result", Text),
+    Column("active_seconds", Float, nullable=False, server_default="0"),
     UniqueConstraint("session_id", "principal", "submission_id"),
 )
 delegations = Table(
@@ -125,6 +127,12 @@ approval_waits = Table(
     Column("admission_id", ForeignKey("admissions.id"), primary_key=True),
     Column("generation", Integer, nullable=False),
     Column("interaction_ids", JSON, nullable=False),
+)
+approval_decisions = Table(
+    "approval_decisions",
+    metadata,
+    Column("interaction_id", ForeignKey("interactions.id"), primary_key=True),
+    Column("generation", Integer, nullable=False),
 )
 approval_revocations = Table(
     "approval_revocations",

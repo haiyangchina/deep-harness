@@ -359,6 +359,23 @@ class BusinessStore:
             await self.append_event(conn, session.id, "admission.accepted", {"id": admission_id})
         return Admission(admission_id, session.id, text, "queued", 0)
 
+    async def find_submission(self, session_id, submission_id, principal="operator"):
+        async with self.engine.connect() as conn:
+            row = (
+                (
+                    await conn.execute(
+                        select(s.admissions).where(
+                            s.admissions.c.session_id == session_id,
+                            s.admissions.c.submission_id == submission_id,
+                            s.admissions.c.principal == principal,
+                        )
+                    )
+                )
+                .mappings()
+                .first()
+            )
+        return admission_from(row) if row is not None else None
+
     async def get_admission(self, admission_id: str, session_id: str) -> Admission:
         async with self.engine.connect() as conn:
             row = (
@@ -481,18 +498,25 @@ class BusinessStore:
         escaped = query.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         async with self.engine.connect() as conn:
             rows = await conn.exec_driver_sql(
+                "WITH ranked_fts AS ("
                 "SELECT m.payload, a.ordinal AS turn_ordinal, m.ordinal AS message_ordinal "
                 "FROM messages_fts "
                 "JOIN messages AS m ON m.ordinal = messages_fts.rowid "
                 "JOIN admissions AS a ON a.id = m.admission_id "
                 "WHERE messages_fts MATCH ? AND messages_fts.session_id = ? "
                 "AND a.status = 'completed' "
-                "UNION SELECT m.payload, a.ordinal, m.ordinal FROM messages AS m "
-                "JOIN admissions AS a ON a.id = m.admission_id "
-                "WHERE m.session_id = ? AND a.status = 'completed' "
+                "ORDER BY a.ordinal, m.ordinal LIMIT ?"
+                "), ranked_literal AS ("
+                "SELECT m.payload, a.ordinal AS turn_ordinal, m.ordinal AS message_ordinal "
+                "FROM admissions AS a INDEXED BY ix_harness_admissions_session_id_status_ordinal "
+                "CROSS JOIN messages AS m INDEXED BY ix_harness_messages_admission_id_ordinal "
+                "ON m.admission_id = a.id WHERE a.session_id = ? AND m.session_id = ? "
+                "AND a.status = 'completed' "
                 "AND CAST(json_extract(m.payload, '$.content') AS TEXT) LIKE ? ESCAPE '\\' "
+                "ORDER BY a.ordinal, m.ordinal LIMIT ?"
+                ") SELECT * FROM ranked_fts UNION SELECT * FROM ranked_literal "
                 "ORDER BY turn_ordinal, message_ordinal LIMIT ?",
-                (phrase, session_id, session_id, f"%{escaped}%", limit),
+                (phrase, session_id, limit, session_id, session_id, f"%{escaped}%", limit, limit),
             )
             return [json.loads(row[0]) for row in rows]
 

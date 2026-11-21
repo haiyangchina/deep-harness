@@ -79,6 +79,8 @@ class ProfileApplication:
         self.closing = False
         self.recover_queued = recover_queued
         self.control = asyncio.Lock()
+        self.maintenance = False
+        self.mutations: set[asyncio.Task] = set()
         self.active: dict[str, asyncio.Task] = {}
 
     async def start(self):
@@ -112,8 +114,7 @@ class ProfileApplication:
                 self.schedule(session_id)
             decided = await self.receipts.decided_waiting() if self.recover_queued else ()
             for pending in decided:
-                session = await self.store.get_session(pending["session_id"], "operator")
-                await self.resume_decided(session, pending["admission_id"], pending["generation"])
+                self.schedule(pending["session_id"])
         except BaseException:
             await self.resources.aclose()
             raise
@@ -143,7 +144,8 @@ class ProfileApplication:
     async def close(self, grace_seconds=5):
         async with self.control:
             self.closing = True
-        await drain_tasks(self.tasks, grace_seconds)
+        await drain_tasks(self.tasks | self.mutations, grace_seconds)
+        await drain_tasks(self.tasks, 0)
         await self.resources.aclose()
 
     @mutation
@@ -349,23 +351,39 @@ class ProfileApplication:
                 logger.warning("Session %s paused: %s", session.id, exc.code)
                 return
             while not self.closing:
-                claim = await self.executions.claim(session_id, self.owner)
+                ready = await self.receipts.decided_waiting(session_id)
+                if ready:
+                    pending = ready[0]
+                    claim = await self.executions.resume(
+                        pending["admission_id"],
+                        session_id,
+                        self.owner,
+                        expected_generation=pending["generation"],
+                    )
+                else:
+                    claim = await self.executions.claim(session_id, self.owner)
                 if claim is None:
                     return
-                status = await self.execute(session, claim)
+                status = await self.execute(session, claim, resume=bool(ready))
                 if status != "completed":
                     return
 
     async def execute(self, session, claim, *, resume=False):
         self.active[claim.admission.id] = asyncio.current_task()
+        clock = asyncio.get_running_loop().time
+        started = clock()
         try:
             await self.delegations.settle_background(session.id, "running", None)
             binding = await self.sessions.policies.get(session.id)
             mcp_bindings = binding["snapshot"].get("mcp_bindings") if binding else None
-            async with asyncio.timeout(self.limits.wall_seconds):
+            spent = await self.executions.active_seconds(claim.admission.id)
+            remaining = self.limits.wall_seconds - spent - (clock() - started)
+            if remaining <= 0:
+                raise DomainError("budget_exhausted", "Cumulative active execution time exhausted")
+            async with asyncio.timeout(remaining):
                 result = await self.runtime(session, claim, mcp_bindings).run(resume=resume)
         except asyncio.CancelledError:
-            await self.executions.settle(claim, "unknown")
+            await self.executions.settle(claim, "unknown", elapsed=clock() - started)
             await self.delegations.settle_background(session.id, "unknown", None)
             raise
         except Exception as exc:
@@ -374,7 +392,12 @@ class ProfileApplication:
             if isinstance(exc, DomainError):
                 logger.warning("Execution stopped [%s]", category)
             else:
-                logger.exception("Execution stopped; preserving uncertain outcomes")
+                logger.error(
+                    "Execution stopped admission=%s generation=%s category=%s",
+                    claim.admission.id,
+                    claim.admission.generation,
+                    category,
+                )
             status = (
                 "interrupted"
                 if category
@@ -387,6 +410,8 @@ class ProfileApplication:
                 else "unknown"
             )
             failure = f"Execution stopped [{category}]"
+            if category == "budget_exhausted" and isinstance(exc, DomainError):
+                failure += f": {exc}"
             if category == "unknown_effect" and isinstance(exc, DomainError):
                 failure += f": {exc}"
             if category == "context_budget_exhausted":
@@ -403,13 +428,17 @@ class ProfileApplication:
                     "[model] reasoning = false (the default) or use a non-thinking "
                     "model, then retry in a new session."
                 )
-            await self.executions.settle(claim, status, failure)
+            await self.executions.settle(claim, status, failure, elapsed=clock() - started)
             await self.delegations.settle_background(session.id, status, failure)
             return status
         finally:
             self.active.pop(claim.admission.id, None)
         await self.executions.settle(
-            claim, result["status"], result["result"], interactions=result.get("interactions", ())
+            claim,
+            result["status"],
+            result["result"],
+            interactions=result.get("interactions", ()),
+            elapsed=clock() - started,
         )
         await self.delegations.settle_background(session.id, result["status"], result["result"])
         if result["status"] == "completed" and self.auto_curate:
@@ -442,24 +471,8 @@ class ProfileApplication:
                 generation,
                 decision,
             )
-            claim = await self.executions.resume(
-                admission_id, session_id, self.owner, expected_generation=generation
-            )
-            if claim is not None:
-                self.track(asyncio.create_task(self._resume(session, claim)))
+            self.schedule(session_id)
         return admission_id
-
-    async def resume_decided(self, session, admission_id, generation):
-        try:
-            await self.sessions.validate(session)
-        except DomainError as exc:
-            logger.warning("Approval recovery for %s paused: %s", session.id, exc.code)
-            return
-        claim = await self.executions.resume(
-            admission_id, session.id, self.owner, expected_generation=generation
-        )
-        if claim is not None:
-            self.track(asyncio.create_task(self._resume(session, claim)))
 
     @mutation
     async def bind_runtime(self, session_id, expected_fingerprint):
@@ -476,16 +489,11 @@ class ProfileApplication:
                     harness=session.harness,
                     knowledge=knowledge,
                     mcp_catalog=catalog,
-                    version=bound["snapshot"].get("version", 1) if bound else 2,
+                    version=bound["snapshot"].get("version", 1) if bound else 3,
                 ),
                 expected_fingerprint,
             )
             await self.restore_waits()
-            for pending in await self.receipts.decided_waiting():
-                if pending["session_id"] == session_id:
-                    await self.resume_decided(
-                        session, pending["admission_id"], pending["generation"]
-                    )
         self.schedule(session_id)
         return await self.sessions.status(session_id)
 
@@ -537,7 +545,7 @@ class ProfileApplication:
         task = self.active.get(admission_id)
         if admission.status == "started" and task is not None:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            await asyncio.wait({task}, timeout=5)
             return await self.store.get_admission(admission_id, session_id)
         result = await self.executions.cancel_pending(session_id, admission_id)
         if result.status == "cancelled":
@@ -546,8 +554,34 @@ class ProfileApplication:
 
     @mutation
     async def backup(self, destination):
-        await self.wait_idle()
-        return await asyncio.to_thread(create_archive, self.scope, destination)
+        async with self.control:
+            if self.maintenance:
+                raise DomainError("maintenance", "A profile backup is in progress")
+            self.maintenance = True
+            others = self.mutations - {asyncio.current_task()}
+        try:
+            if others:
+                _, pending = await asyncio.wait(others, timeout=30)
+                if pending:
+                    raise DomainError(
+                        "maintenance_busy", "Profile mutations did not finish in time"
+                    )
+            clock = asyncio.get_running_loop().time
+            deadline = clock() + 30
+            while running := {task for task in self.tasks if not task.done()}:
+                _, pending = await asyncio.wait(running, timeout=max(0, deadline - clock()))
+                if pending:
+                    raise DomainError("maintenance_busy", "Profile execution did not drain in time")
+            archive = asyncio.create_task(
+                asyncio.to_thread(create_archive, self.scope, destination)
+            )
+            try:
+                return await asyncio.shield(archive)
+            except asyncio.CancelledError:
+                await archive
+                raise
+        finally:
+            self.maintenance = False
 
     @mutation
     async def reconcile(self, session_id, admission_id, generation, evidence, effects):
@@ -579,12 +613,6 @@ class ProfileApplication:
     @mutation
     async def decide_memory_candidate(self, candidate_id, decision):
         return await self.curator.ledger.decide(candidate_id, decision)
-
-    async def _resume(self, session, claim):
-        async with self.locks.setdefault(session.id, asyncio.Lock()):
-            status = await self.execute(session, claim, resume=True)
-        if status == "completed":
-            self.schedule(session.id)
 
 
 class ProjectHost:

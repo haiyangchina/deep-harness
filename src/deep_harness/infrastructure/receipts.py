@@ -250,7 +250,7 @@ class ReceiptLedger:
                 {"admission_id": admission_id},
             )
 
-    async def decided_waiting(self) -> list[dict]:
+    async def decided_waiting(self, session_id=None) -> list[dict]:
         current = func.json_each(s.approval_waits.c.interaction_ids).table_valued("value")
         decided_count = (
             select(func.count())
@@ -262,24 +262,27 @@ class ReceiptLedger:
             .correlate(s.approval_waits)
             .scalar_subquery()
         )
-        async with self.store.engine.connect() as conn:
-            rows = await conn.execute(
-                select(
-                    s.admissions.c.id.label("admission_id"),
-                    s.admissions.c.session_id,
-                    s.approval_waits.c.generation,
-                )
-                .join(
-                    s.approval_waits,
-                    (s.approval_waits.c.admission_id == s.admissions.c.id)
-                    & (s.approval_waits.c.generation == s.admissions.c.generation),
-                )
-                .where(
-                    s.admissions.c.status == "waiting_approval",
-                    func.json_array_length(s.approval_waits.c.interaction_ids) > 0,
-                    func.json_array_length(s.approval_waits.c.interaction_ids) == decided_count,
-                )
+        query = (
+            select(
+                s.admissions.c.id.label("admission_id"),
+                s.admissions.c.session_id,
+                s.approval_waits.c.generation,
             )
+            .join(
+                s.approval_waits,
+                (s.approval_waits.c.admission_id == s.admissions.c.id)
+                & (s.approval_waits.c.generation == s.admissions.c.generation),
+            )
+            .where(
+                s.admissions.c.status == "waiting_approval",
+                func.json_array_length(s.approval_waits.c.interaction_ids) > 0,
+                func.json_array_length(s.approval_waits.c.interaction_ids) == decided_count,
+            )
+        )
+        if session_id is not None:
+            query = query.where(s.admissions.c.session_id == session_id)
+        async with self.store.engine.connect() as conn:
+            rows = await conn.execute(query)
             return [dict(row) for row in rows.mappings()]
 
     async def decide(
@@ -298,8 +301,13 @@ class ReceiptLedger:
                             s.interactions.c.decision,
                             s.admissions.c.generation,
                             s.admissions.c.status,
+                            s.approval_decisions.c.generation.label("decided_generation"),
                         )
                         .join(s.admissions, s.admissions.c.id == s.interactions.c.admission_id)
+                        .outerjoin(
+                            s.approval_decisions,
+                            s.approval_decisions.c.interaction_id == s.interactions.c.id,
+                        )
                         .where(
                             s.interactions.c.id == key,
                             s.interactions.c.session_id == session_id,
@@ -309,13 +317,15 @@ class ReceiptLedger:
                 .mappings()
                 .first()
             )
-            if row is None or row["generation"] != generation:
+            if row is not None and row["decided_generation"] == generation:
+                if row["decision"] != decision:
+                    raise DomainError("approval_conflict", "Approval decision cannot be changed")
+                return row["admission_id"]
+            if row is None or row["generation"] != generation or row["decision"] is not None:
                 raise DomainError(
                     "stale_approval",
                     "Approval is missing or belongs to another generation",
                 )
-            if row["decision"] is not None:
-                raise DomainError("already_decided", "Approval has already been answered")
             if row["status"] != "waiting_approval":
                 raise DomainError("not_waiting", "Execution is not waiting")
             current = await conn.scalar(
@@ -332,6 +342,9 @@ class ReceiptLedger:
                     s.interactions.c.id == key,
                 )
                 .values(decision=decision)
+            )
+            await conn.execute(
+                insert(s.approval_decisions).values(interaction_id=key, generation=generation)
             )
             await self.store.append_event(
                 conn,

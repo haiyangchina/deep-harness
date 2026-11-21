@@ -62,9 +62,21 @@ class HttpProvider:
 
     async def _request(self, method: str, url: str, **kwargs):
         try:
-            response = await self.client.request(method, url, **kwargs)
-            response.raise_for_status()
-            return response
+            async with self.client.stream(method, url, **kwargs) as response:
+                response.raise_for_status()
+                content = bytearray()
+                async for chunk in response.aiter_bytes(chunk_size=8192):
+                    if len(content) + len(chunk) > MAX_HTML_BYTES:
+                        raise DomainError(
+                            "web_response_large", f"{self.name} response exceeded limit"
+                        )
+                    content.extend(chunk)
+                return httpx.Response(
+                    response.status_code,
+                    headers={"content-type": response.headers.get("content-type", "")},
+                    content=bytes(content),
+                    request=response.request,
+                )
         except httpx.TimeoutException as exc:
             raise DomainError("web_timeout", f"{self.name} request timed out") from exc
         except httpx.HTTPError as exc:
@@ -340,6 +352,8 @@ class DdgsProvider:
     name = "ddgs"
 
     def __init__(self):
+        self._worker: asyncio.Task | None = None
+        self._slot = asyncio.Lock()
         try:
             from ddgs import DDGS
 
@@ -354,7 +368,7 @@ class DdgsProvider:
             return []
 
         def run():
-            engine = self._engine()
+            engine = self._engine(timeout=10)
             try:
                 return list(engine.text(query, max_results=limit))
             finally:
@@ -363,9 +377,19 @@ class DdgsProvider:
                     close()
 
         try:
-            rows = await asyncio.wait_for(asyncio.to_thread(run), timeout=15)
+            async with self._slot:
+                if self._worker is not None and not self._worker.done():
+                    raise DomainError("web_backend", "ddgs worker is still busy")
+                self._worker = asyncio.create_task(asyncio.to_thread(run))
+                self._worker.add_done_callback(
+                    lambda task: None if task.cancelled() else task.exception()
+                )
+                worker = self._worker
+            rows = await asyncio.wait_for(asyncio.shield(worker), timeout=15)
         except TimeoutError as exc:
             raise DomainError("web_timeout", "ddgs search timed out") from exc
+        except DomainError:
+            raise
         except Exception as exc:
             raise DomainError("web_backend", "ddgs search failed") from exc
         return [

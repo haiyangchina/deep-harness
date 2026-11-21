@@ -237,64 +237,77 @@ class McpRegistry:
         requested = available if server_names is None else set(server_names)
         if not requested <= available:
             raise DomainError("mcp_not_found", "MCP server is not configured for this profile")
-        for name in sorted(requested):
-            async with asyncio.timeout(90):
+        async with asyncio.timeout(90):
+            for name in sorted(requested):
                 async with self.client(name) as client:
-                    cursor = None
-                    while True:
-                        page = await client.list_tools(cursor=cursor, cache_mode="refresh")
-                        for tool in page.tools:
-                            if not TOOL_NAME.fullmatch(tool.name):
-                                raise DomainError("mcp_schema", "MCP tool name is unsupported")
-                            safe = re.sub(r"[^A-Za-z0-9_]", "_", tool.name)
-                            public = f"mcp__{name}__{safe}"
-                            if public in catalog:
-                                raise DomainError("mcp_schema", "MCP tool names collide")
-                            schema = tool.input_schema
-                            if (
-                                not isinstance(schema, dict)
-                                or schema.get("type") != "object"
-                                or len(json.dumps(schema, ensure_ascii=False)) > 32_000
-                            ):
-                                raise DomainError("mcp_schema", "MCP tool schema is unsupported")
-                            try:
-                                Draft202012Validator.check_schema(schema)
-                            except SchemaError as exc:
-                                raise DomainError(
-                                    "mcp_schema", "MCP tool schema is invalid"
-                                ) from exc
-                            description = tool.description or f"MCP {name}/{tool.name}"
-                            catalog[public] = {
-                                "name": public,
-                                "description": description[:4096],
-                                "parameters": schema,
-                                "server": name,
-                                "remote_name": tool.name,
-                                "schema_hash": fingerprint(schema),
-                                "config_hash": (
-                                    fingerprint(self.servers[name].model_dump(mode="json"))
-                                    if name in self.servers
-                                    else "inprocess"
-                                ),
-                            }
-                            if len(catalog) > 256:
-                                raise DomainError("mcp_schema", "MCP catalog exceeds 256 tools")
-                        cursor = page.next_cursor
-                        if not cursor:
-                            break
-        self.catalog_cache = catalog
+                    catalog.update(await self._list_catalog(name, client))
+                if len(catalog) > 256:
+                    raise DomainError("mcp_schema", "MCP catalog exceeds 256 tools")
+        self.catalog_cache.update(catalog)
         return catalog
 
-    async def call(self, public_name, arguments, expected_schema_hash):
+    async def _list_catalog(self, name, client):
+        catalog = {}
+        seen_cursors = set()
+        cursor = None
+        while True:
+            page = await client.list_tools(cursor=cursor, cache_mode="refresh")
+            for tool in page.tools:
+                if not TOOL_NAME.fullmatch(tool.name):
+                    raise DomainError("mcp_schema", "MCP tool name is unsupported")
+                safe = re.sub(r"[^A-Za-z0-9_]", "_", tool.name)
+                public = f"mcp__{name}__{safe}"
+                if public in catalog:
+                    raise DomainError("mcp_schema", "MCP tool names collide")
+                schema = tool.input_schema
+                if (
+                    not isinstance(schema, dict)
+                    or schema.get("type") != "object"
+                    or len(json.dumps(schema, ensure_ascii=False)) > 32_000
+                ):
+                    raise DomainError("mcp_schema", "MCP tool schema is unsupported")
+                try:
+                    Draft202012Validator.check_schema(schema)
+                except SchemaError as exc:
+                    raise DomainError("mcp_schema", "MCP tool schema is invalid") from exc
+                description = tool.description or f"MCP {name}/{tool.name}"
+                catalog[public] = {
+                    "name": public,
+                    "description": description[:4096],
+                    "parameters": schema,
+                    "server": name,
+                    "remote_name": tool.name,
+                    "schema_hash": fingerprint(schema),
+                    "config_hash": (
+                        fingerprint(self.servers[name].model_dump(mode="json"))
+                        if name in self.servers
+                        else "inprocess"
+                    ),
+                }
+                if len(catalog) > 256:
+                    raise DomainError("mcp_schema", "MCP catalog exceeds 256 tools")
+            cursor = page.next_cursor
+            if not cursor:
+                break
+            if cursor in seen_cursors:
+                raise DomainError("mcp_schema", "MCP tool pagination repeated a cursor")
+            seen_cursors.add(cursor)
+        return catalog
+
+    async def call(self, public_name, arguments, expected_schema_hash, *, before_dispatch=None):
         parts = public_name.split("__", 2)
         if len(parts) != 3 or parts[0] != "mcp":
             raise DomainError("mcp_not_found", "MCP tool name is invalid")
-        catalog = await self.discover({parts[1]})
-        spec = catalog.get(public_name)
-        if spec is None or spec["schema_hash"] != expected_schema_hash:
-            raise DomainError("mcp_schema_changed", "MCP tool schema changed during this session")
         async with asyncio.timeout(90):
-            async with self.client(spec["server"]) as client:
+            async with self.client(parts[1]) as client:
+                catalog = await self._list_catalog(parts[1], client)
+                spec = catalog.get(public_name)
+                if spec is None or spec["schema_hash"] != expected_schema_hash:
+                    raise DomainError(
+                        "mcp_schema_changed", "MCP tool schema changed during this session"
+                    )
+                if before_dispatch is not None:
+                    await before_dispatch()
                 result = await client.call_tool(
                     spec["remote_name"], arguments, read_timeout_seconds=60
                 )

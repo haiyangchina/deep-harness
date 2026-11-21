@@ -322,6 +322,16 @@ def create_api(host, token: str) -> FastAPI:
         return {"events": await service.store.event_history(session_id, after, tail=tail)}
 
     @app.get(
+        "/profiles/{profile_id}/sessions/{session_id}/submission",
+        dependencies=[Depends(authenticate)],
+    )
+    async def submission(profile_id: str, session_id: str, submission_id: str):
+        service = await host.application(profile_id)
+        await service.store.get_session(session_id, "operator")
+        admission = await service.store.find_submission(session_id, submission_id)
+        return asdict(admission) if admission is not None else None
+
+    @app.get(
         "/profiles/{profile_id}/sessions/{session_id}/admissions/{admission_id}",
         dependencies=[Depends(authenticate)],
     )

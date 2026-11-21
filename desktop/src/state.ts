@@ -25,6 +25,7 @@ export interface Conversation {
 }
 export const $runtime = atom<RuntimeInfo | null>(null)
 export const $sessions = atom<Session[]>([])
+export const $sessionCursor = atom<string | null>(null)
 export const $conversation = atom<Conversation | null>(null)
 export const $error = atom('')
 export const $busy = atom(false)
@@ -38,6 +39,7 @@ export function resetView() {
   selection++
   $conversation.set(null)
   $sessions.set([])
+  $sessionCursor.set(null)
 }
 
 export function api<T>(path: string, method: ApiRequest['method'] = 'GET', body?: unknown): Promise<T> {
@@ -51,17 +53,30 @@ export function storageKey(kind: string, session = '') {
   return JSON.stringify(['deep-harness', settings?.stateDir, settings?.workspace, settings?.profile, kind, session])
 }
 
+async function sessionPage(cursor: string) {
+  return api<{ sessions: Session[]; next_cursor: string | null }>(
+    `/sessions?limit=100&after=${encodeURIComponent(cursor)}`
+  )
+}
+
 export async function loadSessions() {
-  const sessions: Session[] = []
-  let cursor: string | null = ''
-  do {
-    const page: { sessions: Session[]; next_cursor: string | null } = await api(
-      `/sessions?limit=100&after=${encodeURIComponent(cursor)}`
-    )
-    sessions.push(...page.sessions)
-    cursor = page.next_cursor
-  } while (cursor)
-  $sessions.set(sessions)
+  const runtime = $runtime.get()
+  const page = await sessionPage('')
+  if ($runtime.get() !== runtime) return
+  $sessions.set(page.sessions)
+  $sessionCursor.set(page.next_cursor)
+}
+
+export async function loadMoreSessions() {
+  const cursor = $sessionCursor.get()
+  if (!cursor) return
+  const runtime = $runtime.get()
+  const page = await sessionPage(cursor)
+  if ($runtime.get() !== runtime || $sessionCursor.get() !== cursor) return
+  const sessions = new Map($sessions.get().map(session => [session.id, session]))
+  for (const session of page.sessions) sessions.set(session.id, session)
+  $sessions.set([...sessions.values()])
+  $sessionCursor.set(page.next_cursor)
 }
 
 function mergeMessages(current: Conversation, page: MessagePage) {
@@ -117,46 +132,61 @@ export async function refreshConversation() {
   const first = current.messageCursor === null
   const query = first ? '' : `?after=${current.messageCursor}`
   const eventQuery = current.eventCursor === null ? 'tail=true' : `after=${current.eventCursor}`
-  const [status, page, events] = await Promise.allSettled([
-    api<SessionStatus>(`${route}/status?include_runtime=false`),
-    api<MessagePage>(`${route}/messages/live${query}`),
-    api<{ events: JournalEvent[] }>(`${route}/events?${eventQuery}`)
+  let backlog = false
+  function latest() {
+    return selection === generation && version === refreshVersion ? $conversation.get() : null
+  }
+  function refreshFailed(error: unknown) {
+    if (latest()) report(error)
+  }
+  await Promise.all([
+    api<SessionStatus>(`${route}/status?include_runtime=false`).then(status => {
+      const view = latest()
+      if (view) $conversation.set({ ...view, status: { ...status, runtime: view.status?.runtime } })
+    }).catch(refreshFailed),
+    api<MessagePage>(`${route}/messages/live${query}`).then(page => {
+      const view = latest()
+      if (!view) return
+      backlog ||= !first && page.has_more
+      if (page.items.length || first) {
+        $conversation.set({
+          ...view,
+          ...mergeMessages(view, page),
+          messageCursor: Math.max(view.messageCursor ?? 0, ...page.items.map(row => row.seq)),
+          hasOlderMessages: first ? page.has_more : view.hasOlderMessages
+        })
+      }
+    }).catch(refreshFailed),
+    api<{ events: JournalEvent[] }>(`${route}/events?${eventQuery}`).then(({ events }) => {
+      const view = latest()
+      if (!view) return
+      const newEvents = events.filter(event => event.seq > (view.eventCursor ?? 0))
+      backlog ||= newEvents.length >= 500
+      if (newEvents.length || view.eventCursor === null) {
+        $conversation.set({
+          ...view,
+          events: [...view.events, ...newEvents].slice(-2000),
+          eventCursor: newEvents.at(-1)?.seq ?? view.eventCursor ?? 0
+        })
+      }
+      if ((inspector === 'usage' && newEvents.some(e => e.type === 'message.committed')) ||
+          (inspector === 'delegations' && newEvents.some(e => e.type.startsWith('delegation.')))) {
+        void refreshInspector(inspector).catch(refreshFailed)
+      }
+    }).catch(refreshFailed)
   ])
-  const latest = $conversation.get()
-  if (selection !== generation || version !== refreshVersion || !latest) return
-  const next = { ...latest }
-  if (status.status === 'fulfilled') {
-    next.status = { ...status.value, runtime: latest.status?.runtime }
-  }
-  if (page.status === 'fulfilled') {
-    if (page.value.items.length) Object.assign(next, mergeMessages(latest, page.value))
-    next.messageCursor = Math.max(current.messageCursor ?? 0, ...page.value.items.map(row => row.seq))
-    if (first) next.hasOlderMessages = page.value.has_more
-  }
-  let newEvents: JournalEvent[] = []
-  if (events.status === 'fulfilled') {
-    newEvents = events.value.events.filter(event => event.seq > (latest.eventCursor ?? 0))
-    next.events = [...latest.events, ...newEvents].slice(-2000)
-    next.eventCursor = newEvents.at(-1)?.seq ?? latest.eventCursor ?? 0
-  }
-  $conversation.set(next)
-  if ((inspector === 'usage' && newEvents.some(e => e.type === 'message.committed')) ||
-      (inspector === 'delegations' && newEvents.some(e => e.type.startsWith('delegation.')))) {
-    void refreshInspector(inspector).catch(report)
-  }
-  for (const result of [status, page, events]) {
-    if (result.status === 'rejected') report(result.reason)
-  }
+  return backlog
 }
 
 async function poll(generation: number) {
   if (generation !== selection) return
-  try {
-    await refreshConversation()
-  } catch (error) {
-    report(error)
-  }
-  if (generation === selection) timer = setTimeout(() => void poll(generation), 1200)
+  const backlog = await refreshConversation()
+  if (generation !== selection) return
+  const active = $conversation.get()?.status?.active_admissions.some(
+    row => ['queued', 'started', 'waiting_approval'].includes(row.status)
+  )
+  const delay = backlog ? 100 : document.hidden ? 8000 : active ? 1200 : 4000
+  timer = setTimeout(() => void poll(generation), delay)
 }
 
 export async function openSession(id: string) {

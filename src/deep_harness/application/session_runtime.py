@@ -28,7 +28,7 @@ class SessionRuntime:
         harness="general",
         knowledge=None,
         mcp_catalog=None,
-        version=2,
+        version=3,
     ):
         identity = dict(self.model.identity)
         if version == 1 and identity.get("provider") == "ollama":
@@ -41,6 +41,8 @@ class SessionRuntime:
             "tools": tool_definitions(tools, mcp_catalog),
             "execution": self.limits.model_dump(),
         }
+        if version >= 3:
+            result["context_projection"] = "deep-turns-v1" if engine == "deep" else "standard-v1"
         if version >= 2:
             result["model_request_timeout"] = self.model.request_timeout
             if self.web_settings is not None and set(tools).intersection(WEB_TOOLS):
@@ -90,7 +92,7 @@ class SessionRuntime:
                 harness=session.harness,
                 knowledge=knowledge,
                 mcp_catalog=catalog,
-                version=binding["snapshot"].get("version", 1) if binding else 2,
+                version=binding["snapshot"].get("version", 1) if binding else 3,
             ),
         )
 
@@ -105,7 +107,7 @@ class SessionRuntime:
             harness=status["session"].harness,
             knowledge=knowledge,
             mcp_catalog=catalog,
-            version=binding["snapshot"].get("version", 1) if binding else 2,
+            version=binding["snapshot"].get("version", 1) if binding else 3,
         )
         saved = binding["snapshot"] if binding else {}
         status["runtime"] = {

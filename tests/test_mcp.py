@@ -226,3 +226,56 @@ async def test_configured_http_transport_calls_external_server(tmp_path):
         await host.close()
         process.terminate()
         await process.wait()
+
+
+@pytest.mark.parametrize("failure_stage", ["prepare", "dispatch"])
+async def test_mcp_effect_tracks_actual_dispatch_boundary(tmp_path, monkeypatch, failure_stage):
+    from deep_harness.application.tools import ToolGateway
+    from deep_harness.domain.models import ToolCall
+
+    server = MCPServer("echo")
+
+    calls = []
+
+    @server.tool()
+    async def echo(text: str) -> str:
+        calls.append(text)
+        raise RuntimeError("injected remote failure")
+
+    host = ProjectHost(tmp_path / "state", tmp_path, mcp_objects={"one": {"echo": server}})
+    try:
+        app = await host.application("one")
+        tool = "mcp__echo__echo"
+        session = await app.create_session(
+            "create", "Prompt", (tool,), permission_mode="full", full_access_acknowledged=True
+        )
+        admission = await app.store.admit(
+            session, principal="operator", submission_id="one", text="hello"
+        )
+        claim = await app.executions.claim(session.id, app.owner)
+        bindings = (await app.sessions.policies.get(session.id))["snapshot"]["mcp_bindings"]
+        gateway = ToolGateway(
+            app.scope, session, app.receipts, claim, mcp=app.mcp, mcp_bindings=bindings
+        )
+
+        async def empty_catalog(name, client):
+            return {}
+
+        if failure_stage == "prepare":
+            monkeypatch.setattr(app.mcp, "_list_catalog", empty_catalog)
+        with pytest.raises(DomainError) as refused:
+            await gateway.execute(ToolCall("lookup", tool, {"text": "hello"}))
+        state = await app.store.session_status(session.id, "operator")
+        effects = [effect["status"] for effect in state["active_effects"]]
+        if failure_stage == "prepare":
+            assert refused.value.code == "mcp_schema_changed"
+            assert not calls and effects == ["prepared"]
+        else:
+            assert refused.value.code == "unknown_effect"
+            assert calls == ["hello"] and effects == ["dispatched"]
+            with pytest.raises(DomainError, match="reconciled"):
+                await gateway.execute(ToolCall("lookup", tool, {"text": "hello"}))
+            assert calls == ["hello"]
+        assert (await app.store.find_submission(session.id, "one")).id == admission.id
+    finally:
+        await host.close()

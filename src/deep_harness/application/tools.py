@@ -242,10 +242,30 @@ class ToolGateway:
         existing = await self.receipts.prepare_effect(self.claim, key, digest)
         if existing and existing["status"] == "succeeded":
             return existing["result"]
-        await self.receipts.dispatch_effect(self.claim, key, approval=approval, audit=audit)
+        dispatched = False
+
+        async def dispatch():
+            nonlocal dispatched
+            await self.receipts.dispatch_effect(self.claim, key, approval=approval, audit=audit)
+            dispatched = True
+
+        if call.name not in self.mcp_bindings:
+            await dispatch()
         try:
-            result = await self._invoke(call.name, arguments, key)
+            if call.name in self.mcp_bindings:
+                result = await self.mcp.call(
+                    call.name,
+                    arguments,
+                    self.mcp_bindings[call.name]["schema_hash"],
+                    before_dispatch=dispatch,
+                )
+            else:
+                result = await self._invoke(call.name, arguments, key)
         except (OSError, UnicodeError, DomainError, TimeoutError) as exc:
+            if not dispatched:
+                if isinstance(exc, DomainError):
+                    raise
+                raise DomainError("mcp_unavailable", "MCP tool preparation failed") from exc
             refused = isinstance(exc, DomainError) and exc.code in {
                 "file_conflict",
                 "edit_match",
@@ -276,6 +296,12 @@ class ToolGateway:
                 ) from exc
             code = exc.code if isinstance(exc, DomainError) else type(exc).__name__
             result = f"Tool error [{code}]: {exc}"
+        except Exception as exc:
+            if call.name not in self.mcp_bindings:
+                raise
+            if not dispatched:
+                raise DomainError("mcp_unavailable", "MCP tool preparation failed") from exc
+            raise DomainError("unknown_effect", "MCP tool outcome must be reconciled") from exc
         await self.receipts.save_effect(self.claim, key, result)
         return result
 
@@ -303,8 +329,6 @@ class ToolGateway:
             await asyncio.to_thread(self.path, arguments.path)
 
     async def _invoke(self, name, arguments, key):
-        if name in self.mcp_bindings:
-            return await self.mcp.call(name, arguments, self.mcp_bindings[name]["schema_hash"])
         if name in WEB_TOOL_NAMES:
             return await execute_web_tool(name, arguments, self.web_client)
         commands = {"bash": bash, "run_command": run_command}
