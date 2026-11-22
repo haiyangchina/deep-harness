@@ -32,6 +32,8 @@ def report() -> dict:
                 FilesystemMiddleware,
             ).parameters,
         },
-        "production_engine": "standard",
-        "deep_status": "read-only integration probe; not a session execution engine yet",
+        "execution_model": "single deepagents kernel; harness tier derives the frozen contract",
+        "deep_status": (
+            "unified execution kernel; harness tiers general/coding/research/research_web"
+        ),
     }

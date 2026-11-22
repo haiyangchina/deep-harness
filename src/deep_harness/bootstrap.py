@@ -37,7 +37,7 @@ from deep_harness.infrastructure.store import BusinessStore
 from deep_harness.infrastructure.web import WebClient
 from deep_harness.infrastructure.web.settings import WebSettings
 from deep_harness.runtime.approval_checkpoint import approval_ids, checkpoint_interrupts
-from deep_harness.runtime.deep import DeepRuntime
+from deep_harness.runtime.deep import HarnessRuntime
 from deep_harness.runtime.mcp import McpRegistry
 from deep_harness.runtime.models import DiagnosticModel
 from deep_harness.runtime.standard import StandardRuntime
@@ -193,7 +193,7 @@ class ProfileApplication:
         if engine != "deep" and harness != "general":
             raise DomainError("unknown_harness", "Specialized harness requires Deep engine")
         if tools is None:
-            tools = derive_grants(engine, harness, extensions, mcp_tools)
+            tools = derive_grants(harness, extensions, mcp_tools)
         if engine != "deep" and set(tools) & {"delegate_task", "check_delegation"}:
             raise DomainError("tool_denied", "Delegation is available only in Deep sessions")
         if harness in READ_ONLY_HARNESSES and set(tools) & MUTATING_TOOLS:
@@ -365,7 +365,12 @@ class ProfileApplication:
         job_id=None,
         snapshot_version=4,
     ):
-        runtime_type = DeepRuntime if session.engine == "deep" else StandardRuntime
+        # A single user-facing mode: users never choose an engine. The runtime is
+        # selected from the frozen session contract (derived automatically from
+        # the harness at creation time). Specialised harnesses use the unified
+        # deepagents kernel; the general tier keeps the compatible LangGraph loop.
+        # ``engine`` is a frozen compatibility field, not a user-facing toggle.
+        runtime_type = HarnessRuntime if session.engine == "deep" else StandardRuntime
         kwargs = dict(
             session=session,
             claim=claim,
@@ -381,7 +386,7 @@ class ProfileApplication:
             web_client=self.web,
             snapshot_version=snapshot_version,
         )
-        if runtime_type is DeepRuntime and stage_limits is None:
+        if runtime_type is HarnessRuntime and stage_limits is None:
             kwargs["background_launcher"] = self.launch_background
         if stage_limits is not None:
             kwargs["model_lock"] = self.jobs.model_lock

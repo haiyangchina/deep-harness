@@ -7,12 +7,6 @@ from dataclasses import replace
 from deepagents import create_deep_agent
 from deepagents.backends import StateBackend
 from deepagents.middleware import FilesystemMiddleware
-from deepagents.profiles import (
-    GeneralPurposeSubagentProfile,
-    HarnessProfile,
-    register_harness_profile,
-)
-from langchain.agents.middleware import AgentMiddleware, ModelResponse
 from langchain.tools import ToolRuntime
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import StructuredTool
@@ -28,139 +22,30 @@ from deep_harness.domain.models import DomainError, ToolCall
 from deep_harness.infrastructure import schema as s
 from deep_harness.infrastructure.branches import BranchLedger
 from deep_harness.infrastructure.delegations import DelegationLedger
+from deep_harness.runtime.agent import (
+    filesystem_middleware,
+    register_profile,
+    specialist_guide,
+    system_prompt_for,
+)
 from deep_harness.runtime.approval_checkpoint import (
     approval_ids,
     interrupt_outcome,
     pause_at_boundary,
     resume_command,
 )
-from deep_harness.runtime.context import summarize
-from deep_harness.runtime.harnesses import HarnessReport, harness_prompt, parse_report
+from deep_harness.runtime.guard import HarnessGuardMiddleware
+from deep_harness.runtime.harnesses import HarnessReport, parse_report
 from deep_harness.runtime.inference import normalized_usage, usage_totals
-from deep_harness.runtime.models import LangChainModel, model_errors, to_langchain
+from deep_harness.runtime.models import LangChainModel, to_langchain
 from deep_harness.server_config import number
 
-
-class ReceiptedModel(AgentMiddleware):
-    def __init__(self, runtime):
-        self.runtime = runtime
-
-    async def awrap_model_call(self, request, handler):
-        async with self.runtime.model_lock:
-            await pause_at_boundary(
-                self.runtime.pause_probe, self.runtime.claim.admission.generation
-            )
-            return await self._call(request, handler)
-
-    async def _call(self, request, handler):
-        owner = self.runtime
-        prompt = request.system_message.model_dump(mode="json") if request.system_message else None
-        request, messages = self._project(request, prompt)
-        digest = fingerprint({"prompt": prompt, "messages": messages, "tools": owner.tool_specs})
-        key = f"{owner.claim.admission.id}:deep:model:{digest[:32]}"
-        saved = await owner.receipts.model_result(key, digest)
-        if saved is not None:
-            return ModelResponse(result=[owner.message_from_receipt(saved)])
-        totals = await usage_totals(owner.store, owner.session.id, owner.claim.admission.id)
-        if totals["model_calls"] >= owner.limits.max_model_calls:
-            raise DomainError("budget_exhausted", "Model call limit reached")
-        if totals["total_tokens"] >= owner.limits.max_run_tokens:
-            raise DomainError("budget_exhausted", "Per-run token budget exhausted")
-        async with owner.store.transaction() as conn:
-            await owner.executions.assert_claim(conn, owner.claim)
-            await owner.store.append_event(conn, owner.session.id, "model.started", {"id": key})
-        with model_errors():
-            async with asyncio.timeout(owner.request_timeout):
-                response = await handler(request)
-        if len(response.result) != 1 or not isinstance(response.result[0], AIMessage):
-            raise DomainError("model_response", "Deep model returned an unsupported response")
-        answer = response.result[0]
-        canonical = {
-            "id": key,
-            "role": "assistant",
-            "content": answer.content,
-            "tool_calls": answer.tool_calls,
-            "provider_extensions": answer.additional_kwargs,
-            "response_metadata": answer.response_metadata,
-            "usage": normalized_usage(
-                {"content": answer.content, "usage": answer.usage_metadata},
-                owner.session.prompt,
-                messages,
-            ),
-        }
-        await owner.receipts.save_model(
-            owner.claim,
-            key,
-            digest,
-            canonical,
-            append_to_history=owner.record_messages,
-        )
-        if (await usage_totals(owner.store, owner.session.id, owner.claim.admission.id))[
-            "total_tokens"
-        ] > owner.limits.max_run_tokens:
-            raise DomainError("budget_exhausted", "Per-run token budget exceeded by model output")
-        answer.id = key
-        return response
-
-    def _project(self, request, prompt):
-        owner = self.runtime
-        budget = getattr(owner.model, "context_budget_bytes", None)
-        original = request.messages
-        messages = [message.model_dump(mode="json") for message in original]
-        fixed = json.dumps(
-            {"prompt": prompt, "tools": request.tools}, ensure_ascii=False, default=str
-        )
-
-        char_limit = owner.limits.max_context_characters - len(fixed)
-        byte_limit = budget - len(fixed.encode()) if budget is not None else None
-
-        def fits(chars, size):
-            return chars <= char_limit and (byte_limit is None or size <= byte_limit)
-
-        rendered = [json.dumps(row, ensure_ascii=False, default=str) for row in messages]
-        chars = size = 2  # JSON array brackets
-        first_turn = None
-        for index in range(len(original) - 1, -1, -1):
-            separator = 2 if index + 1 < len(original) else 0
-            chars += len(rendered[index]) + separator
-            size += len(rendered[index].encode()) + separator
-            if not fits(chars, size):
-                break
-            if index == 0:
-                return request, messages
-            previous = original[index - 1]
-            if (
-                isinstance(original[index], HumanMessage)
-                and isinstance(previous, AIMessage)
-                and not previous.tool_calls
-            ):
-                first_turn = index
-        if first_turn is not None:
-            retained = original[first_turn:]
-            retained_payload = messages[first_turn:]
-            user_history = [
-                {"role": "user", "content": message.content}
-                for message in original[:first_turn]
-                if isinstance(message, HumanMessage)
-            ]
-            summary = summarize("", user_history, owner.limits.summary_characters)
-            if summary:
-                note = HumanMessage(
-                    id=f"deep-context:{fingerprint(summary)}",
-                    content=f"Archived user inputs (historical context):\n{summary}",
-                )
-                projected = [note.model_dump(mode="json"), *retained_payload]
-                history = json.dumps(projected, ensure_ascii=False, default=str)
-                if fits(len(history), len(history.encode())):
-                    return request.override(messages=[note, *retained]), projected
-            return request.override(messages=retained), retained_payload
-        raise DomainError(
-            "context_budget_exhausted",
-            "Deep current turn, tool outputs or schemas exceed the configured context budget",
-        )
+# ReceiptedModel is now the guard module's HarnessGuardMiddleware.
+# The alias preserves the historical name used by tests and external imports.
+ReceiptedModel = HarnessGuardMiddleware
 
 
-class DeepRuntime:
+class HarnessRuntime:
     def __init__(
         self,
         *,
@@ -221,27 +106,20 @@ class DeepRuntime:
         provider, model_name = params.get("ls_provider"), params.get("ls_model_name")
         if not provider or not model_name:
             raise DomainError("deep_model", "Model provider identity is required")
-        register_harness_profile(
-            f"{provider}:{model_name}",
-            HarnessProfile(
-                general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
-                excluded_tools=frozenset({"read_file"}),
-                excluded_middleware=frozenset({"SummarizationMiddleware"}),
-            ),
-        )
+        register_profile(provider, model_name)
         backend = StateBackend()
         self.graph = create_deep_agent(
             model=model.model,
             tools=[self._tool(spec) for spec in self.tool_specs],
-            system_prompt=harness_prompt(session.prompt, session.harness),
+            system_prompt=system_prompt_for(session.prompt, session.harness),
             backend=backend,
             middleware=[
-                FilesystemMiddleware(backend=backend, tools=["read_file"]),
-                ReceiptedModel(self),
+                filesystem_middleware(backend),
+                HarnessGuardMiddleware(self),
             ],
             subagents=[],
             checkpointer=saver,
-            name="deep-harness-deep",
+            name="deep-harness-unified",
         )
         self.config = {
             "configurable": {"thread_id": session.id},
@@ -376,17 +254,7 @@ class DeepRuntime:
         if delegation["status"] == "completed":
             return delegation["result"]
         kind = call.arguments["kind"]
-        guide = {
-            "research": (
-                "Research this bounded question using only the granted sources. "
-                "State uncertainty clearly and cite paths or source identifiers."
-            ),
-            "coding": (
-                "Complete this bounded coding task using only granted tools. "
-                "Inspect before editing, request approval for changes and commands, "
-                "and report actual changes and test results."
-            ),
-        }[kind]
+        guide = specialist_guide(kind)
         allowed = (
             CODING_TOOLS
             if kind == "coding"
@@ -399,7 +267,7 @@ class DeepRuntime:
             tools=child_tools,
             harness="general",
         )
-        child = DeepRuntime(
+        child = HarnessRuntime(
             session=child_session,
             claim=self.claim,
             scope=self.scope,
@@ -646,3 +514,9 @@ def build_readonly_probe(model, checkpointer):
         checkpointer=checkpointer,
         name="deep-harness-deep-readonly-probe",
     )
+
+
+# Compatibility aliases: the unified kernel supersedes the old Deep engine, and
+# the public "build_agent" entry point lives in runtime/agent.py. External
+# imports of DeepRuntime keep working but now resolve to the single kernel.
+DeepRuntime = HarnessRuntime

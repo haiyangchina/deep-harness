@@ -132,7 +132,8 @@ function CapabilityCard({ cap }: { cap: CapabilitySpec }) {
 
 interface CreateRequest {
   request_id: string
-  engine: string
+  // Internal frozen-compatibility field; the UI only exposes the harness tier.
+  engine?: string
   harness: string
   tools?: string[]
   extensions?: string[]
@@ -145,7 +146,6 @@ export function CreateSession({ close }: { close: () => void }) {
     const raw = localStorage.getItem(storageKey('create'))
     return raw ? JSON.parse(raw) : null
   })
-  const [engine, setEngine] = useState(saved?.engine ?? 'standard')
   const [harness, setHarness] = useState(saved?.harness ?? 'general')
   const [permissionMode, setPermissionMode] = useState<PermissionMode>(saved ? saved.permission_mode ?? 'legacy' : 'ask')
   const [extensions, setExtensions] = useState<string[]>(saved?.extensions ?? [])
@@ -163,7 +163,6 @@ export function CreateSession({ close }: { close: () => void }) {
   ] as const
   const visibleExtensions = extensionOptions.filter(
     ([tool]) =>
-      !(engine === 'standard' && tool === 'delegate_task') &&
       !((harness === 'research' || harness === 'research_web') && (tool === 'save_memory' || tool === 'apply_patch'))
   )
   return (
@@ -177,35 +176,19 @@ export function CreateSession({ close }: { close: () => void }) {
           </p>
         )}
         <label className="field">
-          执行引擎
+          任务类型
           <select
             disabled={busy || Boolean(saved)}
-            value={engine}
-            onChange={e => {
-              setEngine(e.target.value)
-              setHarness('general')
-            }}
+            value={harness}
+            onChange={e => setHarness(e.target.value)}
           >
-            <option value="standard">Standard · 标准 Agent</option>
-            <option value="deep">Deep · 深度任务</option>
+            <option value="general">通用</option>
+            <option value="coding">编程</option>
+            <option value="research">研究（只读）</option>
+            <option value="research_web">联网深度研究</option>
           </select>
         </label>
-        {engine === 'deep' && (
-          <label className="field">
-            任务模式
-            <select
-              disabled={busy || Boolean(saved)}
-              value={harness}
-              onChange={e => setHarness(e.target.value)}
-            >
-              <option value="general">通用</option>
-              <option value="coding">编程</option>
-              <option value="research">研究（只读）</option>
-              <option value="research_web">联网深度研究</option>
-            </select>
-          </label>
-        )}
-        <p className="muted small">选择 Agent 如何申请批准。批准模式可在空闲时切换，内置能力默认启用。</p>
+        <p className="muted small">单一执行内核由任务类型自动派生，无需选择引擎。选择 Agent 如何申请批准，批准模式可在空闲时切换，内置能力默认启用。</p>
         <PermissionPicker value={permissionMode} direction="down" disabled={busy || Boolean(saved)} onChange={setPermissionMode} />
         <p className="muted small">内置能力默认授予，无需勾选；除完全访问外，文件操作、终端命令与访问互联网逐次确认。</p>
         {manifest
@@ -245,7 +228,6 @@ export function CreateSession({ close }: { close: () => void }) {
               void perform(async () => {
                 const request = saved ?? {
                   request_id: requestId,
-                  engine,
                   harness,
                   permission_mode: permissionMode,
                   extensions: extensions.filter(tool =>

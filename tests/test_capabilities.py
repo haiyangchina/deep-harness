@@ -83,46 +83,44 @@ def test_workspace_constants_are_derived():
 
 
 @pytest.mark.parametrize(
-    "engine,harness,expected",
+    "harness,expected",
     [
-        ("standard", "general", CORE_TOOLS),
-        ("deep", "coding", CORE_TOOLS),
-        ("deep", "research", READ_ONLY_CORE),
-        ("deep", "research_web", READ_ONLY_CORE),
+        ("general", CORE_TOOLS),
+        ("coding", CORE_TOOLS),
+        ("research", READ_ONLY_CORE),
+        ("research_web", READ_ONLY_CORE),
     ],
 )
-def test_derive_grants_for_each_harness(engine, harness, expected):
-    assert derive_grants(engine, harness) == tuple(sorted(expected))
+def test_derive_grants_for_each_harness(harness, expected):
+    assert derive_grants(harness) == tuple(sorted(expected))
 
 
 @pytest.mark.parametrize("harness", sorted(READ_ONLY_HARNESSES))
 def test_read_only_harnesses_never_grant_mutating_tools(harness):
-    granted = set(derive_grants("deep", harness))
+    granted = set(derive_grants(harness))
     assert granted == set(READ_ONLY_CORE)
     assert not granted & MUTATING_TOOLS
     assert set(WEB_TOOLS) <= granted
     with pytest.raises(DomainError, match="Research harness cannot receive mutating tools"):
-        derive_grants("deep", harness, ("save_memory",))
+        derive_grants(harness, ("save_memory",))
 
 
 def test_extensions_are_explicit_and_gated():
-    assert derive_grants("deep", "general", ("delegate_task",)) == tuple(
+    assert derive_grants("general", ("delegate_task",)) == tuple(
         sorted({*CORE_TOOLS, "delegate_task", "check_delegation"})
     )
-    assert derive_grants("standard", "general", ("save_memory",)) == tuple(
+    assert derive_grants("general", ("save_memory",)) == tuple(
         sorted({*CORE_TOOLS, "save_memory"})
     )
     assert "mcp__srv__tool" in derive_grants(
-        "standard", "general", mcp_tools=("mcp__srv__tool",)
+        "general", mcp_tools=("mcp__srv__tool",)
     )
-    with pytest.raises(DomainError, match="Delegation is available only in Deep"):
-        derive_grants("standard", "general", ("delegate_task",))
     with pytest.raises(DomainError, match="Unknown extension capability"):
-        derive_grants("standard", "general", ("unknown_tool",))
+        derive_grants("general", ("unknown_tool",))
     with pytest.raises(DomainError, match="Research harness cannot receive mutating tools"):
-        derive_grants("deep", "research", ("save_memory",))
+        derive_grants("research", ("save_memory",))
     with pytest.raises(DomainError, match="mcp__server__tool"):
-        derive_grants("standard", "general", mcp_tools=("mcp__broken",))
+        derive_grants("general", mcp_tools=("mcp__broken",))
 
 
 def test_api_exposes_capabilities_route(tmp_path):

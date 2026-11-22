@@ -28,7 +28,9 @@ class CreateSession(RequestModel):
     request_id: str = Field(min_length=1, max_length=number("api.request_id_max_length"))
     prompt: str = Field(default=PROJECT_PROMPT, max_length=number("api.prompt_max_length"))
     tools: tuple[str, ...] | None = None
-    engine: Literal["standard", "deep"] = "standard"
+    # Frozen compatibility field. User-facing clients omit it; the server derives
+    # the internal execution contract from the harness tier when it is absent.
+    engine: Literal["standard", "deep"] | None = None
     harness: Harness = "general"
     permission_mode: Literal["ask", "auto", "full"] | None = None
     extensions: tuple[str, ...] = ()
@@ -95,7 +97,9 @@ def create_api(host, token: str) -> FastAPI:
 
     @app.get("/health")
     async def health():
-        return {"status": "ok", "stage": "development", "engines": ["standard", "deep"]}
+        # The engine is no longer a user choice; the single harness-driven kernel
+        # is described by the four tiers instead.
+        return {"status": "ok", "stage": "development", "harnesses": list(manifest()["harnesses"])}
 
     @app.get("/profiles/{profile_id}/jobs", dependencies=[Depends(authenticate)])
     async def list_jobs(profile_id: str):
@@ -137,11 +141,15 @@ def create_api(host, token: str) -> FastAPI:
     @app.post("/profiles/{profile_id}/sessions", dependencies=[Depends(authenticate)])
     async def create(profile_id: str, body: CreateSession):
         service = await host.application(profile_id)
+        # engine is a frozen internal contract, derived from the harness tier.
+        # Specialised tiers need the unified deepagents kernel; the general tier
+        # keeps the compatible loop. Explicit values remain accepted for compat.
+        engine = body.engine or ("deep" if body.harness != "general" else "standard")
         session = await service.create_session(
             body.request_id,
             body.prompt,
             body.tools,
-            engine=body.engine,
+            engine=engine,
             harness=body.harness,
             permission_mode=body.permission_mode or "legacy",
             extensions=body.extensions,

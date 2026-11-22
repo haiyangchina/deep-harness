@@ -38,7 +38,6 @@ def parser():
     chat = commands.add_parser("chat")
     chat.add_argument("text")
     chat.add_argument("--session", help="Continue an existing session")
-    chat.add_argument("--engine", choices=["standard", "deep"])
     chat.add_argument("--harness", choices=list(HARNESSES))
     chat.add_argument("--permission-mode", choices=["ask", "auto", "full"])
     chat.add_argument(
@@ -72,7 +71,6 @@ def parser():
     chat.add_argument("--submission-id", help="Stable ID for safe submission retries")
     repl = commands.add_parser("repl")
     repl.add_argument("--session")
-    repl.add_argument("--engine", choices=["standard", "deep"])
     repl.add_argument("--harness", choices=list(HARNESSES))
     repl.add_argument("--permission-mode", choices=["ask", "auto", "full"])
     repl.add_argument(

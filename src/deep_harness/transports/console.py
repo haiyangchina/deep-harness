@@ -32,8 +32,6 @@ async def select_session(app, args):
         ):
             raise DomainError("immutable_grants", "Existing session tool grants cannot be changed")
         session = await app.store.get_session(args.session, "operator")
-        if args.engine and args.engine != session.engine:
-            raise DomainError("immutable_engine", "Existing session engine cannot be changed")
         if args.harness and args.harness != session.harness:
             raise DomainError("immutable_harness", "Existing session harness cannot be changed")
         return session
@@ -59,12 +57,16 @@ async def select_session(app, args):
     if args.allow_delegation:
         tools += ("delegate_task", "check_delegation")
     tools += tuple(args.mcp_tool)
+    harness = args.harness or "general"
+    # The execution kernel is derived from the harness tier, never chosen by the
+    # operator. Specialised tiers require the unified deepagents kernel.
+    engine = "deep" if harness != "general" else "standard"
     return await app.create_session(
         str(uuid4()),
         PROJECT_PROMPT,
         tools,
-        engine=args.engine or "standard",
-        harness=args.harness or "general",
+        engine=engine,
+        harness=harness,
         permission_mode=args.permission_mode or "legacy",
         full_access_acknowledged=args.acknowledge_full_access,
     )

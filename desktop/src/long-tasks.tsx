@@ -49,7 +49,6 @@ export function LongTasks({ openStage }: { openStage: (id: string) => void }) {
   const [goal, setGoal] = useState('')
   const [seconds, setSeconds] = useState<number | null>(null)
   const [defaults, setDefaults] = useState<Defaults | null>(null)
-  const [engine, setEngine] = useState<'standard' | 'deep'>('standard')
   const [parallel, setParallel] = useState(false)
   const [stages, setStages] = useState(() => ['调研', '实现', '验证'].map(newStage))
   const [requestId, setRequestId] = useState(() => crypto.randomUUID())
@@ -95,7 +94,7 @@ export function LongTasks({ openStage }: { openStage: (id: string) => void }) {
       setBusy(true)
       try {
         const created = await api<Details>('/jobs', 'POST', {
-          request_id: requestId, goal, engine, parallelism: parallel ? defaults?.parallelism_max : undefined,
+          request_id: requestId, goal, parallelism: parallel ? defaults?.parallelism_max : undefined,
           budget: seconds === null ? undefined : { wall_seconds: seconds },
           stages: stages.map(({ id: _id, group, ...row }) => ({
             ...row, verification_command: row.verify ? row.verification_command.trim() || null : null,
@@ -139,9 +138,6 @@ export function LongTasks({ openStage }: { openStage: (id: string) => void }) {
           setGoal(event.target.value); setRequestId(crypto.randomUUID())
         }} /></label>
         <div className="actions">
-          <label>执行引擎<select value={engine} onChange={event => {
-            setEngine(event.target.value === 'deep' ? 'deep' : 'standard'); setRequestId(crypto.randomUUID())
-          }}><option value="standard">Standard</option><option value="deep">Deep</option></select></label>
           <label>主动执行总秒数<input type="number" min={stages.length} max={defaults?.wall_seconds_max} value={seconds ?? defaults?.wall_seconds ?? ''}
             onChange={event => { setSeconds(Number(event.target.value)); setRequestId(crypto.randomUUID()) }} /></label>
           <label><input type="checkbox" checked={parallel} disabled={(defaults?.parallelism_max ?? 1) <= 1}

@@ -10,9 +10,11 @@ backend policy, HTTP manifest, CLI and desktop UI all read one description.
 """
 
 from dataclasses import asdict, dataclass
-from typing import Literal, get_args
+from typing import Literal
 
-from deep_harness.domain.models import DomainError, Harness
+from deep_harness.application.harness_spec import HARNESSES, spec_for
+from deep_harness.application.harness_spec import manifest as harness_manifest
+from deep_harness.domain.models import DomainError
 
 
 @dataclass(frozen=True)
@@ -119,10 +121,11 @@ EXTENSION_TOOLS: tuple[str, ...] = (
 )
 CAPABILITY_VERSION = 2
 
-# Harness names come from the domain type; the read-only subset is declared once
-# here so derive_grants(), session creation, CLI and HTTP enforce the same rule.
-HARNESSES: tuple[str, ...] = get_args(Harness)
-READ_ONLY_HARNESSES: frozenset[str] = frozenset({"research", "research_web"})
+# Harness names and tier attributes come from harness_spec, the single source of
+# truth. derive_grants(), session creation, CLI and HTTP all enforce the same rule.
+READ_ONLY_HARNESSES: frozenset[str] = frozenset(
+    spec.key for spec in (spec_for(name) for name in HARNESSES) if spec.read_only
+)
 
 MUTATING_EXTENSIONS = frozenset(
     {"save_memory", "write_file", "run_command", "write", "edit", "bash", "apply_patch"}
@@ -260,14 +263,17 @@ def permission_policy() -> dict:
     }
 
 
-def derive_grants(engine, harness, extensions=(), mcp_tools=()):
+def derive_grants(harness, extensions=(), mcp_tools=()):
     """Derive the frozen tool grant for a new session.
 
-    Research harnesses are a contract, not a user preference: every harness in
-    READ_ONLY_HARNESSES receives only read-only core tools. ``full`` is an
-    approval mode and never grants tools that were not enabled here.
+    Harnesses are a contract, not a user preference: every read-only harness
+    receives only read-only core tools. ``full`` is an approval mode and never
+    grants tools that were not enabled here. All harnesses now run on the single
+    deepagents kernel, so delegation availability is a harness-tier property
+    (declared in HarnessSpec) rather than an engine switch.
     """
-    read_only = harness in READ_ONLY_HARNESSES
+    spec = spec_for(harness)
+    read_only = spec.read_only
     granted = set(READ_ONLY_CORE if read_only else CORE_TOOLS)
     requested = list(extensions) + list(mcp_tools)
     for name in requested:
@@ -277,8 +283,6 @@ def derive_grants(engine, harness, extensions=(), mcp_tools=()):
                 raise DomainError("mcp_not_found", "MCP tool name must be mcp__server__tool")
         elif name not in EXTENSION_TOOLS:
             raise DomainError("tool_denied", f"Unknown extension capability: {name}")
-        if name in {"delegate_task", "check_delegation"} and engine != "deep":
-            raise DomainError("tool_denied", "Delegation is available only in Deep sessions")
         if read_only and name in MUTATING_EXTENSIONS:
             raise DomainError("tool_denied", "Research harness cannot receive mutating tools")
         granted.add(name)
@@ -313,4 +317,6 @@ def manifest():
         "permission_modes": permission_policy()["modes"],
         "permission_policy": permission_policy(),
         "hard_boundaries": list(HARD_BOUNDARIES),
+        "harness_specs": harness_manifest()["specs"],
+        "context_policy": harness_manifest()["context_policy"],
     }

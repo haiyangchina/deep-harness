@@ -158,7 +158,7 @@ function Chat({ newSession }: { newSession: () => void }) {
             <p>{sessionId ? `会话 ${sessionId.slice(0, 10)}` : '开始新的工作'}</p>
           </div>
           <span className="chip">
-            {status?.session.engine ?? 'LOCAL'} · {status?.session.harness ?? 'Ollama'}
+            {status?.session.harness ?? 'Ollama'}
           </span>
         </header>
         <div
@@ -419,7 +419,7 @@ function App() {
               <div>
                 {session.id.slice(0, 12)}
                 <small>
-                  {session.engine} · {session.harness}
+                  {session.harness}
                 </small>
               </div>
             </button>

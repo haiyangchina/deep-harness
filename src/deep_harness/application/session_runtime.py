@@ -1,6 +1,7 @@
 """Session configuration and branching authority, independent of transport entry points."""
 
 from deep_harness.application.capabilities import WEB_TOOLS
+from deep_harness.application.harness_spec import CONTEXT_POLICY
 from deep_harness.application.tools import tool_definitions
 from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import DomainError
@@ -42,7 +43,9 @@ class SessionRuntime:
             "execution": self.limits.model_dump(),
         }
         if version >= 3:
-            result["context_projection"] = "deep-turns-v1" if engine == "deep" else "standard-v1"
+            # One context plane for every harness tier; the former
+            # standard/deep projection split is gone.
+            result["context_projection"] = CONTEXT_POLICY
         if version >= 2:
             result["model_request_timeout"] = self.model.request_timeout
             if self.web_settings is not None and set(tools).intersection(WEB_TOOLS):
