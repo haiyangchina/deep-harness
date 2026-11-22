@@ -3,12 +3,12 @@
 import json
 
 
-async def stream_events(store, session_id, after, disconnected):
+async def stream_events(store, session_id, after, disconnected, *, run_id=None):
     cursor = after
     while not await disconnected():
         # Capture before reading: a concurrent commit cannot be lost between read and wait.
         revision = store.revision
-        events = await store.event_history(session_id, cursor)
+        events = await store.event_history(session_id, cursor, run_id=run_id)
         if events:
             for event in events:
                 cursor = event["seq"]

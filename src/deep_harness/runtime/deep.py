@@ -63,6 +63,7 @@ class HarnessRuntime:
         pause_probe=None,
         tool_lock=None,
         background_launcher=None,
+        executor=None,
     ):
         if not isinstance(model, LangChainModel):
             raise DomainError("deep_model", "Deep engine requires a LangChain chat model")
@@ -94,6 +95,7 @@ class HarnessRuntime:
             mcp=mcp,
             mcp_bindings=mcp_bindings,
             web_client=web_client,
+            executor=executor,
         )
         self.delegations = DelegationLedger(store, executions)
         params = model.model._get_ls_params()
@@ -196,6 +198,7 @@ class HarnessRuntime:
                 if exc.code in {
                     "unknown_effect",
                     "lease_lost",
+                    "sandbox_state_lost",
                     "effect_conflict",
                     "budget_exhausted",
                 }:
@@ -277,6 +280,7 @@ class HarnessRuntime:
             record_messages=False,
             delegation_id=delegation["id"],
             model_lock=self.model_lock,
+            executor=self.gateway.executor,
             tool_lock=self.tool_lock,
         )
         child.config["configurable"]["thread_id"] = (

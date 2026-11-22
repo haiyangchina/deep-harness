@@ -62,6 +62,7 @@ class StandardRuntime:
         web_client=None,
         model_lock=None,
         pause_probe=None,
+        executor=None,
     ):
         self.session = session
         self.claim = claim
@@ -86,6 +87,7 @@ class StandardRuntime:
             mcp=mcp,
             mcp_bindings=mcp_bindings,
             web_client=web_client,
+            executor=executor,
         )
         graph = StateGraph(State)
         graph.add_node("model", self._model)
@@ -210,6 +212,7 @@ class StandardRuntime:
                     "lease_lost",
                     "effect_conflict",
                     "approval_missing",
+                    "sandbox_state_lost",
                 }:
                     raise
                 content = f"Tool refused [{exc.code}]: {exc}"

@@ -1,0 +1,88 @@
+web:
+  host: 127.0.0.1
+  port: 8765
+  trusted_hosts: [127.0.0.1, localhost]
+  public_origin: http://127.0.0.1:8765
+
+limits:
+  active_runs: 4
+  queued_runs: 64
+  max_upload_bytes: 16777216
+
+workspaces:
+  reference:
+    path: reference
+    mode: read_only
+
+models:
+  local-qwen:
+    adapter: ollama
+    label: 本机千问
+    model: qwen3.5:9b
+    base_url: http://127.0.0.1:11434
+    capabilities: [text, streaming, tool_calls]
+    context_window_tokens: 32768
+  deepseek:
+    adapter: deepseek
+    model: deepseek-flash
+    secret_env: DEEPSEEK_API_KEY
+    capabilities: [text, streaming, tool_calls]
+  qwen-cloud:
+    adapter: openai
+    model: qwen-plus
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    secret_env: DASHSCOPE_API_KEY
+    capabilities: [text, streaming, tool_calls]
+
+default_workspace: reference
+default_model: local-qwen
+
+agents:
+  reference-assistant:
+    label: 参考资料助手
+    instructions: 阅读工作目录中的资料后回答。清楚标注来源文件名。
+    tools: [read, list_files, search_files]
+  procurement:
+    label: 采购申请
+    instructions: 从目标提取采购金额。第一个 JSON 编码的产物只包含数字字段 amount。
+    workflow: purchasing
+  ticket:
+    label: 工单登记
+    instructions: 从目标提取工单标题。第一个 JSON 编码的产物只包含文本字段 title。
+    workflow: ticketing
+
+connectors:
+  purchase.submit:
+    description: 发送经过验证的采购申请
+    url: http://127.0.0.1:9393/purchases
+    reconcile_url: http://127.0.0.1:9393/status
+    writes: true
+    schema:
+      type: object
+      required: [amount]
+      properties:
+        amount: { type: number, exclusiveMinimum: 0 }
+      additionalProperties: false
+  ticket.submit:
+    description: 发送经过验证的工单
+    url: http://127.0.0.1:9393/tickets
+    reconcile_url: http://127.0.0.1:9393/status
+    writes: true
+    schema:
+      type: object
+      required: [title]
+      properties:
+        title: { type: string, minLength: 1, maxLength: 100 }
+      additionalProperties: false
+
+workflows:
+  purchasing:
+    steps:
+      - { id: draft, type: agent }
+      - { id: verify, type: verify, verifier: json_schema, input_from: draft }
+      - { id: submit, type: tool, tool: purchase.submit, input_from: verify }
+  ticketing:
+    steps:
+      - { id: draft, type: agent }
+      - { id: verify, type: verify, verifier: json_schema, input_from: draft }
+      - { id: submit, type: tool, tool: ticket.submit, input_from: verify }

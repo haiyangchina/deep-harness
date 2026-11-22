@@ -18,6 +18,7 @@ from deep_harness.server_config import number
 @contextmanager
 def model_errors():
     from ollama import ResponseError
+    from openai import APIConnectionError, APIStatusError
 
     try:
         yield
@@ -40,9 +41,13 @@ def model_errors():
         else:
             message = f"Ollama rejected the model request (HTTP {exc.status_code})."
         raise DomainError("ollama_response_error", message) from exc
-    except (ConnectionError, httpx.ConnectError, httpx.ConnectTimeout) as exc:
+    except (APIConnectionError, ConnectionError, httpx.ConnectError, httpx.ConnectTimeout) as exc:
         raise DomainError(
             "model_connection_failed", "Could not connect to the model endpoint."
+        ) from exc
+    except APIStatusError as exc:
+        raise DomainError(
+            "model_request_failed", f"Model endpoint rejected the request (HTTP {exc.status_code})."
         ) from exc
 
 
@@ -199,9 +204,13 @@ def openai_model(
     api_key: str,
     base_url: str | None = None,
     request_timeout: float = number("model.remote_timeout_seconds"),
+    context_window_tokens: int | None = None,
 ):
     from langchain_openai import ChatOpenAI
 
+    identity = {"provider": "openai", "name": model, "endpoint_hash": fingerprint(base_url)}
+    if context_window_tokens is not None:
+        identity["context_window_tokens"] = context_window_tokens
     return LangChainModel(
         ChatOpenAI(
             model=model,
@@ -211,7 +220,31 @@ def openai_model(
             timeout=request_timeout,
         ),
         request_timeout,
-        identity={"provider": "openai", "name": model, "endpoint_hash": fingerprint(base_url)},
+        identity=identity,
+    )
+
+
+def deepseek_model(
+    *, model, api_key, base_url, request_timeout, context_window_tokens, reasoning=False,
+):
+    from deep_harness.runtime.deepseek import DeepSeekChatModel
+
+    endpoint = base_url or "https://api.deepseek.com"
+    return LangChainModel(
+        DeepSeekChatModel(
+            model=model,
+            api_key=api_key,
+            base_url=endpoint,
+            max_retries=number("model.remote_max_retries"),
+            timeout=request_timeout,
+            extra_body={"thinking": {"type": "enabled" if reasoning else "disabled"}},
+            preserve_reasoning=reasoning,
+        ),
+        request_timeout,
+        identity={
+            "provider": "deepseek", "name": model, "endpoint_hash": fingerprint(endpoint),
+            "context_window_tokens": context_window_tokens, "reasoning": reasoning,
+        },
     )
 
 

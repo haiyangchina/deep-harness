@@ -145,7 +145,13 @@ class JobLedger:
             row = (
                 (
                     await conn.execute(
-                        select(s.job_stage_attempts).where(
+                        select(s.job_stage_attempts, s.job_stages.c.definition).join(
+                            s.job_stages,
+                            and_(
+                                s.job_stage_attempts.c.job_id == s.job_stages.c.job_id,
+                                s.job_stage_attempts.c.position == s.job_stages.c.position,
+                            ),
+                        ).where(
                             s.job_stage_attempts.c.session_id == session_id
                         )
                     )

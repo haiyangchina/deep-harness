@@ -22,6 +22,9 @@ class ProfileScope:
     home: Path
     workspace: Path
     state_root: Path
+    server_mode: str | None = None
+    protected_paths: tuple[Path, ...] = ()
+    executor_revision: str | None = None
 
 
 @dataclass(frozen=True)

@@ -41,11 +41,12 @@ jsonschema-specifications==2025.9.1
 justext==3.0.2
 langchain==1.4.7
 langchain-anthropic==1.7.7
-langchain-core==1.7.3
+langchain-core==1.8.4
+langchain-deepseek==1.2.1
 langchain-google-genai==4.4.2
 langchain-ollama==1.1.0
-langchain-openai==1.7.3
-langchain-protocol==0.0.20
+langchain-openai==1.8.5
+langchain-protocol==0.0.22
 langgraph==1.2.19
 langgraph-checkpoint==4.3.1
 langgraph-checkpoint-sqlite==3.1.3

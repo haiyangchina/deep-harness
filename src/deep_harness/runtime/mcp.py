@@ -131,10 +131,15 @@ def read_servers(path: Path):
 
 
 class McpRegistry:
-    def __init__(self, scope, *, objects=None):
+    def __init__(self, scope, *, objects=None, connectors=None):
         self.scope = scope
         self.objects = objects or {}
+        self.connectors = connectors
         self.servers = {row.name: row for row in read_servers(scope.home / "mcp.toml")}
+        if connectors is not None and connectors.catalog and (
+            "http" in self.servers or "http" in self.objects
+        ):
+            raise DomainError("mcp_config", "The http namespace is reserved for HTTP connectors")
         if set(self.servers) & set(self.objects):
             raise DomainError("mcp_config", "In-process MCP test server duplicates configured name")
         self.catalog_cache = {}
@@ -247,13 +252,18 @@ class McpRegistry:
     async def _discover(self, server_names=None):
         catalog = {}
         available = set(self.servers) | set(self.objects)
+        if self.connectors is not None and self.connectors.catalog:
+            available.add("http")
         requested = available if server_names is None else set(server_names)
         if not requested <= available:
             raise DomainError("mcp_not_found", "MCP server is not configured for this profile")
         async with asyncio.timeout(number("mcp.operation_timeout_seconds")):
             for name in sorted(requested):
-                async with self.client(name) as client:
-                    catalog.update(await self._list_catalog(name, client))
+                if name == "http" and self.connectors is not None and self.connectors.catalog:
+                    catalog.update(self.connectors.catalog)
+                else:
+                    async with self.client(name) as client:
+                        catalog.update(await self._list_catalog(name, client))
                 if len(catalog) > number("mcp.max_tools"):
                     raise DomainError("mcp_schema", "MCP catalog exceeds the configured tool limit")
         self.catalog_cache.update(catalog)
@@ -309,7 +319,14 @@ class McpRegistry:
             seen_cursors.add(cursor)
         return catalog
 
-    async def call(self, public_name, arguments, expected_schema_hash, *, before_dispatch=None):
+    async def call(
+        self, public_name, arguments, expected_schema_hash, *, before_dispatch=None, effect_id=None
+    ):
+        if self.connectors is not None and public_name in self.connectors.definitions:
+            return await self.connectors.call(
+                public_name, arguments, expected_schema_hash,
+                before_dispatch=before_dispatch, effect_id=effect_id,
+            )
         parts = public_name.split("__", 2)
         if len(parts) != 3 or parts[0] != "mcp":
             raise DomainError("mcp_not_found", "MCP tool name is invalid")

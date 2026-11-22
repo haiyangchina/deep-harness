@@ -3,7 +3,8 @@
 import asyncio
 import logging
 import time
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, nullcontext
+from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
@@ -23,8 +24,10 @@ from deep_harness.application.scopes import ProfileResolver
 from deep_harness.application.session_runtime import SessionRuntime
 from deep_harness.application.tools import TOOL_ARGUMENTS
 from deep_harness.application.workspace import CODING_TOOLS, MUTATING_TOOLS, READ_TOOLS
+from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import DomainError
 from deep_harness.infrastructure.archives import create_archive, restore_archive
+from deep_harness.infrastructure.artifacts import ArtifactStore
 from deep_harness.infrastructure.delegations import DelegationLedger
 from deep_harness.infrastructure.executions import ExecutionLedger
 from deep_harness.infrastructure.knowledge import KnowledgeStore, render_prompt
@@ -39,6 +42,7 @@ from deep_harness.runtime.deep import HarnessRuntime
 from deep_harness.runtime.mcp import McpRegistry
 from deep_harness.runtime.models import DiagnosticModel
 from deep_harness.runtime.standard import StandardRuntime
+from deep_harness.runtime.workflow import WorkflowModel
 from deep_harness.server_config import number
 
 SHUTDOWN_GRACE_SECONDS = number("lifecycle.shutdown_grace_seconds")
@@ -58,11 +62,20 @@ class ProfileApplication:
         mcp_objects=None,
         web_settings=None,
         web_client=None,
+        models=None,
+        run_slots=None,
+        connectors=None,
+        executor=None,
+        upload_limit=None,
     ):
         self.scope = scope
         self.model = model
+        self.models = models
+        self.run_slots = run_slots
+        self.executor = executor
         self.owner = str(uuid4())
         self.store = BusinessStore(scope.home, scope.profile_id)
+        self.artifacts = ArtifactStore(self.store, upload_limit) if upload_limit else None
         self.executions = ExecutionLedger(self.store)
         self.jobs = JobService(self)
         self.delegations = DelegationLedger(self.store, self.executions)
@@ -70,11 +83,11 @@ class ProfileApplication:
         self.knowledge = KnowledgeStore(self.store)
         self.curator = CurationService(self.store, model)
         self.auto_curate = False
-        self.mcp = McpRegistry(scope, objects=mcp_objects)
+        self.mcp = McpRegistry(scope, objects=mcp_objects, connectors=connectors)
         self.web = web_client or WebClient(web_settings or WebSettings())
         self.limits = execution_limits or ExecutionSettings()
         self.sessions = SessionRuntime(
-            self.store, scope, model, self.limits, self.mcp, self.web.settings
+            self.store, scope, model, self.limits, self.mcp, self.web.settings, models
         )
         self.resources = AsyncExitStack()
         self.tasks: set[asyncio.Task] = set()
@@ -109,6 +122,8 @@ class ProfileApplication:
             self.resources.push_async_callback(self.store.close)
             await self.store.open()
             await self.store.bind_workspace(self.scope.workspace)
+            if self.artifacts is not None:
+                await self.artifacts.open()
             self.saver = await self.resources.enter_async_context(
                 AsyncSqliteSaver.from_conn_string(str(self.scope.home / "checkpoints.db"))
             )
@@ -152,6 +167,7 @@ class ProfileApplication:
         extensions: tuple[str, ...] = (),
         mcp_tools: tuple[str, ...] = (),
         full_access_acknowledged: bool = False,
+        model_id: str | None = None,
     ):
         if permission_mode not in {"ask", "auto", "full"}:
             raise DomainError("permission_mode", "Unknown permission mode")
@@ -177,12 +193,21 @@ class ProfileApplication:
         knowledge = await self.knowledge.snapshot()
         frozen_knowledge = knowledge if any(knowledge.values()) else None
         frozen_tools = tuple(sorted(set(tools)))
+        if self.scope.server_mode:
+            denied = {"write", "edit", "apply_patch", "save_memory", "delegate_task"}
+            if self.scope.server_mode != "sandbox":
+                denied.add("bash")
+            if set(frozen_tools) & denied or permission_mode != "ask":
+                raise DomainError(
+                    "tool_denied", "Tool or permission mode is unavailable on the server"
+                )
         mcp_catalog = await self.sessions.catalog_for(frozen_tools)
         snapshot_fields = {
             "engine": engine,
             "harness": harness,
             "knowledge": frozen_knowledge,
             "mcp_catalog": mcp_catalog,
+            "model_id": model_id,
         }
         return await self.store.create_session(
             principal="operator",
@@ -196,18 +221,25 @@ class ProfileApplication:
         )
 
     @mutation
-    async def submit(self, session_id: str, submission_id: str, text: str):
+    async def submit(
+        self, session_id: str, submission_id: str, text: str, *, artifact_ids=()
+    ):
         if self.closing:
             raise DomainError("draining", "Application is closing")
         session = await self.store.get_session(session_id, "operator")
         if await self.jobs.ledger.owner(session_id) is not None:
             raise DomainError("job_stage_managed", "Submit long-task stages from the job page")
         await self.sessions.validate(session)
+        if artifact_ids:
+            if self.artifacts is None:
+                raise DomainError("artifact_not_found", "Attachments are unavailable")
+            text = await self.artifacts.input_with_attachments(session_id, text, artifact_ids)
         admission = await self.store.admit(
             session,
             principal="operator",
             submission_id=submission_id,
             text=text,
+            artifact_ids=artifact_ids,
         )
         self.schedule(session_id)
         return admission
@@ -220,6 +252,11 @@ class ProfileApplication:
             task = asyncio.create_task(self.drain_scheduled(session_id))
             self.drains[session_id] = task
             self.track(task)
+
+    @mutation
+    async def publish_attachment(self, session_id, chunks, name):
+        await self.store.get_session(session_id, "operator")
+        return await self.artifacts.publish(session_id, chunks, name)
 
     async def drain_scheduled(self, session_id: str):
         try:
@@ -275,8 +312,10 @@ class ProfileApplication:
             else {*READ_TOOLS, *(name for name in session.tools if name.startswith("mcp__"))}
         )
         tools = tuple(sorted(allowed.intersection(session.tools)))
+        parent = await self.sessions.policies.get(session.id)
         snapshot = self.sessions.snapshot(
-            tools, engine="deep", harness=kind, mcp_catalog=mcp_bindings
+            tools, engine="deep", harness=kind, mcp_catalog=mcp_bindings,
+            model_id=parent["snapshot"].get("model_id") if parent else None,
         )
         handle = await self.delegations.spawn_background(
             claim,
@@ -334,13 +373,15 @@ class ProfileApplication:
         *,
         stage_limits=None,
         job_id=None,
+        model_id=None,
+        workflow_step=None,
     ):
         runtime_type = HarnessRuntime if session.engine == "deep" else StandardRuntime
         kwargs = dict(
             session=session,
             claim=claim,
             scope=self.scope,
-            model=self.model,
+            model=self.sessions.select_model(model_id, session.tools),
             store=self.store,
             executions=self.executions,
             receipts=self.receipts,
@@ -350,11 +391,17 @@ class ProfileApplication:
             mcp_bindings=mcp_bindings,
             web_client=self.web,
         )
+        if self.executor is not None:
+            kwargs["executor"] = self.executor
+        if workflow_step is not None and workflow_step["kind"] != "agent":
+            kwargs["model"] = WorkflowModel(workflow_step)
         if runtime_type is HarnessRuntime and stage_limits is None:
             kwargs["background_launcher"] = self.launch_background
         if stage_limits is not None:
             kwargs["model_lock"] = self.jobs.model_lock
             kwargs["pause_probe"] = lambda: self.jobs.ledger.paused(job_id)
+        if self.models is not None:
+            kwargs["model_lock"] = self.models.slots[model_id or self.models.default]
         return runtime_type(**kwargs)
 
     async def drain(self, session_id: str):
@@ -366,34 +413,34 @@ class ProfileApplication:
                 logger.warning("Session %s paused: %s", session.id, exc.code)
                 return
             while not self.closing:
-                paused = await self.executions.paused_job_admission(session_id)
-                ready = await self.receipts.decided_waiting(session_id) if paused is None else ()
-                if paused is not None:
-                    claim = await self.executions.resume(
-                        paused, session_id, self.owner, job_paused=True
-                    )
-                elif ready:
-                    pending = ready[0]
-                    claim = await self.executions.resume(
-                        pending["admission_id"],
-                        session_id,
-                        self.owner,
-                        expected_generation=pending["generation"],
-                    )
-                else:
-                    claim = await self.executions.claim(session_id, self.owner)
-                if claim is None:
-                    return
-                status = await self.execute(
-                    session, claim, resume=bool(ready) or paused is not None
-                )
+                async with self.run_slots or nullcontext():
+                    if self.closing:
+                        return
+                    status = await self.drain_next(session)
                 if status != "completed":
                     return
+
+    async def drain_next(self, session):
+        paused = await self.executions.paused_job_admission(session.id)
+        ready = await self.receipts.decided_waiting(session.id) if paused is None else ()
+        if paused is not None:
+            claim = await self.executions.resume(paused, session.id, self.owner, job_paused=True)
+        elif ready:
+            pending = ready[0]
+            claim = await self.executions.resume(
+                pending["admission_id"], session.id, self.owner,
+                expected_generation=pending["generation"],
+            )
+        else:
+            claim = await self.executions.claim(session.id, self.owner)
+        if claim is not None:
+            return await self.execute(session, claim, resume=bool(ready) or paused is not None)
 
     async def execute(self, session, claim, *, resume=False):
         self.active[claim.admission.id] = asyncio.current_task()
         clock = asyncio.get_running_loop().time
         started = clock()
+        result = None
         try:
             await self.delegations.settle_background(session.id, "running", None)
             binding = await self.sessions.policies.get(session.id)
@@ -415,6 +462,8 @@ class ProfileApplication:
                     mcp_bindings,
                     stage_limits=limits if stage else None,
                     job_id=stage["job_id"] if stage else None,
+                    model_id=binding["snapshot"].get("model_id") if binding else None,
+                    workflow_step=stage["definition"].get("step") if stage else None,
                 )
                 result = await runtime.run(resume=resume)
         except asyncio.CancelledError:
@@ -443,6 +492,8 @@ class ProfileApplication:
                     "empty_model_response",
                     "ollama_response_error",
                     "model_connection_failed",
+                    "model_request_failed",
+                    "sandbox_state_lost",
                 }
                 else "unknown"
             )
@@ -451,6 +502,7 @@ class ProfileApplication:
                 "budget_exhausted",
                 "ollama_response_error",
                 "model_connection_failed",
+                "model_request_failed",
             } and isinstance(exc, DomainError):
                 failure += f": {exc}"
             if category == "unknown_effect" and isinstance(exc, DomainError):
@@ -474,6 +526,8 @@ class ProfileApplication:
             return status
         finally:
             self.active.pop(claim.admission.id, None)
+            if result is None or result["status"] not in {"waiting_approval", "job_paused"}:
+                await self.finish_sandbox(claim.admission.id)
         await self.executions.settle(
             claim,
             result["status"],
@@ -482,9 +536,21 @@ class ProfileApplication:
             elapsed=clock() - started,
         )
         await self.delegations.settle_background(session.id, result["status"], result["result"])
+        if self.artifacts is not None and result["status"] == "completed" and result["result"]:
+            try:
+                await self.artifacts.result(claim.admission, result["result"])
+            except (DomainError, OSError):
+                logger.warning("Result artifact was not published for %s", claim.admission.id)
         if result["status"] == "completed" and self.auto_curate:
             self.track(asyncio.create_task(self._curate_completed(session.id)))
         return result["status"]
+
+    async def finish_sandbox(self, run_id):
+        if self.executor is not None:
+            try:
+                await self.executor.finish(run_id)
+            except (OSError, TimeoutError):
+                logger.warning("Could not confirm sandbox cleanup for %s", run_id)
 
     async def _curate_completed(self, session_id):
         try:
@@ -519,6 +585,8 @@ class ProfileApplication:
     async def set_permissions(
         self, session_id, mode, expected_revision, full_access_acknowledged=False
     ):
+        if self.scope.server_mode and mode != "ask":
+            raise DomainError("permission_mode", "The server uses explicit approval")
         if await self.jobs.ledger.owner(session_id) is not None:
             raise DomainError(
                 "job_stage_managed", "Permissions are fixed for job stages"
@@ -557,6 +625,7 @@ class ProfileApplication:
                     harness=session.harness,
                     knowledge=knowledge,
                     mcp_catalog=catalog,
+                    model_id=bound["snapshot"].get("model_id") if bound else None,
                 ),
             )
 
@@ -570,6 +639,7 @@ class ProfileApplication:
             await asyncio.wait({task}, timeout=number("lifecycle.cancel_wait_seconds"))
             return await self.store.get_admission(admission_id, session_id)
         result = await self.executions.cancel_pending(session_id, admission_id)
+        await self.finish_sandbox(admission_id)
         if result.status == "cancelled":
             self.schedule(session_id)
         return result
@@ -651,6 +721,13 @@ class ProjectHost:
         mcp_objects=None,
         web_settings=None,
         web_clients=None,
+        models=None,
+        run_slots=None,
+        server_mode=None,
+        protected_paths=(),
+        connectors=None,
+        executor=None,
+        upload_limit=None,
     ):
         self.profiles = ProfileResolver(state_dir, workspace)
         self.model_factory = model_factory or (lambda scope: DiagnosticModel())
@@ -659,13 +736,27 @@ class ProjectHost:
         self.mcp_objects = mcp_objects or {}
         self.web_settings = web_settings
         self.web_clients = web_clients or {}
+        self.models = models
+        self.run_slots = run_slots
+        self.server_mode = server_mode
+        self.protected_paths = protected_paths
+        self.connectors = connectors
+        self.executor = executor
+        self.upload_limit = upload_limit
         self.apps: dict[str, ProfileApplication] = {}
         self.lock = asyncio.Lock()
 
     async def application(self, profile_id: str) -> ProfileApplication:
         async with self.lock:
             if profile_id not in self.apps:
-                scope = self.profiles.resolve(profile_id)
+                scope = replace(
+                    self.profiles.resolve(profile_id),
+                    server_mode=self.server_mode, protected_paths=self.protected_paths,
+                    executor_revision=fingerprint({
+                        "image": self.executor.image_id,
+                        "settings": self.executor.settings.model_dump(),
+                    }) if self.executor is not None else None,
+                )
                 self.apps[profile_id] = await ProfileApplication(
                     scope,
                     self.model_factory(scope),
@@ -674,6 +765,11 @@ class ProjectHost:
                     mcp_objects=self.mcp_objects.get(profile_id),
                     web_settings=self.web_settings,
                     web_client=self.web_clients.get(profile_id),
+                    models=self.models,
+                    run_slots=self.run_slots,
+                    connectors=self.connectors,
+                    executor=self.executor,
+                    upload_limit=self.upload_limit,
                 ).start()
             return self.apps[profile_id]
 

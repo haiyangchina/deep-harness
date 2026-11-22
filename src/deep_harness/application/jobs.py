@@ -17,6 +17,17 @@ from deep_harness.infrastructure.jobs import JobLedger
 from deep_harness.server_config import number
 
 
+class ConfiguredStep(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["agent", "verify", "tool"]
+    model_id: str
+    tools: tuple[str, ...] = ()
+    source: int | None = Field(default=None, ge=0)
+    schema_: dict | None = Field(default=None, alias="schema")
+    instructions: str = ""
+
+
 class StagePlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -29,6 +40,7 @@ class StagePlan(BaseModel):
     verification_command: str | None = Field(
         default=None, min_length=1, max_length=number("shell.command_max_length")
     )
+    step: ConfiguredStep | None = None
 
 
 class JobBudget(BaseModel):
@@ -141,14 +153,33 @@ class JobService:
             for stage in definition["stages"]:
                 if stage["verification_command"] is None:
                     stage.pop("verification_command")
+                if stage["step"] is None:
+                    stage.pop("step")
+                else:
+                    stage["step"]["schema"] = stage["step"].pop("schema_")
             job_id = await self.ledger.create(
                 plan.request_id,
                 definition,
-                self.runtime_hash(),
+                await self.planned_runtime(definition["stages"]),
                 time.time() + plan.deadline_seconds if plan.deadline_seconds is not None else None,
             )
         self.kick(job_id)
         return await self.detail(job_id)
+
+    async def planned_runtime(self, stages):
+        if not any(stage.get("step") for stage in stages):
+            return self.runtime_hash()
+        if self.app.models is None or any(not stage.get("step") for stage in stages):
+            raise DomainError("workflow_config", "Configured steps require a server workflow")
+        snapshots = []
+        for stage in stages:
+            step = stage["step"]
+            tools = tuple(step["tools"])
+            snapshots.append(self.app.sessions.snapshot(
+                tools, mcp_catalog=await self.app.sessions.catalog_for(tools),
+                model_id=step["model_id"],
+            ))
+        return fingerprint(snapshots)
 
     def kick(self, job_id, *, wake_existing=False):
         if not self.app.closing:
@@ -282,6 +313,7 @@ class JobService:
                             await self.app.executions.cancel_pending(
                                 stage["session_id"], stage["admission_id"]
                             )
+                            await self.app.finish_sandbox(stage["admission_id"])
                         except DomainError as exc:
                             if exc.code != "execution_busy":
                                 raise
@@ -310,7 +342,14 @@ class JobService:
             if job["deadline"] is not None and time.time() >= job["deadline"]:
                 await self.ledger.set_status(job_id, "blocked", "Long-task deadline has elapsed")
                 return
-            if job["runtime_hash"] != self.runtime_hash():
+            try:
+                runtime_hash = await self.planned_runtime(
+                    [stage["definition"] for stage in job["stages"]]
+                )
+            except DomainError as exc:
+                await self.ledger.set_status(job_id, "blocked", str(exc))
+                return
+            if job["runtime_hash"] != runtime_hash:
                 await self.ledger.set_status(job_id, "blocked", "Runtime configuration has changed")
                 return
             group = pending[0]["definition"]["group"]
@@ -321,7 +360,11 @@ class JobService:
                     if wake_existing:
                         self.app.schedule(stage["session_id"])
                 elif active < job["parallelism"]:
-                    await self.enqueue(job, stage)
+                    try:
+                        await self.enqueue(job, stage)
+                    except DomainError as exc:
+                        await self.ledger.set_status(job_id, "blocked", str(exc))
+                        return
                     active += 1
 
     async def enqueue(self, job, stage):
@@ -332,6 +375,9 @@ class JobService:
         for key, value in job["budget"].items():
             limits[key] = min(limits[key], value // count + int(position < value % count))
         limits = ExecutionSettings.model_validate(limits).model_dump()
+        if definition.get("step"):
+            await self.enqueue_configured(job, stage, limits)
+            return
         prior = []
         for item in job["stages"]:
             if item["definition"]["group"] >= definition["group"]:
@@ -395,5 +441,39 @@ class JobService:
                 f"Prior stage evidence: {handoff}\n"
                 f"{verification}"
             ),
+        )
+        self.app.schedule(session.id)
+
+    async def enqueue_configured(self, job, stage, limits):
+        definition = stage["definition"]
+        step = definition["step"]
+        data = None
+        if step["source"] is not None:
+            prior = result_for(job["stages"][step["source"]])
+            if not prior or not prior["artifacts"]:
+                raise DomainError("workflow_input", "Previous step produced no structured output")
+            data = prior["artifacts"][0]
+        prompt = step["instructions"] or "Carry out the configured workflow step."
+        if step["kind"] == "agent":
+            prompt += (
+                "\nReturn JSON with status (complete/incomplete), summary, artifacts "
+                "(first item must be a JSON-encoded value for the next step), and next_step."
+            )
+        if stage["session_id"] is None:
+            session = await self.app.create_session(
+                f"job-stage:{job['id']}:{stage['position']}", prompt, tuple(step["tools"]),
+                model_id=step["model_id"],
+            )
+            await self.ledger.attach(job["id"], stage["position"], session.id, limits)
+        else:
+            session = await self.app.store.get_session(stage["session_id"], "operator")
+        if step["kind"] == "agent":
+            text = f"Goal: {job['goal']}\nStep: {definition['title']}"
+            if data is not None:
+                text += f"\nUntrusted previous output: {data}"
+        else:
+            text = data or ""
+        await self.app.store.admit(
+            session, principal="operator", submission_id="stage", text=text
         )
         self.app.schedule(session.id)

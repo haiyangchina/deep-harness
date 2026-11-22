@@ -165,6 +165,7 @@ class ToolGateway:
         mcp=None,
         mcp_bindings=None,
         web_client=None,
+        executor=None,
     ):
         self.scope = scope
         self.session = session
@@ -173,10 +174,17 @@ class ToolGateway:
         self.mcp = mcp
         self.mcp_bindings = mcp_bindings or {}
         self.web_client = web_client
+        self.executor = executor
 
     def validate(self, call: ToolCall) -> BaseModel:
         if call.name not in self.session.tools:
             raise DomainError("tool_denied", "Tool is outside the frozen session grant")
+        if self.scope.server_mode:
+            unavailable = {"write", "edit", "apply_patch", "save_memory", "delegate_task"}
+            if call.name in unavailable or (
+                call.name == "bash" and (self.scope.server_mode != "sandbox" or not self.executor)
+            ):
+                raise DomainError("tool_denied", "This tool is unavailable on the server")
         if call.name in self.mcp_bindings:
             spec = self.mcp_bindings[call.name]
             try:
@@ -197,6 +205,11 @@ class ToolGateway:
             raise DomainError(
                 "path_denied", "Runtime state and credentials are not model-accessible"
             )
+        if self.scope.server_mode and (
+            not target.is_relative_to(self.scope.workspace)
+            or any(target.is_relative_to(root) for root in self.scope.protected_paths)
+        ):
+            raise DomainError("path_denied", "Path is outside the available server workspace")
         return target
 
     def approval_reason(self, call: ToolCall) -> str | None:
@@ -252,6 +265,7 @@ class ToolGateway:
                     arguments,
                     self.mcp_bindings[call.name]["schema_hash"],
                     before_dispatch=dispatch,
+                    effect_id=key,
                 )
             else:
                 result = await self._invoke(call.name, arguments, key)
@@ -311,7 +325,15 @@ class ToolGateway:
             if self.mcp is None:
                 raise DomainError("mcp_unavailable", "MCP registry is not configured")
         elif call.name == "bash":
-            await asyncio.to_thread(shell_command, arguments, self.path)
+            if self.executor is not None:
+                self.executor.validate(arguments, self.path)
+                run_id = self.claim.admission.id
+                await self.executor.prepare(
+                    run_id, self.scope.workspace,
+                    previously_used=await self.receipts.used_sandbox(run_id),
+                )
+            else:
+                await asyncio.to_thread(shell_command, arguments, self.path)
         elif call.name in {
             "read",
             "write",
@@ -325,7 +347,13 @@ class ToolGateway:
         if name in WEB_TOOL_NAMES:
             return await execute_web_tool(name, arguments, self.web_client)
         if name == "bash":
-            return json.dumps(await bash(arguments, self.path), ensure_ascii=False)
+            if self.executor is not None:
+                result = await self.executor.run(
+                    arguments, self.path, self.scope.workspace, run_id=self.claim.admission.id
+                )
+            else:
+                result = await bash(arguments, self.path)
+            return json.dumps(result, ensure_ascii=False)
         if name == "save_memory":
             memory = await KnowledgeStore(self.receipts.store).remember(
                 arguments.content, "agent", memory_id=key

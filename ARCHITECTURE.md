@@ -1,10 +1,12 @@
-# deep-harness v1.1.3 架构与技术实现
+# deep-harness v1.1.4 架构与技术实现
 
-deep-harness 是面向本地工作区的 Agent 宿主。CLI 和 Windows 桌面端提供会话、工具审批和任务管理，Python 后端负责执行、持久化与恢复。一次用户输入进入业务库成为一条 admission，随后才交给运行图。模型生成工具提议，宿主决定工具是否获授权、是否需要批准、能否派发，以及结果是否需要人工对账。
+deep-harness 是可在本机及服务器运行的通用 Agent 宿主。CLI、Windows 桌面端和同源浏览器工作台共享 Python 应用服务。一次用户输入进入业务库成为一条 admission，随后才交给运行图。模型生成工具提议，宿主决定工具是否获授权、是否需要批准、能否派发，以及结果是否需要人工对账。
 
-本文对应 v1.1.3。应用版本、业务库 schema 12、会话快照版本 4 和能力清单版本 2 各自演进。
+应用版本、业务库 schema 12、会话快照版本 4 和能力清单版本 2 各自演进。
 
 [技术评审与优化路线](HARNESS_REVIEW.md)对照主流 Agent Harness，记录当前缺陷、验证证据和改进优先级。
+
+[通用 Agent Harness 平台设计](PLATFORM_ARCHITECTURE.md)、[接口与实现规格](IMPLEMENTATION_SPEC.md)和[单实例部署](deploy/README.md)记录服务器 Web、LangChain 多模型、Docker 隔离和业务扩展。
 
 ## 1. 系统架构
 
@@ -15,11 +17,15 @@ flowchart TB
         Main["Electron 主进程<br/>本机后端生命周期"]
         CLI["CLI<br/>chat · repl · 管理命令"]
         REST["外部本机 API 客户端"]
+        Browser["浏览器工作台 / Web API 客户端"]
         UI -->|"受限 preload IPC"| Main
     end
     Main -->|"启动 Python 子进程<br/>回环 HTTP + Bearer"| API
     REST -->|"REST / SSE + Bearer"| API
     API["FastAPI / Uvicorn"] --> Host
+    Browser -->|"同源 REST / SSE"| WebAPI["免登录 Web /api/v1"]
+    WebAPI --> Instance["InstanceHost<br/>工作区、模型目录、实例并发"]
+    Instance --> Host
     CLI --> Host["ProjectHost<br/>按 Profile 装配"]
     Host --> App["ProfileApplication<br/>会话、队列、恢复、审批、任务"]
     App --> Spec["HarnessSpec / SessionRuntime<br/>工具授权、快照与兼容校验"]
@@ -27,7 +33,7 @@ flowchart TB
     Jobs --> App
     App -->|"engine = standard"| Std["StandardRuntime<br/>显式 LangGraph 循环"]
     App -->|"engine = deep"| Deep["HarnessRuntime<br/>Deep Agents 图与模型守卫"]
-    Std --> Model["模型适配器<br/>Ollama / OpenAI-compatible / Diagnostic"]
+    Std --> Model["共享 LangChain 模型工厂<br/>Ollama / DeepSeek / OpenAI-compatible / Diagnostic"]
     Deep -->|"LangChain 模型"| Model
     Std --> Gateway["ToolGateway<br/>参数、路径、审批、effect"]
     Deep --> Gateway
@@ -40,6 +46,9 @@ flowchart TB
     Ledger --> Business[("business.db<br/>消息、执行、审批、回执")]
     Gateway --> Local["工作区文件 / 本机 Shell / 记忆"]
     Gateway --> MCP["MCP SDK<br/>stdio / Streamable HTTP"]
+    Gateway --> HTTP["HTTP 业务连接器<br/>幂等键、状态查询"]
+    Gateway --> Docker["Docker 命令执行<br/>每 Run 工作副本"]
+    App --> Artifacts["附件、结果与差异"]
     Gateway --> Web["WebClient<br/>路由、缓存、证据包"]
     Web --> Worker["Pi Node 工作进程"]
     Web --> Providers["直接搜索后端 / 公网网页 / 远端提取"]

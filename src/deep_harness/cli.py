@@ -3,7 +3,6 @@
 import argparse
 import asyncio
 import json
-import os
 import secrets
 import sys
 from pathlib import Path
@@ -16,7 +15,7 @@ from deep_harness.application.config import (
 )
 from deep_harness.bootstrap import ProjectHost
 from deep_harness.domain.models import DomainError
-from deep_harness.runtime.models import DiagnosticModel, ollama_model, openai_model
+from deep_harness.runtime.model_factory import open_model
 from deep_harness.server_config import number, setting
 
 
@@ -26,7 +25,7 @@ def parser():
     result.add_argument("--workspace", type=Path, default=Path.cwd())
     result.add_argument("--profile", default="default")
     result.add_argument("--config", type=Path, help="Runtime configuration YAML or TOML override")
-    result.add_argument("--provider", choices=["ollama", "openai", "diagnostic"])
+    result.add_argument("--provider", choices=["ollama", "openai", "deepseek", "diagnostic"])
     result.add_argument(
         "--model",
         help="Model identifier; defaults to the configured local Ollama model",
@@ -152,6 +151,9 @@ def parser():
     approve.add_argument("interaction")
     approve.add_argument("--generation", required=True, type=int)
     approve.add_argument("--decision", required=True, choices=["approve", "deny"])
+    web = commands.add_parser("web", help="Serve the shared, login-free browser workbench")
+    web.add_argument("--instance-config", type=Path, required=True)
+    web.add_argument("--assets", type=Path, help="Directory containing the built web interface")
     serve = commands.add_parser("serve")
     serve.add_argument("--port", type=int, default=number("transport.http_port"))
     for name in ("backup", "restore"):
@@ -182,36 +184,15 @@ def build_host(args):
         base_url=args.base_url,
         context_window_tokens=args.context_window,
     )
-    if settings.provider == "diagnostic":
-        return ProjectHost(
-            args.state_dir,
-            args.workspace,
-            lambda scope: DiagnosticModel(),
-            recover_queued=recover_queued,
-            execution_limits=execution_limits,
-            web_settings=web_settings,
-        )
-    api_key = None
-    if settings.provider == "openai":
-        api_key = os.environ.get(args.api_key_env)
-        if not api_key:
-            raise SystemExit(f"Required secret environment variable is missing: {args.api_key_env}")
+    try:
+        model = open_model(settings, args.api_key_env)
+    except DomainError as exc:
+        raise SystemExit(str(exc)) from exc
 
     def factory(scope):
-        if scope.profile_id != args.profile:
+        if settings.provider != "diagnostic" and scope.profile_id != args.profile:
             raise DomainError("profile_mismatch", "Model route is bound to the launch profile")
-        common = {
-            "model": settings.name,
-            "base_url": settings.base_url,
-            "request_timeout": settings.request_timeout_seconds,
-        }
-        if settings.provider == "ollama":
-            return ollama_model(
-                **common,
-                context_window_tokens=settings.context_window_tokens,
-                reasoning=settings.reasoning,
-            )
-        return openai_model(**common, api_key=api_key)
+        return model
 
     return ProjectHost(
         args.state_dir,
@@ -226,6 +207,10 @@ def build_host(args):
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
     args = parser().parse_args()
+    if args.command == "web":
+        from deep_harness.transports.web_launcher import serve_web
+
+        return serve_web(args)
     if args.command in {"backup", "restore", "cancel", "resolve"}:
         from deep_harness.transports.admin import run_admin
 

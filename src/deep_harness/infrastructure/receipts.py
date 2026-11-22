@@ -289,6 +289,45 @@ class ReceiptLedger:
             rows = await conn.execute(query)
             return [dict(row) for row in rows.mappings()]
 
+    async def verify_proposal(self, admission_id, interaction_id, digest):
+        async with self.store.engine.connect() as conn:
+            expected = await conn.scalar(
+                select(s.interactions.c.proposal_hash).where(
+                    s.interactions.c.admission_id == admission_id,
+                    s.interactions.c.id == interaction_id,
+                )
+            )
+        if expected != digest:
+            raise DomainError("stale_approval", "Approval proposal does not match the selected run")
+
+    async def dispatched_tool(self, admission_id, effect_id):
+        async with self.store.engine.connect() as conn:
+            proposal = await conn.scalar(
+                select(s.interactions.c.proposal).join(
+                    s.effects, s.interactions.c.id == s.effects.c.id
+                ).where(
+                    s.effects.c.id == effect_id,
+                    s.effects.c.admission_id == admission_id,
+                    s.effects.c.status == "dispatched",
+                )
+            )
+        if proposal is None:
+            raise DomainError("effect_not_found", "Effect is not available for status lookup")
+        return proposal["tool_name"]
+
+    async def used_sandbox(self, admission_id):
+        async with self.store.engine.connect() as conn:
+            tool = await conn.scalar(
+                select(s.effects.c.id).join(
+                    s.interactions, s.interactions.c.id == s.effects.c.id
+                ).where(
+                    s.effects.c.admission_id == admission_id,
+                    s.effects.c.status == "succeeded",
+                    s.interactions.c.proposal["tool_name"].as_string() == "bash",
+                ).limit(1)
+            )
+        return tool is not None
+
     async def decide(
         self,
         key: str,

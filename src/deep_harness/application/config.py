@@ -11,7 +11,7 @@ from deep_harness.server_config import defaults_for, number, read_operator_confi
 
 class ModelSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, validate_default=True)
-    provider: Literal["ollama", "openai", "diagnostic"]
+    provider: Literal["ollama", "openai", "deepseek", "diagnostic"]
     name: str = Field(min_length=1)
     base_url: str | None = None
     request_timeout_seconds: float = Field(gt=0, le=number("model.request_timeout_seconds_max"))

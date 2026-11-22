@@ -7,6 +7,7 @@ user-facing-surface guarantees.
 """
 
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 
 import pytest
 from deepagents.backends.protocol import BackendProtocol
@@ -24,7 +25,7 @@ from deep_harness.application.harness_spec import (
     spec_for,
 )
 from deep_harness.application.session_runtime import SessionRuntime
-from deep_harness.domain.models import Harness
+from deep_harness.domain.models import Harness, ProfileScope
 from deep_harness.runtime.agent import (
     filesystem_middleware,
     response_format_for,
@@ -99,10 +100,9 @@ def test_context_projection_key_is_unified_across_tiers():
         identity = {"provider": "diagnostic", "name": "guard-test"}
         request_timeout = 1.0
 
-    class _Scope:
-        workspace = __import__("pathlib").Path(".")
-
-    runtime = SessionRuntime(object(), _Scope(), _Model(), ExecutionSettings())
+    directory = Path(".")
+    scope = ProfileScope("guard-test", directory, directory, directory)
+    runtime = SessionRuntime(object(), scope, _Model(), ExecutionSettings())
     standard = runtime.snapshot(("read",), engine="standard")
     deep = runtime.snapshot(("read",), engine="deep")
     assert standard["context_projection"] == CONTEXT_POLICY

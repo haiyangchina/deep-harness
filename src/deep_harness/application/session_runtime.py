@@ -11,10 +11,11 @@ from deep_harness.runtime.harnesses import harness_contract
 
 
 class SessionRuntime:
-    def __init__(self, store, scope, model, limits, mcp=None, web_settings=None):
+    def __init__(self, store, scope, model, limits, mcp=None, web_settings=None, models=None):
         self.store = store
         self.scope = scope
         self.model = model
+        self.models = models
         self.limits = limits
         self.mcp = mcp
         self.web_settings = web_settings
@@ -29,17 +30,25 @@ class SessionRuntime:
         harness="general",
         knowledge=None,
         mcp_catalog=None,
+        model_id=None,
     ):
+        model = self.select_model(model_id, tools)
         result = {
             "version": 4,
             "engine": engine,
             "workspace": str(self.scope.workspace),
-            "model": dict(self.model.identity),
+            "model": dict(model.identity),
             "tools": tool_definitions(tools, mcp_catalog),
             "execution": self.limits.model_dump(),
         }
         result["context_projection"] = CONTEXT_POLICY
-        result["model_request_timeout"] = self.model.request_timeout
+        result["model_request_timeout"] = model.request_timeout
+        if self.models is not None:
+            result["model_id"] = model_id or self.models.default
+            result["model_revision"] = self.models.revision(result["model_id"])
+        if self.scope.server_mode:
+            result["server_mode"] = self.scope.server_mode
+            result["executor_revision"] = self.scope.executor_revision
         if self.web_settings is not None and set(tools).intersection(WEB_TOOLS):
             result["web"] = {
                 key: value
@@ -60,6 +69,13 @@ class SessionRuntime:
         if mcp_names:
             result["mcp_bindings"] = {name: mcp_catalog[name] for name in mcp_names}
         return result
+
+    def select_model(self, model_id, tools):
+        if self.models is None:
+            if model_id is not None:
+                raise DomainError("model_not_found", "This host uses its launch model")
+            return self.model
+        return self.models.get(model_id, tools=bool(tools))
 
     async def catalog_for(self, tools):
         if any(name.startswith("mcp__") for name in tools):
@@ -91,6 +107,7 @@ class SessionRuntime:
                 harness=session.harness,
                 knowledge=knowledge,
                 mcp_catalog=catalog,
+                model_id=binding["snapshot"].get("model_id") if binding else None,
             ),
         )
 
@@ -99,14 +116,21 @@ class SessionRuntime:
         binding = await self.policies.get(session_id)
         knowledge = binding["snapshot"].get("knowledge") if binding else None
         catalog = await self.catalog_for(status["session"].tools)
-        current = self.snapshot(
-            status["session"].tools,
-            engine=status["session"].engine,
-            harness=status["session"].harness,
-            knowledge=knowledge,
-            mcp_catalog=catalog,
-        )
         saved = binding["snapshot"] if binding else {}
+        try:
+            current = self.snapshot(
+                status["session"].tools,
+                engine=status["session"].engine,
+                harness=status["session"].harness,
+                knowledge=knowledge,
+                mcp_catalog=catalog,
+                model_id=saved.get("model_id"),
+            )
+        except DomainError as exc:
+            if exc.code not in {"model_not_found", "model_secret_missing", "model_capability"}:
+                raise
+            status["runtime"] = {"binding": binding, "compatible": False, "error": exc.code}
+            return status
         status["runtime"] = {
             "binding": binding,
             "current_snapshot": current,

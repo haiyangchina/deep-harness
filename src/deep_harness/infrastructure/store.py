@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import uuid4
 
-from sqlalchemy import and_, insert, or_, select
+from sqlalchemy import and_, func, insert, or_, select
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from deep_harness.domain.identity import fingerprint
@@ -318,10 +318,14 @@ class BusinessStore:
         principal: str,
         submission_id: str,
         text: str,
+        artifact_ids: tuple[str, ...] = (),
     ) -> Admission:
         if session.profile_id != self.profile_id or session.principal != principal:
             raise DomainError("scope_mismatch", "Input does not belong to this profile/principal")
-        digest = fingerprint({"text": text})
+        payload = {"text": text}
+        if artifact_ids:
+            payload["artifact_ids"] = artifact_ids
+        digest = fingerprint(payload)
         async with self.transaction() as conn:
             row = (
                 (
@@ -361,8 +365,33 @@ class BusinessStore:
                     payload={"id": f"{admission_id}:user", "role": "user", "content": text},
                 )
             )
+            if artifact_ids:
+                from deep_harness.infrastructure.artifacts import run_artifacts
+
+                await conn.execute(
+                    insert(run_artifacts),
+                    [{"run_id": admission_id, "artifact_id": artifact_id}
+                     for artifact_id in artifact_ids],
+                )
             await self.append_event(conn, session.id, "admission.accepted", {"id": admission_id})
         return Admission(admission_id, session.id, text, "queued", 0)
+
+    async def queued_count(self):
+        async with self.engine.connect() as conn:
+            return await conn.scalar(
+                select(func.count())
+                .select_from(s.admissions)
+                .where(s.admissions.c.status == "queued")
+            )
+
+    async def run_session(self, run_id):
+        async with self.engine.connect() as conn:
+            session_id = await conn.scalar(
+                select(s.admissions.c.session_id).where(s.admissions.c.id == run_id)
+            )
+        if session_id is None:
+            raise DomainError("admission_not_found", "Run is not accessible")
+        return session_id
 
     async def find_submission(self, session_id, submission_id, principal="operator"):
         async with self.engine.connect() as conn:
@@ -533,12 +562,23 @@ class BusinessStore:
             )
             return [json.loads(row[0]) for row in rows]
 
-    async def event_history(self, session_id: str, after: int = 0, *, tail=False) -> list[dict]:
+    async def event_history(
+        self, session_id: str, after: int = 0, *, tail=False, run_id=None
+    ) -> list[dict]:
         order = s.events.c.seq.desc() if tail else s.events.c.seq
+        query = select(s.events).where(s.events.c.session_id == session_id, s.events.c.seq > after)
+        if run_id is not None:
+            payload = s.events.c.payload
+            event_id = payload["id"].as_string()
+            query = query.where(or_(
+                payload["admission_id"].as_string() == run_id,
+                payload["run_id"].as_string() == run_id,
+                event_id == run_id,
+                event_id.startswith(run_id + ":", autoescape=True),
+            ))
         async with self.engine.connect() as conn:
             rows = await conn.execute(
-                select(s.events)
-                .where(s.events.c.session_id == session_id, s.events.c.seq > after)
+                query
                 .order_by(order)
                 .limit(
                     number("pagination.event_tail_size")
