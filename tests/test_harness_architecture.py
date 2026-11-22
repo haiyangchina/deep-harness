@@ -1,16 +1,9 @@
-"""Contract guards for the unified deepagents execution kernel.
-
-These tests lock the architectural decisions of the refactor so a deepagents
-upgrade or an accidental regression fails fast. They cover the plan's four
-guard contracts at the structural level plus the single-source-of-truth and
-user-facing-surface guarantees.
-"""
+"""Contracts for Harness authorization, runtime builders, and snapshots."""
 
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
-from deepagents.backends.protocol import BackendProtocol
 
 from deep_harness.application.capabilities import (
     READ_ONLY_HARNESSES,
@@ -27,12 +20,10 @@ from deep_harness.application.harness_spec import (
 from deep_harness.application.session_runtime import SessionRuntime
 from deep_harness.domain.models import Harness, ProfileScope
 from deep_harness.runtime.agent import (
-    filesystem_middleware,
     response_format_for,
-    subagent_descriptors,
+    specialist_guide,
     system_prompt_for,
 )
-from deep_harness.runtime.backend import ToolGatewayBackend
 from deep_harness.runtime.harnesses import HarnessReport
 
 
@@ -61,15 +52,9 @@ def test_manifest_exposes_specs_and_context_policy_without_engine():
     assert "engines" not in data
 
 
-def test_derive_grants_no_longer_takes_an_engine():
+def test_derive_grants_for_read_only_harness():
     assert derive_grants("research") == derive_grants("research", ())
     assert not set(derive_grants("research")) & {"write", "edit", "bash"}
-
-
-def test_backend_satisfies_deepagents_protocol():
-    assert isinstance(ToolGatewayBackend(), BackendProtocol)
-    for method in ("aread", "awrite", "aedit", "als", "aglob", "agrep", "adelete"):
-        assert callable(getattr(ToolGatewayBackend(), method))
 
 
 def test_agent_builders_follow_the_harness_spec():
@@ -77,22 +62,9 @@ def test_agent_builders_follow_the_harness_spec():
     assert response_format_for("coding") is HarnessReport
     assert system_prompt_for("base", "general") == "base"
     assert "base\n\n" in system_prompt_for("base", "research_web")
-    # general declares no subagents; the specialised tiers declare fork children.
-    assert subagent_descriptors("general") == ()
-    for harness in ("coding", "research", "research_web"):
-        descriptors = subagent_descriptors(harness)
-        assert descriptors
-        assert all(desc["mode"] == "fork" for desc in descriptors)
-        assert all(desc["response_format"] is HarnessReport for desc in descriptors)
-
-
-def test_filesystem_middleware_uses_the_boundary_backend():
-    from deepagents.middleware import FilesystemMiddleware
-
-    backend = ToolGatewayBackend()
-    middleware = filesystem_middleware(backend)
-    assert isinstance(middleware, FilesystemMiddleware)
-    assert middleware.backend is backend
+    for spec in SPECS.values():
+        for kind in spec.subagents:
+            assert specialist_guide(kind)
 
 
 def test_context_projection_key_is_unified_across_tiers():

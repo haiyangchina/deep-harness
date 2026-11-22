@@ -390,18 +390,6 @@ class DelegationLedger:
                 )
             )
 
-    async def count_tools(self, admission_id):
-        async with self.store.engine.connect() as conn:
-            count = await conn.execute(
-                select(func.count())
-                .select_from(s.delegation_tool_receipts)
-                .join(
-                    s.delegations, s.delegations.c.id == s.delegation_tool_receipts.c.delegation_id
-                )
-                .where(s.delegations.c.admission_id == admission_id)
-            )
-            return count.scalar_one()
-
     async def list(self, session_id):
         async with self.store.engine.connect() as conn:
             rows = await conn.execute(

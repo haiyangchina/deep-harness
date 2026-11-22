@@ -3,7 +3,7 @@
 deep-harness 是可在本机或服务器运行的 Python Agent 宿主，提供 CLI、Windows 桌面端、免登录浏览器工作台和 REST/SSE API。CLI 默认使用本机 Ollama 的 `qwen3.5:9b`。各入口复用统一的会话授权、审批、回执和恢复机制。
 
 - [系统架构与技术实现](ARCHITECTURE.md)
-- [技术评审与优化路线](HARNESS_REVIEW.md)
+- [Web 接口与业务扩展](IMPLEMENTATION_SPEC.md)
 - [Windows 桌面端](desktop/README.md)
 - [开发状态](DEVELOPMENT.md)
 - [免登录服务器部署](deploy/README.md)

@@ -61,9 +61,3 @@ class ToolCall:
     id: str
     name: str
     arguments: dict
-
-
-@dataclass(frozen=True)
-class ToolOutcome:
-    content: str
-    status: str = "success"

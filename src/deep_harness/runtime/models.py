@@ -262,8 +262,6 @@ def ollama_model(
     # turns thinking ON for qwen3.5. In that mode the answer lives in Ollama's
     # `message.thinking` field, which langchain-ollama drops from streamed chunks;
     # the adapter then sees content="" and the run silently completes with no text.
-    # Guard the kwarg so older langchain-ollama releases stay usable.
-    options = {"reasoning": reasoning} if "reasoning" in ChatOllama.model_fields else {}
     hostname = urlsplit(base_url).hostname
     try:
         loopback = ip_address(hostname).is_loopback
@@ -279,7 +277,7 @@ def ollama_model(
             temperature=0,
             num_ctx=context_window_tokens,
             client_kwargs=client_kwargs,
-            **options,
+            reasoning=reasoning,
         ),
         request_timeout,
         identity={

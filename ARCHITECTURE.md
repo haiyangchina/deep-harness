@@ -4,9 +4,7 @@ deep-harness 是可在本机及服务器运行的通用 Agent 宿主。CLI、Win
 
 应用版本、业务库 schema 12、会话快照版本 4 和能力清单版本 2 各自演进。
 
-[技术评审与优化路线](HARNESS_REVIEW.md)对照主流 Agent Harness，记录当前缺陷、验证证据和改进优先级。
-
-[通用 Agent Harness 平台设计](PLATFORM_ARCHITECTURE.md)、[接口与实现规格](IMPLEMENTATION_SPEC.md)和[单实例部署](deploy/README.md)记录服务器 Web、LangChain 多模型、Docker 隔离和业务扩展。
+[Web 接口与业务扩展](IMPLEMENTATION_SPEC.md)和[单实例部署](deploy/README.md)记录服务器 Web、模型配置、Docker 隔离和业务扩展。
 
 ## 1. 系统架构
 
@@ -203,7 +201,7 @@ flowchart LR
 
 **长任务**由 `JobService` 和 `JobLedger` 调度。提交计划后按阶段创建独立会话及稳定的输入标识。任务预算先按阶段分配，再与单 admission 的限制取较小值。同组允许规则约束下的最多两路只读阶段，跨组按顺序推进，阶段模型调用共享应用内的一把锁。后续阶段接收有界的已完成报告与引用。可配置最终独立验收命令，验收读取实际工具回执、退出码，以及受管写入和命令的顺序。暂停在后续模型或工具边界落 checkpoint，未知、未验证或中断的阶段由调度器标为需要处理。
 
-**委派**由显式授权的 `delegate_task` 和 `check_delegation` 驱动。同步委派构造带独立图 thread 的子运行实例，使用父 admission claim、预算及受限工具交集，子审批向父图传递。后台委派经宿主创建独立会话和 admission，有自己的执行预算，支持查询、追加指令和停止。SDK 原生通用子 agent 被关闭，实际委派由项目运行时和持久台账负责。`subagent_descriptors()` 发布专业描述符，当前建图传入 `subagents=[]`。
+**委派**由显式授权的 `delegate_task` 和 `check_delegation` 驱动。同步委派构造带独立图 thread 的子运行实例，使用父 admission claim、预算及受限工具交集，子审批向父图传递。后台委派经宿主创建独立会话和 admission，有自己的执行预算，支持查询、追加指令和停止。委派类型由 HarnessSpec 声明，运行时使用专用提示和持久台账。
 
 来源见 [长任务编排](src/deep_harness/application/jobs.py)、[长任务台账](src/deep_harness/infrastructure/jobs.py)、[同步委派](src/deep_harness/runtime/deep.py)和[委派台账](src/deep_harness/infrastructure/delegations.py)。
 
@@ -221,10 +219,10 @@ flowchart LR
 
 | 领域 | 当前边界 |
 | --- | --- |
-| 执行框架 | 专业档位走 Deep，通用档位默认走 Standard。Deep 继续使用请求级上下文投影，Standard 继续使用持久整轮归档。`ToolGatewayBackend` 当前是中性协议实现，生产 Deep 图实际装配 `StateBackend`。 |
+| 执行框架 | 专业档位走 Deep，通用档位默认走 Standard。Deep 使用请求级上下文投影，图内文件使用 SDK `StateBackend`。Standard 使用持久整轮归档。 |
 | 可靠性 | 双库、模型回执和工具台账提供可追踪的恢复边界。外部调用的实际结果可能早于回执持久化，出现未知结果时由人工对账。 |
-| 工作区 | 文件工具受路径和哈希约束，Shell 运行在当前用户权限下。项目现有搜索按文件扫描，缺少语言符号索引。多文件补丁的原子性在单文件层面。 |
-| 部署 | 当前面向单机、每 Profile 单 owner。远程多用户、通用 DAG、单独常驻调度后端和交互式 OAuth 登录仍在现有覆盖范围之外。 |
+| 工作区 | 文件工具受路径和哈希约束。本地 Shell 使用当前用户权限，Web Shell 在配置的 Docker 工作区运行。搜索按文件扫描，多文件补丁逐文件原子替换。 |
+| 部署 | Web 单 worker 持有实例状态卷。每个 Profile 由独立 owner 持有。Web 访问范围由部署网络界定，访问者共享实例状态和操作能力。 |
 | 实验集成 | Pi 搜索受供应商、公网和本机 Node 运行条件影响。显式启用的第三方 MCP 和远端提取由所配置服务决定运行范围。 |
 
 后端通过专用 Conda Python 3.12 运行 `scripts/run_tests.sh`。桌面通过 `npm test` 验证本机 Python 连接、审批和重启恢复，通过 `npm run typecheck` 检查类型。离线模型及本机集成、真实 Ollama、公网供应商和全新 Windows 便携包分别验收。[开发状态](DEVELOPMENT.md)

@@ -28,8 +28,7 @@ import { TaskInspector } from './task-inspector'
 import { webResultStatus } from './web-result'
 import './styles.css'
 
-// Injected by build.mjs from package.json so the sidebar label always matches
-// the packaged version instead of drifting like the old hard-coded "v0.1".
+// build.mjs injects the package version.
 declare const __APP_VERSION__: string
 
 const starters = [

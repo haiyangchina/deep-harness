@@ -101,7 +101,7 @@ config.local.*
 db.sqlite3
 db.sqlite3-journal
 
-# 运行时状态目录（业务库、检查点、WAL/SHM、迁移备份、令牌）
+# 运行时状态目录（业务库、检查点、归档、产物、令牌）
 /.state/
 
 # 数据 / 模型 / 大文件

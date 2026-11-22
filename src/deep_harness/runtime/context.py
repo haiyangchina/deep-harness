@@ -144,9 +144,7 @@ class ContextProjector:
         while over(remaining):
             turn, rest = first_turn(remaining)
             if not turn or any(message["id"] == f"{claim.admission.id}:user" for message in turn):
-                # No completed turn is left to archive. Clip oversized tool results in the
-                # projection instead of leaving the session permanently stuck: previously
-                # every further model call failed with context_budget_exhausted.
+                # With no completed turn to archive, trim oversized tool results.
                 clipped = clip_tool_outputs(remaining, lambda rows: not over(rows))
                 if clipped is None:
                     raise DomainError(

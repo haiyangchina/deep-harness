@@ -18,7 +18,7 @@ requirements, and update the manifest and lock; do not ask again for routine add
 - Record new dependencies in pyproject.toml and refresh the environment lock.
 - Report experimental features and missing parity honestly in DEVELOPMENT.md.
 
-## 版本号规则（2026-11-22 起）
+## 版本号规则
 
 当前生效版本为 **v1.1.4**。
 只有用户明确要求修改版本号时才改版本。
@@ -44,4 +44,4 @@ requirements, and update the manifest and lock; do not ask again for routine add
 
 - 研究 Harness 的只读授权由 HarnessSpec 和 capabilities 派生，入口与网关均检查授权。
 - 联网工具显式归入 internet:external，普通工作区文件读取免批，工作区外及敏感路径受权限模式约束。
-- 业务库初始化与读取仅接受当前 schema，历史数据由用户独立保管。
+- 业务库初始化与读取仅接受当前 schema。

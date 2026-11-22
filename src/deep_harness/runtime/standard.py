@@ -6,12 +6,10 @@ from typing import Annotated, TypedDict
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 from pydantic import ValidationError
-from sqlalchemy import select
 
 from deep_harness.application.tools import ToolGateway, tool_definitions
 from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import DomainError, ToolCall
-from deep_harness.infrastructure import schema as s
 from deep_harness.infrastructure.branches import BranchLedger
 from deep_harness.runtime.approval_checkpoint import (
     interrupt_outcome,
@@ -253,13 +251,3 @@ class StandardRuntime:
         if result.get("__interrupt__"):
             return interrupt_outcome(result["__interrupt__"], self.claim.admission.generation)
         return {"status": "completed", "result": result["messages"][-1]["content"]}
-
-    async def open_interactions(self) -> list[dict]:
-        async with self.store.engine.connect() as conn:
-            rows = await conn.execute(
-                select(s.interactions).where(
-                    s.interactions.c.session_id == self.session.id,
-                    s.interactions.c.decision.is_(None),
-                )
-            )
-            return [dict(row) for row in rows.mappings()]

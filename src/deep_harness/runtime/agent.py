@@ -1,4 +1,4 @@
-"""Deep Agents registration, prompts and specialist descriptors."""
+"""Deep Agents registration and prompts for the active runtimes."""
 
 from deepagents.middleware import FilesystemMiddleware
 from deepagents.profiles import (
@@ -43,12 +43,6 @@ def filesystem_middleware(backend) -> FilesystemMiddleware:
     return FilesystemMiddleware(backend=backend, tools=["read_file"])
 
 
-# Specialist descriptors are declared by HarnessSpec, not duplicated across the
-# runtime. ``mode="fork"`` is the contract-critical choice: fork children inherit
-# this graph's guard middleware (approval / receipts / fencing / recovery).
-# The ledger-backed delegation path in runtime/deep.py consumes these descriptors
-# to create durable child sessions with their own checkpoints, so background
-# work, steering and exactly-once effect accounting remain intact.
 SUBAGENT_GUIDES: dict[str, str] = {
     "research": (
         "Research this bounded question using only the granted sources. "
@@ -60,22 +54,6 @@ SUBAGENT_GUIDES: dict[str, str] = {
         "and report actual changes and test results."
     ),
 }
-
-
-def subagent_descriptors(harness: str) -> tuple[dict, ...]:
-    """Fork-mode specialist descriptors authorised for a harness tier."""
-    descriptors = []
-    for kind in spec_for(harness).subagents:
-        descriptors.append(
-            {
-                "name": kind,
-                "description": SUBAGENT_GUIDES[kind],
-                "system_prompt": SUBAGENT_GUIDES[kind],
-                "mode": "fork",
-                "response_format": HarnessReport,
-            }
-        )
-    return tuple(descriptors)
 
 
 def specialist_guide(kind: str) -> str:
