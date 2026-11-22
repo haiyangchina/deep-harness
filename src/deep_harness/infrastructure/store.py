@@ -213,6 +213,7 @@ class BusinessStore:
         harness: str = "general",
         permission_mode: str = "legacy",
         runtime_snapshot: dict | None = None,
+        compatible_runtime_hashes: tuple[str, ...] = (),
     ) -> Session:
         tools = tuple(sorted(set(tools)))
         creation = {"prompt": prompt, "tools": tools, "engine": engine}
@@ -251,7 +252,9 @@ class BusinessStore:
                             "runtime_unbound",
                             "Inspect and explicitly bind this legacy session before execution",
                         )
-                    if binding != fingerprint(runtime_snapshot):
+                    if binding != fingerprint(runtime_snapshot) and (
+                        binding not in compatible_runtime_hashes
+                    ):
                         raise DomainError(
                             "idempotency_conflict", "Creation runtime parameters changed"
                         )
@@ -414,17 +417,17 @@ class BusinessStore:
                 )
             ).scalar_one_or_none()
 
-    async def history(self, session_id: str) -> list[dict]:
+    async def history(self, session_id: str, *, admission_id=None) -> list[dict]:
+        query = (
+            select(s.messages.c.payload)
+            .join(s.admissions, s.admissions.c.id == s.messages.c.admission_id)
+            .where(s.messages.c.session_id == session_id)
+            .order_by(s.admissions.c.ordinal, s.messages.c.ordinal)
+        )
+        if admission_id is not None:
+            query = query.where(s.messages.c.admission_id == admission_id)
         async with self.engine.connect() as conn:
-            rows = await conn.execute(
-                select(s.messages.c.payload)
-                .join(s.admissions, s.admissions.c.id == s.messages.c.admission_id)
-                .where(
-                    s.messages.c.session_id == session_id,
-                )
-                .order_by(s.admissions.c.ordinal, s.messages.c.ordinal)
-            )
-            return list(rows.scalars())
+            return list((await conn.execute(query)).scalars())
 
     async def live_history(self, session_id, *, after=None, before=None, limit=LIVE_PAGE_SIZE):
         """Tail or append-only cursor over all committed messages, including active turns."""

@@ -2,6 +2,7 @@
 
 import hashlib
 import os
+import re
 import stat
 import tempfile
 from pathlib import Path
@@ -141,6 +142,42 @@ def atomic_write(target: Path, data: bytes):
             temporary.unlink(missing_ok=True)
 
 
+def replace_text(text: str, old: str, new: str) -> str:
+    start = text.find(old)
+    if start > 0 and text[start - 1 : start + 1] == "\r\n":
+        start = -1
+    if start >= 0:
+        if start != text.rfind(old):
+            raise DomainError("edit_match", "Expected one exact match; found multiple.")
+        end = start + len(old)
+    else:
+        normalized = text.replace("\r\n", "\n")
+        needle = old.replace("\r\n", "\n")
+        index = normalized.find(needle)
+        if index < 0 or index != normalized.rfind(needle):
+            raise DomainError(
+                "edit_match", "Expected one match after newline normalization; read unique context."
+            )
+        # Solve for both raw offsets in one pass over CRLF positions.
+        start, end = index, index + len(needle)
+        for match in re.finditer("\r\n", text):
+            if match.start() < start:
+                start += 1
+            if match.start() >= end:
+                break
+            end += 1
+    if "\n" in new:
+        region = text[start:end]
+        styles = set(re.findall(r"\r?\n", region))
+        if not styles:
+            styles = set(re.findall(r"\r?\n", text))
+        if len(styles) > 1:
+            raise DomainError("edit_match", "Mixed newline styles; narrow the edit.")
+        if styles:
+            new = new.replace("\r\n", "\n").replace("\n", next(iter(styles)))
+    return text[:start] + new + text[end:]
+
+
 def mutate(arguments: WriteArgs | EditArgs, workspace_path):
     target = workspace_path(arguments.path)
     current = read_bytes(target) if target.exists() else None
@@ -150,15 +187,9 @@ def mutate(arguments: WriteArgs | EditArgs, workspace_path):
     if isinstance(arguments, EditArgs):
         if current is None:
             raise DomainError("not_file", "Cannot edit a missing file")
-        text = text_content(current)
-        first = text.find(arguments.old_text)
-        if first == -1 or first != text.rfind(arguments.old_text):
-            raise DomainError(
-                "edit_match",
-                f"Expected one exact match; found {'zero' if first == -1 else 'multiple'}. "
-                "Read the file and provide unique context.",
-            )
-        data = text.replace(arguments.old_text, arguments.new_text, 1).encode("utf-8")
+        data = replace_text(text_content(current), arguments.old_text, arguments.new_text).encode(
+            "utf-8"
+        )
     else:
         if current is not None and arguments.expected_sha256 is None:
             raise DomainError("file_conflict", "Overwriting requires the SHA-256 from read")

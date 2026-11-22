@@ -161,6 +161,8 @@ class ReceiptLedger:
         key: str,
         digest: str,
         proposal: dict,
+        *,
+        before_open=None,
     ) -> str | None:
         async with self.store.transaction() as conn:
             await self.executions.assert_claim(conn, claim)
@@ -179,6 +181,8 @@ class ReceiptLedger:
                 if row["proposal_hash"] != digest:
                     raise DomainError("interaction_conflict", "Approval proposal changed")
                 return row["decision"]
+            if before_open is not None:
+                await before_open()
             await conn.execute(
                 insert(s.interactions).values(
                     id=key,

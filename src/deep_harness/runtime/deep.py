@@ -20,6 +20,7 @@ from langgraph.types import interrupt
 from pydantic import ValidationError
 from sqlalchemy import select
 
+from deep_harness.application.coding_evidence import coding_evidence
 from deep_harness.application.tools import ToolGateway, tool_definitions
 from deep_harness.application.workspace import CODING_TOOLS, READ_TOOLS
 from deep_harness.domain.identity import fingerprint
@@ -34,9 +35,10 @@ from deep_harness.runtime.approval_checkpoint import (
     resume_command,
 )
 from deep_harness.runtime.context import summarize
-from deep_harness.runtime.harnesses import harness_prompt, parse_report
+from deep_harness.runtime.harnesses import HarnessReport, harness_prompt, parse_report
 from deep_harness.runtime.inference import normalized_usage, usage_totals
 from deep_harness.runtime.models import LangChainModel, model_errors, to_langchain
+from deep_harness.server_config import number
 
 
 class ReceiptedModel(AgentMiddleware):
@@ -178,6 +180,7 @@ class DeepRuntime:
         delegation_id=None,
         model_lock=None,
         pause_probe=None,
+        snapshot_version=4,
         tool_lock=None,
         background_launcher=None,
     ):
@@ -200,7 +203,10 @@ class DeepRuntime:
         self.model = model
         self.saver = saver
         self.mcp = mcp
-        self.tool_specs = tool_definitions(session.tools, mcp_bindings)
+        self.snapshot_version = snapshot_version
+        self.tool_specs = tool_definitions(
+            session.tools, mcp_bindings, snapshot_version=snapshot_version
+        )
         self.gateway = ToolGateway(
             scope,
             session,
@@ -407,6 +413,7 @@ class DeepRuntime:
             mcp_bindings=self.gateway.mcp_bindings,
             web_client=self.gateway.web_client,
             record_messages=False,
+            snapshot_version=self.snapshot_version,
             delegation_id=delegation["id"],
             model_lock=self.model_lock,
             tool_lock=self.tool_lock,
@@ -457,7 +464,7 @@ class DeepRuntime:
                 scope_key=scope_key,
                 reusable=can_reuse,
             )
-        decision = await self.receipts.interaction(self.claim, key, digest, proposal)
+        decision = await self.gateway.interaction(call, key, digest, proposal)
         if decision is None:
             interrupt(
                 {
@@ -468,32 +475,160 @@ class DeepRuntime:
                     "generation": self.claim.admission.generation,
                 }
             )
-            decision = await self.receipts.interaction(self.claim, key, digest, proposal)
+            decision = await self.gateway.interaction(call, key, digest, proposal)
         if decision is None:
             raise DomainError("approval_missing", "No durable approval decision exists")
         return decision == "approve"
 
-    async def run(self, *, resume=False):
-        if resume:
-            value = resume_command(await self.graph.aget_state(self.config))
-        else:
-            checkpoint = await self.graph.aget_state(self.config)
-            inherited = (
-                [] if checkpoint.values else await BranchLedger(self.store).seed(self.session.id)
-            )
-            value = {
-                "messages": [
-                    *(to_langchain(message) for message in inherited),
-                    HumanMessage(
-                        id=f"{self.claim.admission.id}:user", content=self.claim.admission.text
-                    ),
-                ]
+    async def _repair_report(self, answer, evidence):
+        limit = number("harness_report.repair_input_chars")
+        prompt = (
+            "Reformat the previous coding answer into the supplied JSON schema. "
+            "Return only a JSON object. Use the same language. Use receipts as evidence. "
+            "Do not claim any action beyond the previous answer and receipts. "
+            + json.dumps(HarnessReport.model_json_schema(), ensure_ascii=False)
+        )
+        messages = [
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "answer": str(answer)[:limit],
+                        "receipts_excerpt": json.dumps(evidence, ensure_ascii=False)[:limit],
+                    },
+                    ensure_ascii=False,
+                ),
             }
-        result = await self.graph.ainvoke(value, config=self.config, durability="sync")
-        if result.get("__interrupt__"):
-            return interrupt_outcome(result["__interrupt__"], self.claim.admission.generation)
-        answer = result["messages"][-1].content
-        if self.session.harness != "general":
+        ]
+        input_bytes = len(prompt.encode()) + len(messages[0]["content"].encode())
+        model_budget = self.model.context_budget_bytes
+        if len(prompt) + len(messages[0]["content"]) > self.limits.max_context_characters or (
+            model_budget is not None and input_bytes > model_budget
+        ):
+            return None
+        digest = fingerprint({"prompt": prompt, "messages": messages})
+        key = f"{self.claim.admission.id}:coding:report:{digest[:32]}"
+        async with self.model_lock:
+            saved = await self.receipts.model_result(key, digest)
+            if saved is None:
+                totals = await usage_totals(self.store, self.session.id, self.claim.admission.id)
+                if (
+                    totals["model_calls"] >= self.limits.max_model_calls
+                    or totals["total_tokens"] >= self.limits.max_run_tokens
+                ):
+                    return None
+                await pause_at_boundary(self.pause_probe, self.claim.admission.generation)
+                try:
+                    async with asyncio.timeout(
+                        min(self.request_timeout, number("harness_report.repair_timeout_seconds"))
+                    ):
+                        saved = await self.model.complete(prompt, messages, ())
+                except Exception:
+                    # Only the provider request is optional. Ledger failures still propagate.
+                    saved = {"content": "", "tool_calls": []}
+                saved["usage"] = normalized_usage(saved, prompt, messages)
+                await self.receipts.save_model(
+                    self.claim, key, digest, saved, append_to_history=False
+                )
+            if (await usage_totals(self.store, self.session.id, self.claim.admission.id))[
+                "total_tokens"
+            ] > self.limits.max_run_tokens:
+                return None
+        if saved.get("tool_calls"):
+            return None
+        return saved.get("content")
+
+    async def _coding_report(self, answer):
+        messages = await self.store.history(self.session.id, admission_id=self.claim.admission.id)
+        files, commands, last_write = coding_evidence(messages)
+        evidence = {
+            "files": files,
+            "commands": [
+                {
+                    "receipt_id": command["receipt_id"],
+                    "command": str(
+                        command["arguments"].get("command") or command["arguments"].get("argv")
+                    )[:300],
+                    "exit_code": command["exit_code"],
+                    "purpose": command["arguments"].get("purpose", "general"),
+                    "after_file_edits": command["batch"] > last_write,
+                }
+                for command in commands
+            ],
+        }
+        report_status = "valid"
+        try:
+            report = json.loads(parse_report(answer))
+        except DomainError:
+            repaired = await self._repair_report(
+                answer, {key: rows[-16:] for key, rows in evidence.items()}
+            )
+            try:
+                report = json.loads(parse_report(repaired))
+                report_status = "repaired"
+            except DomainError:
+                report = HarnessReport(
+                    summary="Coding report could not be formatted.",
+                    evidence=[],
+                    changes=[],
+                    tests=[],
+                    limitations=[],
+                ).model_dump()
+                report_status = "unavailable"
+        report["tests"] = [
+            f"{row['command']} (exit {row['exit_code']}, receipt {row['receipt_id']})"
+            for row in evidence["commands"]
+            if row["purpose"] in {"reproduce", "verify"} and type(row["exit_code"]) is int
+        ][-number("harness_report.tests_max_length") :]
+        if files:
+            report["changes"] = [f"{row['path']} (SHA-256 {row['sha256']})" for row in files][
+                -number("harness_report.changes_max_length") :
+            ]
+        return json.dumps(
+            {**report, "report_status": report_status, "execution_evidence": evidence},
+            ensure_ascii=False,
+        )
+
+    async def run(self, *, resume=False):
+        checkpoint = await self.graph.aget_state(self.config)
+        history = checkpoint.values.get("messages", [])
+        admission_message_id = f"{self.claim.admission.id}:user"
+        if (
+            self.session.harness == "coding"
+            and not checkpoint.next
+            and history
+            and isinstance(history[-1], AIMessage)
+            and not history[-1].tool_calls
+            and any(message.id == admission_message_id for message in history)
+        ):
+            answer = history[-1].content
+        else:
+            if self.session.harness == "coding" and await self.executions.report_pending(
+                self.claim.admission
+            ):
+                raise DomainError("harness_output", "Coding graph checkpoint is unavailable")
+            if resume:
+                value = resume_command(checkpoint)
+            else:
+                inherited = (
+                    []
+                    if checkpoint.values
+                    else await BranchLedger(self.store).seed(self.session.id)
+                )
+                value = {
+                    "messages": [
+                        *(to_langchain(message) for message in inherited),
+                        HumanMessage(id=admission_message_id, content=self.claim.admission.text),
+                    ]
+                }
+            result = await self.graph.ainvoke(value, config=self.config, durability="sync")
+            if result.get("__interrupt__"):
+                return interrupt_outcome(result["__interrupt__"], self.claim.admission.generation)
+            answer = result["messages"][-1].content
+        if self.session.harness == "coding":
+            await self.executions.report_checkpoint(self.claim)
+            answer = await self._coding_report(answer)
+        elif self.session.harness != "general":
             answer = parse_report(answer)
         return {"status": "completed", "result": answer}
 

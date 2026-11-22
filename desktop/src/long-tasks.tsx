@@ -10,7 +10,8 @@ interface Summary {
 
 interface Stage {
   position: number
-  definition: { title: string; goal: string; acceptance: string }
+  definition: { title: string; goal: string; acceptance: string; verify?: boolean }
+  verification?: { receipt_id: string; exit_code: number | null } | null
   session_id: string | null
   admission_status: string | null
   verified: boolean
@@ -38,7 +39,7 @@ const statusLabel: Record<string, string> = {
 }
 
 function newStage(title = '') {
-  return { id: crypto.randomUUID(), title, goal: '', acceptance: '', read_only: false, verify: false, group: '' }
+  return { id: crypto.randomUUID(), title, goal: '', acceptance: '', read_only: false, verify: false, verification_command: '', group: '' }
 }
 
 export function LongTasks({ openStage }: { openStage: (id: string) => void }) {
@@ -97,7 +98,8 @@ export function LongTasks({ openStage }: { openStage: (id: string) => void }) {
           request_id: requestId, goal, engine, parallelism: parallel ? defaults?.parallelism_max : undefined,
           budget: seconds === null ? undefined : { wall_seconds: seconds },
           stages: stages.map(({ id: _id, group, ...row }) => ({
-            ...row, group: !parallel || group === '' ? null : Number(group),
+            ...row, verification_command: row.verify ? row.verification_command.trim() || null : null,
+            group: !parallel || group === '' ? null : Number(group),
           })),
         })
         setCurrent(created)
@@ -154,6 +156,11 @@ export function LongTasks({ openStage }: { openStage: (id: string) => void }) {
             onChange={event => updateStage(stage.id, { read_only: event.target.checked, verify: false })} /> 只读</label>
           <label><input type="checkbox" checked={stage.verify} disabled={stage.read_only}
             onChange={event => updateStage(stage.id, { verify: event.target.checked })} /> 要求成功的命令回执</label>
+          {stage.verify && (
+            <label>指定验收命令（可选）<input value={stage.verification_command}
+              onChange={event => updateStage(stage.id, { verification_command: event.target.value })}
+              placeholder="留空时使用阶段最后一条命令" /></label>
+          )}
           {parallel && <label>组号（相同组号并行，留空顺序执行）<input type="number" min={0} value={stage.group}
             onChange={event => updateStage(stage.id, { group: event.target.value })} /></label>}
           {stages.length > 1 && <button type="button" onClick={() => {
@@ -181,6 +188,9 @@ export function LongTasks({ openStage }: { openStage: (id: string) => void }) {
           <legend>{stage.position + 1}. {stage.definition.title}</legend>
           <p>{stage.verified ? '已验收' : statusLabel[stage.admission_status ?? ''] ?? '未开始'}</p>
           <p>{stage.report?.summary ?? stage.definition.goal}</p>
+          {stage.verification && (
+            <p className="muted small">验收退出码 {stage.verification.exit_code ?? '未取得'} · {stage.verification.receipt_id}</p>
+          )}
           {stage.report?.artifacts.map((artifact, index) => <p key={index}>{artifact}</p>)}
           {stage.evidence?.effects.map(effect => <p key={effect.id}>{effect.id} · {effect.status}</p>)}
           {stage.session_id && <button onClick={() => openStage(stage.session_id!)}>查看阶段会话和审批</button>}

@@ -5,16 +5,25 @@ import hashlib
 import json
 import os
 import tempfile
+from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Literal
 
-from filelock import FileLock
+from filelock import AsyncFileLock, FileLock
 from jsonschema import Draft202012Validator
 from jsonschema import ValidationError as JsonSchemaError
 from pydantic import BaseModel, ConfigDict, Field
 
-from deep_harness.application.atomic_files import EditArgs, ReadArgs, WriteArgs, mutate, read
+from deep_harness.application.atomic_files import (
+    EditArgs,
+    ReadArgs,
+    WriteArgs,
+    atomic_write,
+    mutate,
+    read,
+)
 from deep_harness.application.capabilities import READ_ONLY_SCOPES
+from deep_harness.application.patches import PatchArgs, prepare_file
 from deep_harness.application.permissions import approval_reason, approval_scope, sensitive_path
 from deep_harness.application.shell import BashArgs, bash, shell_command
 from deep_harness.application.terminal import CommandArgs, run_command, validate_command
@@ -75,6 +84,7 @@ TOOL_ARGUMENTS = {
     "read": ReadArgs,
     "write": WriteArgs,
     "edit": EditArgs,
+    "apply_patch": PatchArgs,
     "bash": BashArgs,
     "list_files": ListFilesArgs,
     "search_files": SearchFilesArgs,
@@ -101,6 +111,14 @@ TOOL_DESCRIPTIONS = {
         "Zero or multiple matches fail without changing the file. Preserve all other bytes. "
         "Optional expected_sha256 rejects stale content. Requires approval."
     ),
+    "apply_patch": (
+        "Apply a multi-file UTF-8 patch. Read each existing file, then copy its exact sha256 "
+        "into expected_sha256. Use null only for a new path. Provide unified @@ hunks, "
+        "optionally with matching --- and +++ headers. A one-line replacement example: "
+        "'@@ -1 +1 @@\\n-old\\n+new\\n'. "
+        "All baselines and hunks are checked before approval and again before writing. "
+        "Updates and creates files; does not delete or move paths."
+    ),
     "bash": (
         "Execute a shell command in workspace-relative cwd, subject to the session "
         "approval mode. Supports pipes, redirects and PATH commands. auto uses PowerShell "
@@ -116,7 +134,7 @@ TOOL_DESCRIPTIONS = {
     ),
     "search_files": (
         "Search literal text in bounded UTF-8 workspace files. Returns paths, line numbers "
-        "and excerpts. Narrow path/pattern when truncated."
+        "and excerpts. Pass next_cursor with the same path, pattern and query to continue."
     ),
     "read_file": (
         "Read a workspace-relative UTF-8 file by start_line/max_lines. Returns bounded content, "
@@ -143,15 +161,25 @@ TOOL_DESCRIPTIONS = {
 TOOL_DESCRIPTIONS.update(WEB_TOOL_DESCRIPTIONS)
 
 
-def tool_definitions(names: tuple[str, ...], mcp_catalog=None) -> list[dict]:
+def tool_definitions(names: tuple[str, ...], mcp_catalog=None, *, snapshot_version=4) -> list[dict]:
     definitions = []
     for name in sorted(names):
         if name in TOOL_ARGUMENTS:
+            description = TOOL_DESCRIPTIONS[name]
+            parameters = TOOL_ARGUMENTS[name].model_json_schema()
+            if name == "bash" and snapshot_version < 4:
+                parameters["properties"].pop("purpose")
+            if name == "search_files" and snapshot_version < 4:
+                parameters["properties"].pop("cursor")
+                description = (
+                    "Search literal text in bounded UTF-8 workspace files. Returns paths, line "
+                    "numbers and excerpts. Narrow path/pattern when truncated."
+                )
             definitions.append(
                 {
                     "name": name,
-                    "description": TOOL_DESCRIPTIONS[name],
-                    "parameters": TOOL_ARGUMENTS[name].model_json_schema(),
+                    "description": description,
+                    "parameters": parameters,
                 }
             )
         elif mcp_catalog is not None and name in mcp_catalog:
@@ -229,6 +257,18 @@ class ToolGateway:
         """Return (scope_key, decision, reusable) for this call."""
         return approval_scope(call, self.session, self.scope, self.path)
 
+    async def interaction(self, call, key, digest, proposal):
+        before_open = None
+        if call.name == "apply_patch":
+
+            async def before_open():
+                arguments = self.validate(call)
+                await asyncio.to_thread(self._patch_plan, arguments)
+
+        return await self.receipts.interaction(
+            self.claim, key, digest, proposal, before_open=before_open
+        )
+
     async def execute(self, call: ToolCall) -> str:
         arguments = self.validate(call)
         await self._preflight(call, arguments)
@@ -252,10 +292,12 @@ class ToolGateway:
             await self.receipts.dispatch_effect(self.claim, key, approval=approval, audit=audit)
             dispatched = True
 
-        if call.name not in self.mcp_bindings:
+        if call.name not in self.mcp_bindings and call.name != "apply_patch":
             await dispatch()
         try:
-            if call.name in self.mcp_bindings:
+            if call.name == "apply_patch":
+                result = await self._apply_patch(arguments, key, dispatch)
+            elif call.name in self.mcp_bindings:
                 result = await self.mcp.call(
                     call.name,
                     arguments,
@@ -268,7 +310,8 @@ class ToolGateway:
             if not dispatched:
                 if isinstance(exc, DomainError):
                     raise
-                raise DomainError("mcp_unavailable", "MCP tool preparation failed") from exc
+                category = "patch_preflight" if call.name == "apply_patch" else "mcp_unavailable"
+                raise DomainError(category, "Tool preparation failed before dispatch") from exc
             refused = isinstance(exc, DomainError) and exc.code in {
                 "file_conflict",
                 "edit_match",
@@ -288,7 +331,9 @@ class ToolGateway:
                 "web_backend",
                 "web_error",
             }
-            if not refused and (call.name in MUTATING_TOOLS or (call.name in self.mcp_bindings)):
+            if call.name == "apply_patch" or (
+                not refused and (call.name in MUTATING_TOOLS or call.name in self.mcp_bindings)
+            ):
                 if isinstance(exc, TimeoutError) and isinstance(arguments, (BashArgs, CommandArgs)):
                     detail = f"工具 {call.name} 执行超时（{arguments.timeout_seconds:g} 秒）"
                 else:
@@ -364,13 +409,87 @@ class ToolGateway:
         handler = {"read_file": self._read, "write_file": self._write}[name]
         return await asyncio.to_thread(handler, arguments)
 
-    def _mutate(self, arguments, workspace_path):
-        # Serialize read/check/replace across profiles and workers using the same state root.
-        target = workspace_path(arguments.path)
+    def _patch_targets(self, arguments):
+        targets = {}
+        for patch in arguments.files:
+            path = Path(patch.path)
+            target = self.path(patch.path)
+            if (
+                path.anchor
+                or ".." in path.parts
+                or not target.is_relative_to(self.scope.workspace)
+                or os.path.normcase(str(self.scope.workspace / path))
+                != os.path.normcase(str(target))
+                or sensitive_path(target)
+            ):
+                raise DomainError("path_denied", "Patch requires ordinary workspace-relative paths")
+            if target in targets:
+                raise DomainError("patch_format", "Each patch target must be unique")
+            targets[target] = patch
+        return targets
+
+    def _patch_plan(self, arguments):
+        return {
+            target: prepare_file(target, patch)
+            for target, patch in self._patch_targets(arguments).items()
+        }
+
+    async def _patch_event(self, key, event, **payload):
+        async with self.receipts.store.transaction() as conn:
+            await self.receipts.executions.assert_claim(conn, self.claim)
+            await self.receipts.store.append_event(
+                conn, self.session.id, event, {"effect_id": key, **payload}
+            )
+
+    async def _apply_patch(self, arguments, key, dispatch):
+        targets = self._patch_targets(arguments)
+        async with AsyncExitStack() as locks:
+            for target in sorted(targets):
+                await locks.enter_async_context(
+                    AsyncFileLock(
+                        self._lock_path(target), timeout=number("files.write_lock_seconds")
+                    )
+                )
+            plan = await asyncio.to_thread(self._patch_plan, arguments)
+            if plan.keys() != targets.keys():
+                raise DomainError("file_conflict", "Patch targets changed during preflight")
+            files = [
+                {
+                    "path": patch.path,
+                    "expected_sha256": patch.expected_sha256,
+                    "sha256": hashlib.sha256(plan[target]).hexdigest(),
+                }
+                for target, patch in targets.items()
+            ]
+            await dispatch()
+            await self._patch_event(key, "patch.planned", files=files)
+            for (target, patch), evidence in zip(targets.items(), files, strict=True):
+                await self._patch_event(key, "patch.file_dispatched", **evidence)
+                writing = asyncio.create_task(
+                    asyncio.to_thread(self._write_patch_file, target, patch)
+                )
+                try:
+                    await asyncio.shield(writing)
+                except asyncio.CancelledError:
+                    await asyncio.gather(writing, return_exceptions=True)
+                    raise
+                await self._patch_event(key, "patch.file_written", **evidence)
+            return json.dumps({"files": files}, ensure_ascii=False)
+
+    def _write_patch_file(self, target, patch):
+        if self.path(patch.path) != target:
+            raise DomainError("file_conflict", "Patch target moved after approval")
+        atomic_write(target, prepare_file(target, patch))
+
+    def _lock_path(self, target):
         key = hashlib.sha256(os.path.normcase(str(target)).encode()).hexdigest()
         locks = self.scope.state_root / "file-locks"
         locks.mkdir(parents=True, exist_ok=True)
-        with FileLock(locks / f"{key}.lock", timeout=number("files.write_lock_seconds")):
+        return locks / f"{key}.lock"
+
+    def _mutate(self, arguments, workspace_path):
+        target = workspace_path(arguments.path)
+        with FileLock(self._lock_path(target), timeout=number("files.write_lock_seconds")):
             return mutate(arguments, workspace_path)
 
     def _read(self, arguments: ReadFileArgs) -> str:

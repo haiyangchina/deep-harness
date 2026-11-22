@@ -342,8 +342,38 @@ class ExecutionLedger:
                     )
                 )
 
+    async def report_checkpoint(self, claim):
+        async with self.store.transaction() as conn:
+            await self.assert_claim(conn, claim)
+            if not await self._has_report_checkpoint(conn, claim.admission):
+                await self.store.append_event(
+                    conn,
+                    claim.admission.session_id,
+                    "coding.report_pending",
+                    {"admission_id": claim.admission.id},
+                )
+
+    async def report_pending(self, admission):
+        async with self.store.engine.connect() as conn:
+            return await self._has_report_checkpoint(conn, admission)
+
+    @staticmethod
+    async def _has_report_checkpoint(conn, admission):
+        return (
+            await conn.scalar(
+                select(s.events.c.seq)
+                .where(
+                    s.events.c.session_id == admission.session_id,
+                    s.events.c.type == "coding.report_pending",
+                    s.events.c.payload["admission_id"].as_string() == admission.id,
+                )
+                .limit(1)
+            )
+            is not None
+        )
+
     async def recover(self) -> list[str]:
-        """A crashed started execution is uncertain; never silently requeue it."""
+        """Recover only work that completed its graph and has no outstanding effect."""
         async with self.store.transaction() as conn:
             rows = (
                 (
@@ -357,18 +387,29 @@ class ExecutionLedger:
                 .all()
             )
             for row in rows:
+                admission = admission_from(row)
+                pending_effect = await conn.scalar(
+                    select(s.effects.c.id)
+                    .where(
+                        s.effects.c.admission_id == admission.id,
+                        s.effects.c.status == "dispatched",
+                    )
+                    .limit(1)
+                )
+                report_only = pending_effect is None and await self._has_report_checkpoint(
+                    conn, admission
+                )
+                status = "queued" if report_only else "unknown"
                 await conn.execute(
                     update(s.admissions)
-                    .where(
-                        s.admissions.c.id == row["id"],
-                    )
-                    .values(status="unknown", owner=None)
+                    .where(s.admissions.c.id == admission.id)
+                    .values(status=status, owner=None)
                 )
                 await self.store.append_event(
                     conn,
-                    row["session_id"],
-                    "execution.unknown",
-                    {"admission_id": row["id"]},
+                    admission.session_id,
+                    f"execution.{status}",
+                    {"admission_id": admission.id},
                 )
             queued = await conn.execute(
                 select(s.admissions.c.session_id)

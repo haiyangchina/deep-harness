@@ -24,6 +24,10 @@ class BashArgs(BaseModel):
         default=number("shell.timeout_seconds"), ge=1, le=number("shell.timeout_seconds_max")
     )
     shell: Literal["auto", "bash", "powershell"] = "auto"
+    purpose: Literal["general", "reproduce", "verify"] = Field(
+        default="general",
+        description="Use reproduce for baseline tests and verify for tests after changes.",
+    )
 
 
 def shell_kind(kind):

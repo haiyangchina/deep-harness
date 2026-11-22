@@ -428,6 +428,12 @@ nav button span {
   margin: 10px 0 4px;
   line-height: 1.6;
 }
+.patch-preview pre {
+  overflow: auto;
+  max-height: 18rem;
+  white-space: pre;
+}
+
 .inspector {
   background: #12161b;
   border-left: 1px solid var(--line);

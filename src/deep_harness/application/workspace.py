@@ -1,12 +1,16 @@
 """Bounded, read-only workspace discovery for project analysis and coding."""
 
+import base64
+import binascii
 import fnmatch
+import json
 import os
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from deep_harness.application.capabilities import CORE_TOOLS, LEGACY_TOOLS, READ_ONLY_CORE
+from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import DomainError
 from deep_harness.server_config import number, setting
 
@@ -17,8 +21,9 @@ MUTATING_TOOLS = frozenset(set(CORE_TOOLS) - set(READ_ONLY_CORE)) | {
     "write_file",
     "run_command",
     "save_memory",
+    "apply_patch",
 }
-CODING_TOOLS = frozenset({*CORE_TOOLS, *LEGACY_TOOLS})
+CODING_TOOLS = frozenset({*CORE_TOOLS, *LEGACY_TOOLS, "apply_patch"})
 PROJECT_PROMPT = (
     "You are deep-harness, a careful coding and project analysis assistant. "
     "For project questions, inspect the configured workspace with list_files, then read "
@@ -57,6 +62,7 @@ class ListFilesArgs(BaseModel):
 
 class SearchFilesArgs(ListFilesArgs):
     query: str = Field(min_length=1, max_length=number("workspace.query_max_length"))
+    cursor: str | None = Field(default=None, max_length=32768)
 
 
 def workspace_files(arguments, workspace_path, candidate_path=None):
@@ -119,31 +125,103 @@ def list_files(arguments, workspace_path, candidate_path=None):
     return {"files": paths, "truncated": False}
 
 
+def search_entries(directory, prefix, after, candidate_path, workspace):
+    try:
+        with os.scandir(directory) as stream:
+            entries = sorted(stream, key=lambda entry: entry.name)
+    except OSError:
+        if not prefix:
+            raise
+        return
+    for entry in entries:
+        position = (*prefix, entry.name)
+        if position < after and after[: len(position)] != position:
+            continue
+        if entry.is_symlink():
+            continue
+        path = Path(entry.path)
+        is_directory = entry.is_dir(follow_symlinks=False)
+        if is_directory and (entry.name in SKIP_DIRECTORIES or path.is_junction()):
+            continue
+        relative = display_path(path, workspace)
+        try:
+            candidate_path(relative)
+        except DomainError:
+            continue
+        yield position, relative, is_directory
+        if is_directory:
+            yield from search_entries(path, position, after, candidate_path, workspace)
+
+
 def search_files(arguments, workspace_path, candidate_path=None):
     candidate_path = candidate_path or workspace_path
+    root = workspace_path(arguments.path)
+    if not root.is_dir():
+        raise DomainError("not_directory", "Choose a workspace directory")
+    identity = fingerprint([str(root), arguments.pattern, arguments.query])
+    position, start_line = (), 1
+    if arguments.cursor is not None:
+        try:
+            token, parts, start_line = json.loads(base64.urlsafe_b64decode(arguments.cursor))
+            if (
+                token != identity
+                or not isinstance(parts, list)
+                or not all(isinstance(part, str) and part for part in parts)
+                or type(start_line) is not int
+                or start_line < 1
+            ):
+                raise ValueError
+            position = tuple(parts)
+        except (ValueError, TypeError, binascii.Error) as exc:
+            raise DomainError("search_cursor", "Cursor does not match this search") from exc
+
     matches = []
-    scanned = 0
-    output_size = 0
-    for path in workspace_files(arguments, workspace_path, candidate_path):
-        if path is None or scanned >= number("workspace.search_max_files"):
-            return {"matches": matches, "truncated": True}
+    scanned = visited = output_size = 0
+
+    def page(reason=None, cursor=None, line=1):
+        return {
+            "matches": matches,
+            "scanned_files": scanned,
+            "truncated": reason is not None,
+            "truncated_reason": reason,
+            "next_cursor": (
+                base64.urlsafe_b64encode(json.dumps([identity, cursor, line]).encode()).decode()
+                if reason
+                else None
+            ),
+        }
+
+    workspace = workspace_path(".")
+    for current, path, directory in search_entries(root, (), position, candidate_path, workspace):
+        # Ancestor directories are visited only to reach the continuation point.
+        if current < position:
+            continue
+        if visited >= number("workspace.max_visited_entries"):
+            return page("visit_limit", current)
+        visited += 1
+        if directory or not fnmatch.fnmatch("/".join(current), arguments.pattern):
+            continue
+        if scanned >= number("workspace.search_max_files"):
+            return page("file_limit", current)
         scanned += 1
         try:
             with candidate_path(path).open("rb") as stream:
                 data = stream.read(number("workspace.search_max_file_bytes") + 1)
-            if len(data) > number("workspace.search_max_file_bytes") or b"\x00" in data:
+            if len(data) > number("workspace.search_max_file_bytes") or b"\\x00" in data:
                 continue
             lines = data.decode("utf-8").splitlines()
         except (DomainError, OSError, UnicodeError):
             continue
-        for line_number, line in enumerate(lines, 1):
+        first = start_line if current == position else 1
+        for line_number, line in enumerate(lines[first - 1 :], first):
             if arguments.query not in line:
                 continue
             text = line[: number("workspace.match_preview_chars")]
-            output_size += len(text.encode("utf-8")) + len(path.encode("utf-8")) + 80
-            if len(matches) >= arguments.max_results or output_size > number(
-                "workspace.output_max_bytes"
-            ):
-                return {"matches": matches, "truncated": True}
+            size = len(text.encode("utf-8")) + len(path.encode("utf-8")) + 80
+            if len(matches) >= arguments.max_results:
+                return page("result_limit", current, line_number)
+            if matches and output_size + size > number("workspace.output_max_bytes"):
+                return page("output_limit", current, line_number)
+            output_size += size
             matches.append({"path": path, "line": line_number, "text": text})
-    return {"matches": matches, "truncated": False}
+    return page()

@@ -28,7 +28,7 @@ class SessionRuntime:
         harness="general",
         knowledge=None,
         mcp_catalog=None,
-        version=3,
+        version=4,
     ):
         identity = dict(self.model.identity)
         if version == 1 and identity.get("provider") == "ollama":
@@ -38,7 +38,7 @@ class SessionRuntime:
             "engine": engine,
             "workspace": str(self.scope.workspace),
             "model": identity,
-            "tools": tool_definitions(tools, mcp_catalog),
+            "tools": tool_definitions(tools, mcp_catalog, snapshot_version=version),
             "execution": self.limits.model_dump(),
         }
         if version >= 3:
@@ -94,7 +94,7 @@ class SessionRuntime:
                 harness=session.harness,
                 knowledge=knowledge,
                 mcp_catalog=catalog,
-                version=binding["snapshot"].get("version", 1) if binding else 3,
+                version=binding["snapshot"].get("version", 1) if binding else 4,
             ),
         )
 
@@ -109,7 +109,7 @@ class SessionRuntime:
             harness=status["session"].harness,
             knowledge=knowledge,
             mcp_catalog=catalog,
-            version=binding["snapshot"].get("version", 1) if binding else 3,
+            version=binding["snapshot"].get("version", 1) if binding else 4,
         )
         saved = binding["snapshot"] if binding else {}
         status["runtime"] = {

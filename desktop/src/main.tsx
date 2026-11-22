@@ -60,6 +60,31 @@ const starters = [
 ]
 type Page = 'jobs' | 'chat' | 'capabilities' | 'skills' | 'memories' | 'mcp/tools' | 'settings'
 
+interface CodingReport {
+  report_status: 'valid' | 'repaired' | 'unavailable'
+  summary: string
+  execution_evidence: {
+    files: { path: string; sha256: string }[]
+    commands: {
+      receipt_id: string
+      command: string
+      exit_code: number | null
+      purpose?: 'general' | 'reproduce' | 'verify'
+    }[]
+  }
+}
+
+function readCodingReport(value?: string): CodingReport | null {
+  try {
+    const parsed = JSON.parse(value ?? '') as CodingReport
+    if (parsed?.report_status && Array.isArray(parsed.execution_evidence?.files) &&
+        Array.isArray(parsed.execution_evidence?.commands)) return parsed
+  } catch {
+    return null
+  }
+  return null
+}
+
 function Chat({ newSession }: { newSession: () => void }) {
   const conversation = useStore($conversation)
   const busy = useStore($busy)
@@ -80,6 +105,9 @@ function Chat({ newSession }: { newSession: () => void }) {
   }
   const status = conversation?.status
   const latest = status?.latest_admission
+  const codingReport = status?.session.harness === 'coding' && latest?.status === 'completed'
+    ? readCodingReport(latest.result)
+    : null
   const running = status?.active_admissions.some(a => ['queued', 'started', 'waiting_approval'].includes(a.status))
   // Only unknown/reconciled mean a write may have landed without a receipt. An
   // interrupted run is a deterministic local stop with no uncertain side effects.
@@ -208,6 +236,29 @@ function Chat({ newSession }: { newSession: () => void }) {
             <article className="message user">
               <div className="message-role">当前任务 · {latest.status}</div>
               <div className="message-content">{latest.text}</div>
+            </article>
+          )}
+          {codingReport && (
+            <article className="message assistant">
+              <div className="message-role">编码执行结果</div>
+              <div className="message-content">
+                <p>{codingReport.report_status === 'unavailable'
+                  ? '执行已结束，报告生成失败。' : codingReport.summary}</p>
+                {codingReport.execution_evidence.files.length > 0 && (
+                  <ul>{codingReport.execution_evidence.files.map(file => (
+                    <li key={file.path}>已修改 <code>{file.path}</code></li>
+                  ))}</ul>
+                )}
+                {codingReport.execution_evidence.commands.length > 0 && (
+                  <ul>{codingReport.execution_evidence.commands.map(command => (
+                    <li key={command.receipt_id}>
+                      {command.purpose === 'reproduce' ? '复现 · ' :
+                        command.purpose === 'verify' ? '验收 · ' : ''}
+                      <code>{command.command}</code> · 退出码 {command.exit_code ?? '未取得'}
+                    </li>
+                  ))}</ul>
+                )}
+              </div>
             </article>
           )}
           {running && deltas && (

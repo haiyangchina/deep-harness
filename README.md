@@ -470,6 +470,18 @@ HTTP 还提供 `GET .../delegations/{id}`、`POST .../delegations/{id}/steers`
 （`submission_id`、`text`）及 `POST .../delegations/{id}/stop`。单次 CLI 命令
 退出即关闭其 Profile owner；需要后台任务跨回合运行时，应保持 HTTP 服务或交互式进程常驻。
 
+Coding 会话可以用 `--allow-patch` 或在桌面新建会话时启用「多文件补丁」。
+`apply_patch` 的每个文件项包含工作区相对 `path`、`expected_sha256`
+（创建文件时为 `null`）以及 unified diff hunks，可带与路径一致的文件头。
+API 可通过创建会话的 `extensions: ["apply_patch"]` 授权。补丁展示逐文件差异和基线，
+并记录每个文件的写入进度。若执行结果待对账，请按活动事件与磁盘文件核对。
+
+`search_files` 返回 `next_cursor` 时，可用相同路径、pattern 和 query 继续搜索。
+Coding 完成结果中的 `report_status` 是报告状态，`execution_evidence` 包含实际文件回执
+和命令退出码。调用 `bash` 时可用 `purpose: "reproduce"` 标记修复前测试，
+或用 `purpose: "verify"` 标记验收。长任务可配置 `verification_command`，
+让阶段按全部修改后的指定命令回执验收。
+
 MCP 服务器由操作者写入 `.state/profiles/default/mcp.toml`，重启应用后生效。
 例如：
 

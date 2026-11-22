@@ -111,7 +111,12 @@ READ_ONLY_CORE: tuple[str, ...] = tuple(
     )
 )
 LEGACY_TOOLS: tuple[str, ...] = ("read_file", "write_file", "run_command")
-EXTENSION_TOOLS: tuple[str, ...] = ("save_memory", "delegate_task", "check_delegation")
+EXTENSION_TOOLS: tuple[str, ...] = (
+    "save_memory",
+    "delegate_task",
+    "check_delegation",
+    "apply_patch",
+)
 CAPABILITY_VERSION = 2
 
 # Harness names come from the domain type; the read-only subset is declared once
@@ -120,7 +125,7 @@ HARNESSES: tuple[str, ...] = get_args(Harness)
 READ_ONLY_HARNESSES: frozenset[str] = frozenset({"research", "research_web"})
 
 MUTATING_EXTENSIONS = frozenset(
-    {"save_memory", "write_file", "run_command", "write", "edit", "bash"}
+    {"save_memory", "write_file", "run_command", "write", "edit", "bash", "apply_patch"}
 )
 
 
@@ -238,8 +243,7 @@ def permission_policy() -> dict:
     return {
         "modes": [asdict(mode) for mode in PERMISSION_MODES],
         "access_scopes": [
-            {**asdict(scope), "scope_keys": list(scope.scope_keys)}
-            for scope in ACCESS_SCOPES
+            {**asdict(scope), "scope_keys": list(scope.scope_keys)} for scope in ACCESS_SCOPES
         ],
         "scope_keys": list(ALL_SCOPE_KEYS),
         "matrix": {

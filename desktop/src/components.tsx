@@ -158,12 +158,13 @@ export function CreateSession({ close }: { close: () => void }) {
   }, [])
   const extensionOptions = [
     ['save_memory', '保存记忆'],
+    ['apply_patch', '多文件补丁'],
     ['delegate_task', 'Deep 子任务']
   ] as const
   const visibleExtensions = extensionOptions.filter(
     ([tool]) =>
       !(engine === 'standard' && tool === 'delegate_task') &&
-      !((harness === 'research' || harness === 'research_web') && tool === 'save_memory')
+      !((harness === 'research' || harness === 'research_web') && (tool === 'save_memory' || tool === 'apply_patch'))
   )
   return (
     <div className="modal-backdrop">
@@ -247,7 +248,9 @@ export function CreateSession({ close }: { close: () => void }) {
                   engine,
                   harness,
                   permission_mode: permissionMode,
-                  extensions
+                  extensions: extensions.filter(tool =>
+                    visibleExtensions.some(([name]) => name === tool)
+                  )
                 }
                 const payload = request.permission_mode === 'full'
                   ? { ...request, risk_acknowledged: true }

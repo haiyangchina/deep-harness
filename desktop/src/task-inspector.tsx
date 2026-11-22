@@ -11,6 +11,27 @@ function proposalScope(proposal: unknown): string | null {
   return null
 }
 
+function PatchPreview({ proposal }: { proposal: unknown }) {
+  if (!proposal || typeof proposal !== 'object' || !('tool_name' in proposal) ||
+      proposal.tool_name !== 'apply_patch' || !('arguments' in proposal)) return null
+  const args = proposal.arguments as {
+    files?: { path: string; diff: string; expected_sha256: string | null }[]
+  }
+  if (!Array.isArray(args?.files)) return null
+  return (
+    <div className="patch-preview">
+      {args.files.map(file => (
+        <details key={file.path} open>
+          <summary>{file.path}</summary>
+          <p className="muted small">{file.expected_sha256
+            ? '基线 SHA-256 ' + file.expected_sha256 : '新建文件'}</p>
+          <pre>{file.diff}</pre>
+        </details>
+      ))}
+    </div>
+  )
+}
+
 export function TaskInspector() {
   const conversation = useStore($conversation)
   const busy = useStore($busy)
@@ -47,6 +68,7 @@ export function TaskInspector() {
         <section className="approval" key={approval.id}>
           <span className="eyebrow">WAITING FOR YOU</span>
           <h3>操作需要你的批准</h3>
+          <PatchPreview proposal={approval.proposal} />
           <Json value={approval.proposal} />
           {proposalScope(approval.proposal) && (
             <p className="muted small">作用域 {proposalScope(approval.proposal)}</p>

@@ -158,6 +158,9 @@ files:
   max_bytes: 8388608
   output_chars: 24000
   write_lock_seconds: 10
+patch:
+  max_files: 8
+  max_file_diff_chars: 16000
 legacy_files:
   start_line: 1
   max_lines: 120
@@ -236,6 +239,8 @@ harness_evidence:
   source_max_length: 1000
   observation_max_length: 4000
 harness_report:
+  repair_input_chars: 8000
+  repair_timeout_seconds: 20
   summary_max_length: 8000
   evidence_max_length: 32
   changes_max_length: 32

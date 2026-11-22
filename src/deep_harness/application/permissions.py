@@ -34,6 +34,8 @@ def sensitive_path(target):
 
 def classify(call, scope, resolve_path):
     """Map a call to (scope_key, reason) without inspecting command text."""
+    if call.name == "apply_patch":
+        return SCOPE_FILE_WRITE, "审阅并批准多文件补丁"
     if call.name in FILE_TOOLS:
         target = resolve_path(call.arguments.get("path", "."))
         if not target.is_relative_to(scope.workspace):
@@ -61,11 +63,7 @@ def classify(call, scope, resolve_path):
 
 def legacy_reason(call):
     """Compatibility row: strict workspace paths, no path resolution here."""
-    if (
-        call.name in MUTATING_TOOLS
-        or call.name in WEB_TOOLS
-        or call.name.startswith("mcp__")
-    ):
+    if call.name in MUTATING_TOOLS or call.name in WEB_TOOLS or call.name.startswith("mcp__"):
         return "需要逐项批准"
     return None
 
@@ -86,4 +84,6 @@ def approval_scope(call, session, scope, resolve_path):
         return None, "per_call", False
     scope_key, _ = classify(call, scope, resolve_path)
     decision = policy_for(session.permission_mode, scope_key)
+    if call.name == "apply_patch" and decision != "exempt":
+        return scope_key, "per_call", False
     return scope_key, decision, reusable(session.permission_mode, scope_key)

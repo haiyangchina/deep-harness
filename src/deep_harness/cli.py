@@ -60,6 +60,7 @@ def parser():
     chat.add_argument(
         "--allow-delegation", action="store_true", help="Grant scoped Deep specialists"
     )
+    chat.add_argument("--allow-patch", action="store_true", help="Grant multi-file patches")
     chat.add_argument(
         "--allow-memory",
         action="store_true",
@@ -83,6 +84,7 @@ def parser():
     repl.add_argument("--allow-write", action="store_true")
     repl.add_argument("--allow-exec", action="store_true")
     repl.add_argument("--allow-delegation", action="store_true")
+    repl.add_argument("--allow-patch", action="store_true", help="Grant multi-file patches")
     repl.add_argument("--allow-memory", action="store_true")
     repl.add_argument("--read-only", action="store_true")
     sessions = commands.add_parser("sessions")

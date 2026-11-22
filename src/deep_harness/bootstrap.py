@@ -23,6 +23,7 @@ from deep_harness.application.scopes import ProfileResolver
 from deep_harness.application.session_runtime import SessionRuntime
 from deep_harness.application.tools import TOOL_ARGUMENTS
 from deep_harness.application.workspace import CODING_TOOLS, MUTATING_TOOLS, READ_TOOLS
+from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import DomainError, ExecutionClaim
 from deep_harness.infrastructure.archives import create_archive, restore_archive
 from deep_harness.infrastructure.delegations import DelegationLedger
@@ -141,6 +142,7 @@ class ProfileApplication:
                     session,
                     ExecutionClaim(admission, self.owner),
                     binding["snapshot"].get("mcp_bindings"),
+                    snapshot_version=binding["snapshot"].get("version", 1),
                 )
                 state = await runtime.graph.aget_state(runtime.config)
                 ids = approval_ids(checkpoint_interrupts(state), admission.generation)
@@ -202,6 +204,12 @@ class ProfileApplication:
         frozen_knowledge = knowledge if any(knowledge.values()) else None
         frozen_tools = tuple(sorted(set(tools)))
         mcp_catalog = await self.sessions.catalog_for(frozen_tools)
+        snapshot_fields = {
+            "engine": engine,
+            "harness": harness,
+            "knowledge": frozen_knowledge,
+            "mcp_catalog": mcp_catalog,
+        }
         return await self.store.create_session(
             principal="operator",
             request_id=request_id,
@@ -210,12 +218,9 @@ class ProfileApplication:
             engine=engine,
             harness=harness,
             permission_mode=permission_mode,
-            runtime_snapshot=self.sessions.snapshot(
-                frozen_tools,
-                engine=engine,
-                harness=harness,
-                knowledge=frozen_knowledge,
-                mcp_catalog=mcp_catalog,
+            runtime_snapshot=self.sessions.snapshot(frozen_tools, **snapshot_fields),
+            compatible_runtime_hashes=(
+                fingerprint(self.sessions.snapshot(frozen_tools, version=3, **snapshot_fields)),
             ),
         )
 
@@ -350,7 +355,16 @@ class ProfileApplication:
             await self.delegations.reconcile_background()
         return await self.get_delegation(session_id, delegation_id)
 
-    def runtime(self, session, claim, mcp_bindings=None, *, stage_limits=None, job_id=None):
+    def runtime(
+        self,
+        session,
+        claim,
+        mcp_bindings=None,
+        *,
+        stage_limits=None,
+        job_id=None,
+        snapshot_version=4,
+    ):
         runtime_type = DeepRuntime if session.engine == "deep" else StandardRuntime
         kwargs = dict(
             session=session,
@@ -365,6 +379,7 @@ class ProfileApplication:
             mcp=self.mcp,
             mcp_bindings=mcp_bindings,
             web_client=self.web,
+            snapshot_version=snapshot_version,
         )
         if runtime_type is DeepRuntime and stage_limits is None:
             kwargs["background_launcher"] = self.launch_background
@@ -431,6 +446,7 @@ class ProfileApplication:
                     mcp_bindings,
                     stage_limits=limits if stage else None,
                     job_id=stage["job_id"] if stage else None,
+                    snapshot_version=binding["snapshot"].get("version", 1) if binding else 4,
                 )
                 result = await runtime.run(resume=resume)
         except asyncio.CancelledError:
@@ -550,7 +566,7 @@ class ProfileApplication:
                     harness=session.harness,
                     knowledge=knowledge,
                     mcp_catalog=catalog,
-                    version=bound["snapshot"].get("version", 1) if bound else 3,
+                    version=bound["snapshot"].get("version", 1) if bound else 4,
                 ),
                 expected_fingerprint,
             )

@@ -62,6 +62,7 @@ class StandardRuntime:
         web_client=None,
         model_lock=None,
         pause_probe=None,
+        snapshot_version=4,
     ):
         self.session = session
         self.claim = claim
@@ -72,7 +73,9 @@ class StandardRuntime:
         self.limits = limits
         self.model_lock = model_lock
         self.pause_probe = pause_probe
-        self.tool_specs = tool_definitions(session.tools, mcp_bindings)
+        self.tool_specs = tool_definitions(
+            session.tools, mcp_bindings, snapshot_version=snapshot_version
+        )
         if hasattr(model, "with_tool_specs"):
             self.model = model.with_tool_specs(self.tool_specs)
         self.context = ContextProjector(store, executions, limits)
@@ -154,7 +157,7 @@ class StandardRuntime:
         # permanent "Tool refused" tool result: on the next resume the same tool call
         # would then produce different content and trip message_conflict.
         for _ in range(number("execution.approval_replay_limit")):
-            decision = await self.receipts.interaction(self.claim, key, digest, proposal)
+            decision = await self.gateway.interaction(call, key, digest, proposal)
             if decision is not None:
                 return decision == "approve"
             interrupt(

@@ -25,6 +25,7 @@ async def select_session(app, args):
             or args.allow_exec
             or args.allow_memory
             or args.allow_delegation
+            or args.allow_patch
             or args.mcp_tool
             or args.permission_mode
             or args.read_only
@@ -41,6 +42,7 @@ async def select_session(app, args):
         or args.allow_exec
         or args.allow_memory
         or args.allow_delegation
+        or args.allow_patch
         or args.mcp_tool
     ):
         raise DomainError("immutable_grants", "--read-only cannot be combined with extra grants")
@@ -50,6 +52,8 @@ async def select_session(app, args):
             file=sys.stderr,
         )
     tools = READ_ONLY_CORE if args.read_only else CORE_TOOLS
+    if args.allow_patch:
+        tools += ("apply_patch",)
     if args.allow_memory:
         tools += ("save_memory",)
     if args.allow_delegation:

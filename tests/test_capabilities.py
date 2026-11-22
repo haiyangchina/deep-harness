@@ -78,8 +78,8 @@ def test_workspace_constants_are_derived():
     assert set(READ_ONLY_CORE) == {"read", "list_files", "search_files", *WEB_TOOLS}
     assert not set(WEB_TOOLS) & MUTATING_TOOLS
     assert set(READ_TOOLS) == set(READ_ONLY_CORE) | {"read_file"}
-    assert {"write", "edit", "bash"} <= MUTATING_TOOLS
-    assert set(CORE_TOOLS) | set(LEGACY_TOOLS) == set(CODING_TOOLS)
+    assert {"write", "edit", "bash", "apply_patch"} <= MUTATING_TOOLS
+    assert set(CORE_TOOLS) | set(LEGACY_TOOLS) | {"apply_patch"} == set(CODING_TOOLS)
 
 
 @pytest.mark.parametrize(

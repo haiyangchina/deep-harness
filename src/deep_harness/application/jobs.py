@@ -8,6 +8,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from deep_harness.application.capabilities import CORE_TOOLS, READ_ONLY_CORE
+from deep_harness.application.coding_evidence import coding_evidence
 from deep_harness.application.config import ExecutionSettings
 from deep_harness.application.workspace import PROJECT_PROMPT
 from deep_harness.domain.identity import fingerprint
@@ -25,6 +26,9 @@ class StagePlan(BaseModel):
     group: int | None = Field(default=None, ge=0)
     read_only: bool = False
     verify: bool = False
+    verification_command: str | None = Field(
+        default=None, min_length=1, max_length=number("shell.command_max_length")
+    )
 
 
 class JobBudget(BaseModel):
@@ -73,6 +77,8 @@ class CreateJob(BaseModel):
                 raise ValueError("Stage groups must be in ascending order")
             previous = stage.group = group
             counts[group] = counts.get(group, 0) + 1
+            if stage.verification_command is not None and not stage.verify:
+                raise ValueError("A verification command requires command verification")
             if stage.read_only and stage.verify:
                 raise ValueError("A command-verification stage cannot be read-only")
         if any(counts[stage.group] > 1 and not stage.read_only for stage in self.stages):
@@ -126,14 +132,18 @@ class JobService:
         self.lock = asyncio.Lock()
         self.model_lock = asyncio.Lock()
 
-    def runtime_hash(self):
-        return fingerprint(self.app.sessions.snapshot(CORE_TOOLS))
+    def runtime_hash(self, version=4):
+        return fingerprint(self.app.sessions.snapshot(CORE_TOOLS, version=version))
 
     async def create(self, plan):
         async with self.lock:
+            definition = plan.model_dump()
+            for stage in definition["stages"]:
+                if stage["verification_command"] is None:
+                    stage.pop("verification_command")
             job_id = await self.ledger.create(
                 plan.request_id,
-                plan.model_dump(),
+                definition,
                 self.runtime_hash(),
                 time.time() + plan.deadline_seconds if plan.deadline_seconds is not None else None,
             )
@@ -151,35 +161,52 @@ class JobService:
 
     async def verified(self, stage):
         report = result_for(stage)
+        return self.accepted(stage, report, await self.verification(stage) if report else None)
+
+    @staticmethod
+    def accepted(stage, report, evidence):
         if not report or report["status"] != "complete":
             return False
         if stage["accepted_evidence"] is not None or not stage["definition"]["verify"]:
             return True
-        messages = await self.app.store.history(stage["session_id"])
-        commands = {
-            call["id"]
-            for message in messages
-            for call in message.get("tool_calls", [])
-            if call.get("name") in {"bash", "run_command"}
-        }
-        outputs = []
-        for message in messages:
-            if message.get("tool_call_id") not in commands:
-                continue
-            try:
-                value = json.loads(message["content"])
-            except (ValueError, TypeError):
-                continue
-            if isinstance(value, dict) and type(value.get("exit_code")) is int:
-                outputs.append(value["exit_code"])
-        return bool(outputs) and all(code == 0 for code in outputs)
+        return (
+            evidence is not None
+            and type(evidence["exit_code"]) is int
+            and evidence["exit_code"] == 0
+        )
+
+    async def verification(self, stage):
+        if not stage["admission_id"] or not stage["definition"]["verify"]:
+            return None
+        messages = await self.app.store.history(
+            stage["session_id"], admission_id=stage["admission_id"]
+        )
+        files, commands, last_write = coding_evidence(messages)
+        expected = stage["definition"].get("verification_command")
+        # The most recent command must be the verifier. Other shell operations
+        # can also mutate the workspace even when they supplied no file receipt.
+        if not commands:
+            return None
+        last = commands[-1]
+        if last["batch"] <= last_write:
+            return None
+        if expected is not None and (
+            last["tool"] != "bash" or last["arguments"].get("command") != expected
+        ):
+            return None
+        if last["arguments"].get("purpose") == "reproduce":
+            return None
+        if sum(command["batch"] == last["batch"] for command in commands) > 1:
+            return None
+        return {**last, "files": files}
 
     async def detail(self, job_id):
         job = await self.ledger.get(job_id)
         used = {"wall_seconds": 0.0, "max_model_calls": 0, "max_tool_calls": 0, "max_run_tokens": 0}
         for stage in job["stages"]:
             stage["report"] = result_for(stage)
-            stage["verified"] = await self.verified(stage)
+            stage["verification"] = await self.verification(stage)
+            stage["verified"] = self.accepted(stage, stage["report"], stage["verification"])
             stage["evidence"] = None
             if stage["admission_id"]:
                 entry = await self.ledger.evidence(stage["admission_id"])
@@ -283,7 +310,7 @@ class JobService:
             if job["deadline"] is not None and time.time() >= job["deadline"]:
                 await self.ledger.set_status(job_id, "blocked", "Long-task deadline has elapsed")
                 return
-            if job["runtime_hash"] != self.runtime_hash():
+            if job["runtime_hash"] not in {self.runtime_hash(), self.runtime_hash(version=3)}:
                 await self.ledger.set_status(job_id, "blocked", "Runtime configuration has changed")
                 return
             group = pending[0]["definition"]["group"]
@@ -346,6 +373,17 @@ class JobService:
         else:
             session = await self.app.store.get_session(stage["session_id"], "operator")
         handoff = json.dumps(prior, ensure_ascii=False)
+        verification = ""
+        if definition["verify"]:
+            verification = (
+                "Run the verification command as a separate, final tool call after all edits. "
+                "When available, set bash purpose to verify. "
+            )
+            if command := definition.get("verification_command"):
+                verification += f"Use exactly this bash command: {command}"
+        if stage["admission_id"] is not None:
+            self.app.schedule(session.id)
+            return
         await self.app.store.admit(
             session,
             principal="operator",
@@ -354,7 +392,8 @@ class JobService:
                 f"Job objective: {job['goal']}\n"
                 f"Stage: {definition['title']}\n{definition['goal']}\n"
                 f"Acceptance: {definition['acceptance']}\n"
-                f"Prior stage evidence: {handoff}"
+                f"Prior stage evidence: {handoff}\n"
+                f"{verification}"
             ),
         )
         self.app.schedule(session.id)
