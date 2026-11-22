@@ -1,10 +1,4 @@
-"""Four frozen harness tiers that replace the old engine switch.
-
-A harness spec is a product contract, not a user toggle. It describes the
-sub-agent and report behaviour of a task tier; the concrete tool grant is still
-derived by ``capabilities.derive_grants`` so the frozen-session authority rule
-stays in one place. All tiers now run on the single deepagents execution kernel.
-"""
+"""Frozen task tiers for tool grants, delegation and reports."""
 
 from dataclasses import asdict, dataclass
 from typing import get_args

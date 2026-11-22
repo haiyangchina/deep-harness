@@ -8,9 +8,6 @@ around model calls:
 3. generation fencing -- every model call asserts the execution claim
 4. crash recovery -- replays hit the model receipt and never re-run side effects
 
-It is the renamed, extracted form of the former ``ReceiptedModel`` so that the
-guard is a first-class architectural component rather than an implementation
-detail of the Deep runtime.
 """
 
 import asyncio

@@ -18,7 +18,7 @@ def require_environment():
     prefix = Path(sys.prefix)
     if prefix.name != "deep-harness" or not (prefix / "conda-meta").is_dir():
         raise SystemExit(
-            "Use the deep-harness Conda interpreter; base/legacy environments are refused"
+            "Use the dedicated deep-harness Conda interpreter"
         )
 
 

@@ -39,7 +39,7 @@ def session_for(mode):
     )
 
 
-@pytest.mark.parametrize("mode", ["legacy", "ask", "auto"])
+@pytest.mark.parametrize("mode", ["ask", "auto"])
 @pytest.mark.parametrize("command", COMMANDS)
 def test_every_command_requires_per_call_approval(tmp_path, mode, command):
     session = session_for(mode)
@@ -47,8 +47,7 @@ def test_every_command_requires_per_call_approval(tmp_path, mode, command):
     call = ToolCall("one", "bash", {"command": command, "cwd": "."})
     gateway = ToolGateway(scope, session, None, None)
     assert gateway.approval_reason(call) is not None
-    if mode != "legacy":
-        assert approval_reason(call, session, scope, lambda path: tmp_path / path) is not None
+    assert approval_reason(call, session, scope, lambda path: tmp_path / path) is not None
 
 
 @pytest.mark.parametrize("command", ["pwd", "echo safe", "npm test"])

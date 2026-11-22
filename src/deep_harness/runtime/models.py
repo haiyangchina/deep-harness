@@ -172,7 +172,7 @@ class DiagnosticModel:
             return {"role": "assistant", "content": f"Diagnostic tool result: {last['content']}"}
         text = last["content"]
         if text.startswith("/read "):
-            name = "read_file" if "read_file" in tools else "read"
+            name = "read"
             call = {"id": "read-1", "name": name, "args": {"path": text[6:]}}
             return {"role": "assistant", "content": "", "tool_calls": [call]}
         writes = (
@@ -185,7 +185,7 @@ class DiagnosticModel:
                 calls.append(
                     {
                         "id": f"write-{index}",
-                        "name": "write_file" if "write_file" in tools else "write",
+                        "name": "write",
                         "args": {"path": path, "content": content},
                     }
                 )

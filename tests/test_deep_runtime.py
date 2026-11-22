@@ -39,7 +39,7 @@ class DeepToolModel(DeepTestModel):
                 tool_calls=[
                     {
                         "id": "call-one",
-                        "name": "write_file",
+                        "name": "write",
                         "args": {"path": "deep.txt", "content": "saved"},
                     }
                 ],
@@ -55,7 +55,7 @@ class RepeatedReadModel(DeepTestModel):
             answer = AIMessage(
                 content="",
                 tool_calls=[
-                    {"id": f"read-{number}", "name": "harness_read_file", "args": {"path": "a.txt"}}
+                    {"id": f"read-{number}", "name": "read", "args": {"path": "a.txt"}}
                     for number in (1, 2)
                 ],
             )
@@ -124,7 +124,7 @@ class CollaboratingModel(DeepTestModel):
             answer = AIMessage(
                 content="",
                 tool_calls=[
-                    {"id": "read-1", "name": "harness_read_file", "args": {"path": user[8:]}}
+                    {"id": "read-1", "name": "read", "args": {"path": user[8:]}}
                 ],
             )
         return ChatResult(generations=[ChatGeneration(message=answer)])
@@ -155,7 +155,7 @@ class WritingSpecialistModel(DeepTestModel):
                 tool_calls=[
                     {
                         "id": "write-1",
-                        "name": "write_file",
+                        "name": "write",
                         "args": {"path": "c.txt", "content": "from child"},
                     }
                 ],
@@ -191,7 +191,7 @@ async def test_deep_write_waits_for_durable_approval(tmp_path):
     host = host_factory()
     try:
         app = await host.application("deep")
-        session = await app.create_session("create", "frozen", ("write_file",), engine="deep")
+        session = await app.create_session("create", "frozen", ("write",), engine="deep")
         admission = await app.submit(session.id, "send", "write it")
         await app.wait_idle()
         pending = await app.store.get_admission(admission.id, session.id)
@@ -222,7 +222,7 @@ async def test_deep_repeated_identical_tool_arguments_keep_distinct_call_ids(tmp
     )
     try:
         app = await host.application("deep")
-        session = await app.create_session("create", "frozen", ("read_file",), engine="deep")
+        session = await app.create_session("create", "frozen", ("read",), engine="deep")
         admission = await app.submit(session.id, "send", "read twice")
         await app.wait_idle()
         completed = await app.store.get_admission(admission.id, session.id)
@@ -265,7 +265,7 @@ async def test_coding_harness_coordinates_two_readonly_specialists(tmp_path):
         session = await app.create_session(
             "create",
             "frozen",
-            ("read_file", "delegate_task"),
+            ("read", "delegate_task"),
             engine="deep",
             harness="coding",
         )
@@ -294,13 +294,13 @@ async def test_coding_harness_coordinates_two_readonly_specialists(tmp_path):
             await app.create_session(
                 "create",
                 "frozen",
-                ("read_file", "delegate_task"),
+                ("read", "delegate_task"),
                 engine="deep",
                 harness="research",
             )
         with pytest.raises(DomainError, match="Research harness cannot"):
             await app.create_session(
-                "invalid", "frozen", ("write_file",), engine="deep", harness="research"
+                "invalid", "frozen", ("write",), engine="deep", harness="research"
             )
     finally:
         await host.close()
@@ -318,7 +318,7 @@ async def test_coding_specialist_write_waits_for_approval_and_survives_restart(t
     try:
         app = await host.application("deep")
         session = await app.create_session(
-            "create", "frozen", ("delegate_task", "write_file"), engine="deep"
+            "create", "frozen", ("delegate_task", "write"), engine="deep"
         )
         admission = await app.submit(session.id, "send", "delegate write")
         await app.wait_idle()
@@ -326,7 +326,7 @@ async def test_coding_specialist_write_waits_for_approval_and_survives_restart(t
         assert pending.status == "waiting_approval"
         assert not (tmp_path / "c.txt").exists()
         proposal = (await app.sessions.status(session.id))["approvals"][0]
-        assert proposal["proposal"]["tool_name"] == "write_file"
+        assert proposal["proposal"]["tool_name"] == "write"
         await host.close()
         host = host_factory()
         app = await host.application("deep")

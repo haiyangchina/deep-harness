@@ -53,7 +53,7 @@ test(
     try {
       await writeFile(path.join(workspace, 'README.md'), 'Desktop integration evidence', 'utf8')
       await runtime.start(settings)
-      const session = await request('/sessions', 'POST', { request_id: 'create', tools: ['read_file', 'write_file'] })
+      const session = await request('/sessions', 'POST', { request_id: 'create', tools: ['read', 'write'] })
       const route = `/sessions/${session.id}`
       const receipt = await request(`${route}/inputs`, 'POST', {
         submission_id: 'write-one',

@@ -46,7 +46,7 @@ export function TaskComposer({ draft, pending, paused, updateDraft, send }: Task
             <span> · {runtime.settings.profile}</span>
           </span>
           <div className="actions">
-            {status && <PermissionPicker value={status.session.permission_mode ?? 'legacy'}
+            {status && <PermissionPicker value={status.session.permission_mode}
               disabled={busy || pending || Boolean(running) || paused || Boolean(childRunning)}
               onChange={mode => void perform(async () => {
                 await api(`/sessions/${sessionId}/permissions`, 'POST', {

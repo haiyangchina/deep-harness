@@ -13,7 +13,7 @@ class AnalysisModel(DiagnosticModel):
         calls = [
             ("list_files", {}),
             ("search_files", {"query": "def greet", "pattern": "*.py"}),
-            ("read_file", {"path": "main.py", "start_line": 2, "max_lines": 1}),
+            ("read", {"path": "main.py", "offset": 2, "limit": 1}),
         ]
         if len(results) == len(calls):
             return {
@@ -37,7 +37,7 @@ async def test_analysis_discovers_searches_and_reads_without_approval(tmp_path):
     try:
         app = await host.application("one")
         session = await app.create_session(
-            "create", "Analyze project", ("list_files", "search_files", "read_file")
+            "create", "Analyze project", ("list_files", "search_files", "read")
         )
         admission = await app.submit(session.id, "input", "Explain this project")
         await app.wait_idle()
@@ -65,7 +65,7 @@ class EscapeModel(DiagnosticModel):
         }
 
 
-async def test_discovery_rejects_workspace_escape(tmp_path):
+async def test_discovery_outside_workspace_requires_approval(tmp_path):
     host = ProjectHost(tmp_path / "state", tmp_path, lambda scope: EscapeModel())
     try:
         app = await host.application("one")
@@ -73,7 +73,11 @@ async def test_discovery_rejects_workspace_escape(tmp_path):
         admission = await app.submit(session.id, "input", "inspect")
         await app.wait_idle()
         done = await app.store.get_admission(admission.id, session.id)
-        assert done.status == "completed"
-        assert "path_denied" in done.result
+        assert done.status == "waiting_approval"
+        approval = (await app.sessions.status(session.id))["approvals"][0]
+        assert approval["proposal"]["scope_key"] == "outside:workspace"
+        await app.approve(session.id, approval["id"], done.generation, "deny")
+        await app.wait_idle()
+        assert (await app.store.get_admission(admission.id, session.id)).status == "completed"
     finally:
         await host.close()

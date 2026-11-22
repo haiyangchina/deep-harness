@@ -13,7 +13,7 @@ async def test_backup_restores_pending_approval_with_checkpoint_to_new_profile(t
     host = ProjectHost(tmp_path / "state", tmp_path)
     try:
         app = await host.application("original")
-        session = await app.create_session("create", "Frozen", ("write_file",))
+        session = await app.create_session("create", "Frozen", ("write",))
         admission = await app.submit(session.id, "send", "/write restored.txt approved")
         await app.wait_idle()
         pending = await app.store.get_admission(admission.id, session.id)

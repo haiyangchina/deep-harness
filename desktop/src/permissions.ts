@@ -7,5 +7,5 @@ export const permissionOptions = [
 ] as const
 
 export function permissionLabel(mode: PermissionMode) {
-  return mode === 'legacy' ? '请求批准 · 仅工作区' : permissionOptions.find(row => row.value === mode)!.label
+  return permissionOptions.find(row => row.value === mode)!.label
 }

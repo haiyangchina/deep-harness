@@ -23,9 +23,8 @@ async def test_deep_harness_and_delegation_catalog_are_authentic_session_fields(
                 headers=headers,
                 json={
                     "request_id": "create",
-                    "engine": "deep",
                     "harness": "research",
-                    "tools": ["read_file", "delegate_task"],
+                    "tools": ["read", "delegate_task"],
                 },
             )
             assert created.status_code == 200
@@ -47,7 +46,7 @@ async def test_deep_harness_and_delegation_catalog_are_authentic_session_fields(
                 headers=headers,
                 json={"request_id": "invalid", "engine": "standard", "harness": "coding"},
             )
-            assert invalid.status_code == 409
+            assert invalid.status_code == 422
     finally:
         await host.close()
 
@@ -140,7 +139,7 @@ async def test_authenticated_knowledge_routes_freeze_new_session_prompt(tmp_path
             created = await client.post(
                 route + "/sessions",
                 headers=headers,
-                json={"request_id": "deep", "engine": "deep"},
+                json={"request_id": "deep", "harness": "coding"},
             )
             assert created.status_code == 200
             assert created.json()["engine"] == "deep"

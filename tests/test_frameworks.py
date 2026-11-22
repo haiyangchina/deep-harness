@@ -28,7 +28,7 @@ async def test_langchain_adapter_runs_real_model_interface_without_network():
     result = await adapter.complete(
         "Frozen prompt",
         [{"id": "u1", "role": "user", "content": "hello"}],
-        ("read_file",),
+        ("read",),
     )
     assert result["content"] == "SDK integration works"
     assert result["tool_calls"] == []

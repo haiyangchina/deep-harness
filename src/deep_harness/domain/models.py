@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-PermissionMode = Literal["legacy", "ask", "auto", "full"]
+PermissionMode = Literal["ask", "auto", "full"]
 Harness = Literal["general", "coding", "research", "research_web"]
 
 
@@ -33,7 +33,7 @@ class Session:
     tools: tuple[str, ...]
     engine: Literal["standard", "deep"]
     harness: Harness = "general"
-    permission_mode: PermissionMode = "legacy"
+    permission_mode: PermissionMode = "ask"
     permission_revision: int = 0
 
 

@@ -49,14 +49,6 @@ def parser():
         "--mcp-tool", action="append", default=[], help="Grant one configured MCP tool"
     )
     chat.add_argument(
-        "--allow-write",
-        action="store_true",
-        help="Grant file writes under the session approval policy",
-    )
-    chat.add_argument(
-        "--allow-exec", action="store_true", help="Grant commands under the session approval policy"
-    )
-    chat.add_argument(
         "--allow-delegation", action="store_true", help="Grant scoped Deep specialists"
     )
     chat.add_argument("--allow-patch", action="store_true", help="Grant multi-file patches")
@@ -79,8 +71,6 @@ def parser():
         help="Confirm the full-access risk notice (required with --permission-mode full)",
     )
     repl.add_argument("--mcp-tool", action="append", default=[])
-    repl.add_argument("--allow-write", action="store_true")
-    repl.add_argument("--allow-exec", action="store_true")
     repl.add_argument("--allow-delegation", action="store_true")
     repl.add_argument("--allow-patch", action="store_true", help="Grant multi-file patches")
     repl.add_argument("--allow-memory", action="store_true")
@@ -157,11 +147,6 @@ def parser():
     fork = commands.add_parser("fork")
     fork.add_argument("session")
     fork.add_argument("--request-id", help="Stable ID for safe fork retries")
-    bind = commands.add_parser("bind-session")
-    bind.add_argument("session")
-    bind.add_argument(
-        "--fingerprint", required=True, help="Reviewed current runtime fingerprint from inspect"
-    )
     approve = commands.add_parser("approve")
     approve.add_argument("session")
     approve.add_argument("interaction")
@@ -299,7 +284,6 @@ def main():
         "usage",
         "approve",
         "fork",
-        "bind-session",
     }:
         from deep_harness.transports.console import run_console
 

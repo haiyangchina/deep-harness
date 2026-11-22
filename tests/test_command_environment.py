@@ -10,29 +10,22 @@ import sys
 import pytest
 
 from deep_harness.application.shell import BashArgs, bash
-from deep_harness.application.terminal import CommandArgs, run_command
 
 
-@pytest.mark.parametrize("runner", ["shell", "native"])
 async def test_commands_keep_os_locations_and_timezone_without_provider_secrets(
-    tmp_path, monkeypatch, runner
+    tmp_path, monkeypatch
 ):
     monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
     monkeypatch.setenv("TZ", "UTC")
     monkeypatch.setenv("OPENAI_API_KEY", "provider-secret-must-not-reach-command")
     keys = ["HOME", "USERPROFILE", "APPDATA", "TZ", "OPENAI_API_KEY", "Harness_HOME"]
     code = f"import os,json; print(json.dumps({{k:os.environ.get(k) for k in {keys!r}}}))"
-    if runner == "native":
-        result = await run_command(
-            CommandArgs(argv=[sys.executable, "-c", code]), lambda p: tmp_path / p
-        )
+    if os.name == "nt":
+        executable = sys.executable.replace("'", "''")
+        command = f"& '{executable}' -c '{code.replace(chr(39), chr(39) * 2)}'"
     else:
-        if os.name == "nt":
-            executable = sys.executable.replace("'", "''")
-            command = f"& '{executable}' -c '{code.replace(chr(39), chr(39) * 2)}'"
-        else:
-            command = f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
-        result = await bash(BashArgs(command=command), lambda p: tmp_path / p)
+        command = f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+    result = await bash(BashArgs(command=command), lambda p: tmp_path / p)
     assert result["exit_code"] == 0, result["stderr"]
     inherited = json.loads(result["stdout"])
     for key in ("HOME", "USERPROFILE", "APPDATA", "TZ"):

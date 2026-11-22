@@ -4,7 +4,6 @@ import asyncio
 import hashlib
 import json
 import os
-import tempfile
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Literal
@@ -26,7 +25,6 @@ from deep_harness.application.capabilities import READ_ONLY_SCOPES
 from deep_harness.application.patches import PatchArgs, prepare_file
 from deep_harness.application.permissions import approval_reason, approval_scope, sensitive_path
 from deep_harness.application.shell import BashArgs, bash, shell_command
-from deep_harness.application.terminal import CommandArgs, run_command, validate_command
 from deep_harness.application.web_tools import (
     WEB_TOOL_ARGUMENTS,
     WEB_TOOL_DESCRIPTIONS,
@@ -44,23 +42,6 @@ from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import DomainError, ExecutionClaim, ProfileScope, Session, ToolCall
 from deep_harness.infrastructure.knowledge import KnowledgeStore
 from deep_harness.server_config import number
-
-
-class FilePathArgs(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    path: str = Field(min_length=1)
-
-
-class ReadFileArgs(FilePathArgs):
-    start_line: int = Field(default=number("legacy_files.start_line"), ge=1)
-    max_lines: int = Field(
-        default=number("legacy_files.max_lines"), ge=1, le=number("legacy_files.max_lines_max")
-    )
-
-
-class WriteFileArgs(FilePathArgs):
-    content: str = Field(max_length=number("legacy_files.content_max_length"))
-    expected_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
 
 class SaveMemoryArgs(BaseModel):
@@ -88,9 +69,6 @@ TOOL_ARGUMENTS = {
     "bash": BashArgs,
     "list_files": ListFilesArgs,
     "search_files": SearchFilesArgs,
-    "read_file": ReadFileArgs,
-    "write_file": WriteFileArgs,
-    "run_command": CommandArgs,
     "save_memory": SaveMemoryArgs,
     "delegate_task": DelegateTaskArgs,
     "check_delegation": CheckDelegationArgs,
@@ -126,7 +104,7 @@ TOOL_DESCRIPTIONS = {
         "flags (64 KiB per stream). Timeout 1-120 seconds. Runs as the current OS user, "
         "without ambient secret env vars; the shell is not a filesystem sandbox. A timeout "
         "has an unknown effect outcome. Every command follows the session approval mode: "
-        "per call in ask/legacy, once per scope per round in auto, and exempt in full."
+        "per call in ask, once per scope per round in auto, and exempt in full."
     ),
     "list_files": (
         "List workspace files recursively with a glob pattern. Skips state, dependencies "
@@ -135,18 +113,6 @@ TOOL_DESCRIPTIONS = {
     "search_files": (
         "Search literal text in bounded UTF-8 workspace files. Returns paths, line numbers "
         "and excerpts. Pass next_cursor with the same path, pattern and query to continue."
-    ),
-    "read_file": (
-        "Read a workspace-relative UTF-8 file by start_line/max_lines. Returns bounded content, "
-        "line range, truncation flag and full-file SHA-256 (files up to 128 KB)."
-    ),
-    "write_file": (
-        "Write a UTF-8 file after human approval. Existing files require expected_sha256 "
-        "from the read result; omit it only when creating a new file."
-    ),
-    "run_command": (
-        "Run an absolute executable with argv in the workspace after human approval. "
-        "No shell expansion or ambient secrets are provided."
     ),
     "save_memory": "Save a stable profile memory for future sessions after human approval.",
     "delegate_task": (
@@ -161,20 +127,12 @@ TOOL_DESCRIPTIONS = {
 TOOL_DESCRIPTIONS.update(WEB_TOOL_DESCRIPTIONS)
 
 
-def tool_definitions(names: tuple[str, ...], mcp_catalog=None, *, snapshot_version=4) -> list[dict]:
+def tool_definitions(names: tuple[str, ...], mcp_catalog=None) -> list[dict]:
     definitions = []
     for name in sorted(names):
         if name in TOOL_ARGUMENTS:
             description = TOOL_DESCRIPTIONS[name]
             parameters = TOOL_ARGUMENTS[name].model_json_schema()
-            if name == "bash" and snapshot_version < 4:
-                parameters["properties"].pop("purpose")
-            if name == "search_files" and snapshot_version < 4:
-                parameters["properties"].pop("cursor")
-                description = (
-                    "Search literal text in bounded UTF-8 workspace files. Returns paths, line "
-                    "numbers and excerpts. Narrow path/pattern when truncated."
-                )
             definitions.append(
                 {
                     "name": name,
@@ -233,15 +191,8 @@ class ToolGateway:
         return TOOL_ARGUMENTS[call.name].model_validate(call.arguments)
 
     def path(self, relative: str) -> Path:
-        path = Path(relative)
-        legacy = self.session.permission_mode == "legacy"
-        if legacy and (path.is_absolute() or path.drive):
-            raise DomainError("path_denied", "Tools accept workspace-relative paths only")
-        if not legacy:
-            path = path.expanduser()
+        path = Path(relative).expanduser()
         target = (self.scope.workspace / path).resolve()
-        if legacy and not target.is_relative_to(self.scope.workspace):
-            raise DomainError("path_denied", "Path escapes the configured workspace")
         if target.is_relative_to(self.scope.state_root):
             raise DomainError(
                 "path_denied", "Runtime state and credentials are not model-accessible"
@@ -249,8 +200,6 @@ class ToolGateway:
         return target
 
     def approval_reason(self, call: ToolCall) -> str | None:
-        # legacy is a compatibility row inside the shared policy table: it keeps
-        # strict workspace-relative paths and must not resolve paths here.
         return approval_reason(call, self.session, self.scope, self.path)
 
     def approval_scope(self, call: ToolCall):
@@ -334,7 +283,7 @@ class ToolGateway:
             if call.name == "apply_patch" or (
                 not refused and (call.name in MUTATING_TOOLS or call.name in self.mcp_bindings)
             ):
-                if isinstance(exc, TimeoutError) and isinstance(arguments, (BashArgs, CommandArgs)):
+                if isinstance(exc, TimeoutError) and isinstance(arguments, BashArgs):
                     detail = f"工具 {call.name} 执行超时（{arguments.timeout_seconds:g} 秒）"
                 else:
                     detail = f"工具 {call.name} 派发后失败（{type(exc).__name__}）"
@@ -363,14 +312,10 @@ class ToolGateway:
                 raise DomainError("mcp_unavailable", "MCP registry is not configured")
         elif call.name == "bash":
             await asyncio.to_thread(shell_command, arguments, self.path)
-        elif call.name == "run_command":
-            await asyncio.to_thread(validate_command, arguments, self.path)
         elif call.name in {
             "read",
             "write",
             "edit",
-            "read_file",
-            "write_file",
             "list_files",
             "search_files",
         }:
@@ -379,9 +324,8 @@ class ToolGateway:
     async def _invoke(self, name, arguments, key):
         if name in WEB_TOOL_NAMES:
             return await execute_web_tool(name, arguments, self.web_client)
-        commands = {"bash": bash, "run_command": run_command}
-        if name in commands:
-            return json.dumps(await commands[name](arguments, self.path), ensure_ascii=False)
+        if name == "bash":
+            return json.dumps(await bash(arguments, self.path), ensure_ascii=False)
         if name == "save_memory":
             memory = await KnowledgeStore(self.receipts.store).remember(
                 arguments.content, "agent", memory_id=key
@@ -406,8 +350,7 @@ class ToolGateway:
         if name in handlers:
             value = await asyncio.to_thread(handlers[name], arguments, self.path)
             return json.dumps(value, ensure_ascii=False)
-        handler = {"read_file": self._read, "write_file": self._write}[name]
-        return await asyncio.to_thread(handler, arguments)
+        raise DomainError("unknown_tool", "Requested tool is not supported")
 
     def _patch_targets(self, arguments):
         targets = {}
@@ -491,64 +434,3 @@ class ToolGateway:
         target = workspace_path(arguments.path)
         with FileLock(self._lock_path(target), timeout=number("files.write_lock_seconds")):
             return mutate(arguments, workspace_path)
-
-    def _read(self, arguments: ReadFileArgs) -> str:
-        target = self.path(arguments.path)
-        with target.open("rb") as stream:
-            data = stream.read(number("legacy_files.max_bytes") + 1)
-        if len(data) > number("legacy_files.max_bytes"):
-            raise DomainError("file_too_large", "File exceeds this prototype's 128 KB limit")
-        lines = data.decode("utf-8").splitlines(keepends=True)
-        selected = lines[arguments.start_line - 1 : arguments.start_line - 1 + arguments.max_lines]
-        content = ""
-        for line in selected:
-            if len(content.encode("utf-8")) + len(line.encode("utf-8")) > number(
-                "legacy_files.output_max_bytes"
-            ):
-                break
-            content += line
-        # A single long line still needs to be inspectable.
-        if not content and selected:
-            content = (
-                selected[0]
-                .encode("utf-8")[: number("legacy_files.output_max_bytes")]
-                .decode("utf-8", errors="ignore")
-            )
-        end_line = arguments.start_line - 1 + len(content.splitlines())
-        return json.dumps(
-            {
-                "path": arguments.path,
-                "content": content,
-                "start_line": arguments.start_line,
-                "end_line": end_line,
-                "total_lines": len(lines),
-                "truncated": end_line < len(lines) or content != "".join(selected),
-                "sha256": hashlib.sha256(data).hexdigest(),
-            },
-            ensure_ascii=False,
-        )
-
-    def _write(self, arguments: WriteFileArgs) -> str:
-        target = self.path(arguments.path)
-        if target.exists():
-            current = hashlib.sha256(target.read_bytes()).hexdigest()
-            if arguments.expected_sha256 != current:
-                raise DomainError(
-                    "file_conflict",
-                    "Existing file changed or expected hash is missing",
-                )
-        elif arguments.expected_sha256 is not None:
-            raise DomainError("file_conflict", "Expected existing file is missing")
-        data = arguments.content.encode("utf-8")
-        temporary = None
-        try:
-            with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as stream:
-                temporary = Path(stream.name)
-                stream.write(data)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, target)
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
-        return json.dumps({"path": arguments.path, "sha256": hashlib.sha256(data).hexdigest()})

@@ -21,8 +21,8 @@ from deep_harness.application.workspace import MUTATING_TOOLS
 
 SENSITIVE_PARTS = {".git", ".ssh", ".aws", ".azure", ".kube", ".gnupg"}
 SENSITIVE_NAMES = {"agents.md", "claude.md", ".env", ".npmrc", ".netrc", "credentials"}
-FILE_TOOLS = {"read", "write", "edit", "read_file", "write_file", "list_files", "search_files"}
-FILE_WRITES = {"write", "edit", "write_file"}
+FILE_TOOLS = {"read", "write", "edit", "list_files", "search_files"}
+FILE_WRITES = {"write", "edit"}
 
 
 def sensitive_path(target):
@@ -45,7 +45,7 @@ def classify(call, scope, resolve_path):
         if call.name in FILE_WRITES:
             return SCOPE_FILE_WRITE, "修改文件需要批准"
         return SCOPE_FILE_READ, None
-    if call.name in {"bash", "run_command"}:
+    if call.name == "bash":
         cwd = resolve_path(call.arguments.get("cwd", "."))
         if not cwd.is_relative_to(scope.workspace) or sensitive_path(cwd):
             return SCOPE_OUTSIDE, "在工作区外或敏感目录执行命令"
@@ -61,17 +61,8 @@ def classify(call, scope, resolve_path):
     return SCOPE_FILE_READ, None
 
 
-def legacy_reason(call):
-    """Compatibility row: strict workspace paths, no path resolution here."""
-    if call.name in MUTATING_TOOLS or call.name in WEB_TOOLS or call.name.startswith("mcp__"):
-        return "需要逐项批准"
-    return None
-
-
 def approval_reason(call, session, scope, resolve_path):
     mode = session.permission_mode
-    if mode == "legacy":
-        return legacy_reason(call)
     scope_key, reason = classify(call, scope, resolve_path)
     if policy_for(mode, scope_key) == "exempt":
         return None
@@ -80,8 +71,6 @@ def approval_reason(call, session, scope, resolve_path):
 
 def approval_scope(call, session, scope, resolve_path):
     """Return (scope_key, decision, reusable) for the session mode."""
-    if session.permission_mode == "legacy":
-        return None, "per_call", False
     scope_key, _ = classify(call, scope, resolve_path)
     decision = policy_for(session.permission_mode, scope_key)
     if call.name == "apply_patch" and decision != "exempt":

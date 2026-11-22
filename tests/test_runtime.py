@@ -1,7 +1,5 @@
 """Real LangGraph, SQLite and tool execution with no paid model calls."""
 
-import sqlite3
-from contextlib import closing
 
 import pytest
 
@@ -64,7 +62,7 @@ async def test_write_waits_and_resumes_after_entire_host_restarts(tmp_path):
     state_dir = tmp_path / "state"
     host = ProjectHost(state_dir, tmp_path)
     app = await host.application("writer")
-    session = await app.create_session("create", "Frozen", ("read_file", "write_file"))
+    session = await app.create_session("create", "Frozen", ("read", "write"))
     pending = await send(app, session, "send", "/write result.txt approved")
     assert pending.status == "waiting_approval"
     assert not (tmp_path / "result.txt").exists()
@@ -101,18 +99,22 @@ async def test_write_waits_and_resumes_after_entire_host_restarts(tmp_path):
         await restarted.close()
 
 
-async def test_denied_write_does_not_modify_workspace_and_read_cannot_escape(tmp_path):
+async def test_denied_write_and_outside_read_require_authorization(tmp_path):
     host = ProjectHost(tmp_path / "state", tmp_path)
     try:
         app = await host.application("writer")
-        session = await app.create_session("create", "Frozen", ("read_file", "write_file"))
+        session = await app.create_session("create", "Frozen", ("read", "write"))
         pending = await send(app, session, "1", "/write denied.txt no")
         await app.approve(session.id, f"{pending.id}:write-1", pending.generation, "deny")
         await app.wait_idle()
         assert not (tmp_path / "denied.txt").exists()
         outcome = await send(app, session, "2", "/read ../outside.txt")
-        assert outcome.status == "completed"
-        assert "path_denied" in outcome.result
+        assert outcome.status == "waiting_approval"
+        approval = (await app.sessions.status(session.id))["approvals"][0]
+        assert approval["proposal"]["scope_key"] == "outside:workspace"
+        await app.approve(session.id, approval["id"], outcome.generation, "deny")
+        await app.wait_idle()
+        assert (await app.store.get_admission(outcome.id, session.id)).status == "completed"
     finally:
         await host.close()
 
@@ -131,12 +133,11 @@ async def test_second_owner_is_rejected_and_lock_releases_on_close(tmp_path):
         await two.close()
 
 
-@pytest.mark.parametrize("upgrade_v10", [False, True])
-async def test_durable_decision_is_resumed_if_process_stopped_before_claim(tmp_path, upgrade_v10):
+async def test_durable_decision_is_resumed_if_process_stopped_before_claim(tmp_path):
     state = tmp_path / "state"
     host = ProjectHost(state, tmp_path)
     app = await host.application("writer")
-    session = await app.create_session("create", "Frozen", ("write_file",))
+    session = await app.create_session("create", "Frozen", ("write",))
     pending = await send(app, session, "send", "/write recovered.txt value")
     await app.receipts.decide(
         f"{pending.id}:write-1",
@@ -145,12 +146,6 @@ async def test_durable_decision_is_resumed_if_process_stopped_before_claim(tmp_p
         "approve",
     )
     await host.close()
-    if upgrade_v10:
-        with closing(sqlite3.connect(state / "profiles" / "writer" / "business.db")) as conn:
-            conn.execute("DROP TABLE approval_decisions")
-            conn.execute("ALTER TABLE admissions DROP COLUMN active_seconds")
-            conn.execute("PRAGMA user_version=10")
-            conn.commit()
     restarted = ProjectHost(state, tmp_path)
     try:
         app = await restarted.application("writer")

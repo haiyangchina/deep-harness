@@ -132,12 +132,10 @@ function CapabilityCard({ cap }: { cap: CapabilitySpec }) {
 
 interface CreateRequest {
   request_id: string
-  // Internal frozen-compatibility field; the UI only exposes the harness tier.
-  engine?: string
   harness: string
   tools?: string[]
   extensions?: string[]
-  permission_mode?: PermissionMode
+  permission_mode: PermissionMode
   risk_acknowledged?: boolean
 }
 
@@ -147,7 +145,7 @@ export function CreateSession({ close }: { close: () => void }) {
     return raw ? JSON.parse(raw) : null
   })
   const [harness, setHarness] = useState(saved?.harness ?? 'general')
-  const [permissionMode, setPermissionMode] = useState<PermissionMode>(saved ? saved.permission_mode ?? 'legacy' : 'ask')
+  const [permissionMode, setPermissionMode] = useState<PermissionMode>(saved ? saved.permission_mode : 'ask')
   const [extensions, setExtensions] = useState<string[]>(saved?.extensions ?? [])
   const [showExtensions, setShowExtensions] = useState(Boolean(saved?.extensions?.length))
   const [manifest, setManifest] = useState<CapabilityManifest | null>(null)
@@ -291,10 +289,6 @@ export function Capabilities() {
           <p className="muted small">
             按需在新建会话的「扩展能力」区开启：{manifest.extensions.join(' · ')}；
             MCP 工具由 Profile 的 mcp.toml 配置。
-          </p>
-          <h2>兼容工具</h2>
-          <p className="muted small">
-            {manifest.legacy_tools.join(' · ')} 仅供显式 CLI/HTTP 授予，不出现在新建会话清单中。
           </p>
           <h2>安全访问权限</h2>
           <p className="muted small">

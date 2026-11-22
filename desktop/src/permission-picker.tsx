@@ -7,7 +7,7 @@ interface PermissionPickerProps {
   value: PermissionMode
   disabled?: boolean
   direction?: 'up' | 'down'
-  onChange: (value: Exclude<PermissionMode, 'legacy'>) => void
+  onChange: (value: PermissionMode) => void
 }
 
 function Icon({ kind }: { kind: string }) {
@@ -56,7 +56,7 @@ export function PermissionPicker({ value, disabled, direction = 'up', onChange }
     </button>
     {open && <div className={`permission-menu permission-menu-${direction}`} role="menu" aria-label="权限模式">
       {permissionOptions.map(row => <button type="button" key={row.value} role="menuitemradio"
-        aria-checked={value === row.value || (value === 'legacy' && row.value === 'ask')}
+        aria-checked={value === row.value}
         className={row.value === 'full' ? 'permission-danger' : ''}
         onClick={() => {
           setOpen(false)
@@ -68,7 +68,7 @@ export function PermissionPicker({ value, disabled, direction = 'up', onChange }
           onChange(row.value)
         }}>
         <Icon kind={row.icon} /><span><strong>{row.label}</strong><small>{row.description}</small></span>
-        {(value === row.value || (value === 'legacy' && row.value === 'ask')) && <span aria-hidden="true">✓</span>}
+        {(value === row.value) && <span aria-hidden="true">✓</span>}
       </button>)}
       <p>内置能力默认启用。除完全访问外，文件操作、终端命令与访问互联网均逐次确认；运行状态目录不开放。</p>
     </div>}

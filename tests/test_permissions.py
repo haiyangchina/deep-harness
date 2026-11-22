@@ -1,8 +1,6 @@
 """Permission modes govern real tool dispatch and survive upgrades and restarts."""
 
 import json
-import sqlite3
-from contextlib import closing
 
 import httpx
 import pytest
@@ -14,7 +12,6 @@ from deep_harness.application.permissions import approval_reason
 from deep_harness.application.tools import ToolGateway
 from deep_harness.bootstrap import ProjectHost
 from deep_harness.domain.models import DomainError, ProfileScope, Session, ToolCall
-from deep_harness.infrastructure.migrations import SCHEMA_VERSION
 from deep_harness.runtime.models import LangChainModel
 from deep_harness.transports.api import create_api
 
@@ -275,32 +272,6 @@ async def test_gateway_rejects_unapproved_external_read_even_without_runtime(tmp
             await gateway.execute(ToolCall("outside", "read", {"path": str(outside)}))
     finally:
         await host.close()
-
-
-async def test_v8_upgrade_keeps_legacy_scope_and_frozen_runtime(tmp_path):
-    host = project(tmp_path, [])
-    app = await host.application("one")
-    session = await app.create_session("create", "old")
-    binding = await app.sessions.policies.get(session.id)
-    home = app.scope.home
-    await host.close()
-    with closing(sqlite3.connect(home / "business.db")) as conn:
-        conn.execute("ALTER TABLE sessions DROP COLUMN permission_mode")
-        conn.execute("ALTER TABLE sessions DROP COLUMN permission_revision")
-        conn.execute("PRAGMA user_version=8")
-        conn.commit()
-    restarted = project(tmp_path, [])
-    try:
-        app = await restarted.application("one")
-        restored = await app.store.get_session(session.id, "operator")
-        assert restored.permission_mode == "legacy" and restored.permission_revision == 0
-        assert await app.sessions.policies.get(session.id) == binding
-        await app.sessions.validate(restored)
-        with closing(sqlite3.connect(home / "business.db")) as conn:
-            assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
-        assert list((home / "backups").glob("*.db"))
-    finally:
-        await restarted.close()
 
 
 async def test_api_validates_modes_and_enforces_profile_and_operator_access(tmp_path):

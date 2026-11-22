@@ -23,7 +23,7 @@ class RecordingModel(DiagnosticModel):
 async def test_fork_preserves_completed_prefix_and_leaves_unknown_effect_untouched(tmp_path):
     host = ProjectHost(tmp_path / "state", tmp_path)
     app = await host.application("default")
-    source = await app.create_session("source", "Frozen", ("read_file", "write_file"))
+    source = await app.create_session("source", "Frozen", ("read", "write"))
     await app.submit(source.id, "complete", "remember the completed turn")
     await app.wait_idle()
     uncertain = await app.store.admit(

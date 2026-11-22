@@ -9,7 +9,6 @@ from deep_harness.application.capabilities import (
     CORE_TOOLS,
     EXTENSION_TOOLS,
     HARNESSES,
-    LEGACY_TOOLS,
     READ_ONLY_CORE,
     READ_ONLY_HARNESSES,
     WEB_TOOLS,
@@ -38,7 +37,6 @@ def test_manifest_describes_four_core_capabilities():
     assert len(CORE_TOOLS) == 10 and "local_time" not in CORE_TOOLS
     assert set(WEB_TOOLS) <= set(CORE_TOOLS)
     assert set(WEB_TOOLS) <= set(READ_ONLY_CORE)
-    assert set(data["legacy_tools"]) == set(LEGACY_TOOLS)
     assert set(data["extensions"]) == set(EXTENSION_TOOLS)
     assert data["harnesses"] == list(HARNESSES)
     assert set(data["read_only_harnesses"]) == READ_ONLY_HARNESSES
@@ -70,16 +68,16 @@ def test_harness_contract_is_shared_by_domain_guides_and_manifest():
 
 
 def test_api_contract_accepts_research_web():
-    body = CreateSession(request_id="x", prompt="p", engine="deep", harness="research_web")
+    body = CreateSession(request_id="x", prompt="p", harness="research_web")
     assert body.harness == "research_web"
 
 
 def test_workspace_constants_are_derived():
     assert set(READ_ONLY_CORE) == {"read", "list_files", "search_files", *WEB_TOOLS}
     assert not set(WEB_TOOLS) & MUTATING_TOOLS
-    assert set(READ_TOOLS) == set(READ_ONLY_CORE) | {"read_file"}
+    assert set(READ_TOOLS) == set(READ_ONLY_CORE)
     assert {"write", "edit", "bash", "apply_patch"} <= MUTATING_TOOLS
-    assert set(CORE_TOOLS) | set(LEGACY_TOOLS) | {"apply_patch"} == set(CODING_TOOLS)
+    assert set(CORE_TOOLS) | {"apply_patch"} == set(CODING_TOOLS)
 
 
 @pytest.mark.parametrize(

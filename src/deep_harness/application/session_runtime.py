@@ -29,36 +29,28 @@ class SessionRuntime:
         harness="general",
         knowledge=None,
         mcp_catalog=None,
-        version=4,
     ):
-        identity = dict(self.model.identity)
-        if version == 1 and identity.get("provider") == "ollama":
-            identity.pop("reasoning", None)
         result = {
-            "version": version,
+            "version": 4,
             "engine": engine,
             "workspace": str(self.scope.workspace),
-            "model": identity,
-            "tools": tool_definitions(tools, mcp_catalog, snapshot_version=version),
+            "model": dict(self.model.identity),
+            "tools": tool_definitions(tools, mcp_catalog),
             "execution": self.limits.model_dump(),
         }
-        if version >= 3:
-            # One context plane for every harness tier; the former
-            # standard/deep projection split is gone.
-            result["context_projection"] = CONTEXT_POLICY
-        if version >= 2:
-            result["model_request_timeout"] = self.model.request_timeout
-            if self.web_settings is not None and set(tools).intersection(WEB_TOOLS):
-                result["web"] = {
-                    key: value
-                    for key, value in self.web_settings.model_dump(mode="json").items()
-                    if not key.endswith("_env") and key not in {"searxng_url", "firecrawl_url"}
-                }
-                result["web"]["endpoint_hash"] = fingerprint(
-                    [self.web_settings.searxng_url, self.web_settings.firecrawl_url]
-                )
-                if "pi" not in self.web_settings.routing:
-                    result["web"].pop("pi_providers", None)
+        result["context_projection"] = CONTEXT_POLICY
+        result["model_request_timeout"] = self.model.request_timeout
+        if self.web_settings is not None and set(tools).intersection(WEB_TOOLS):
+            result["web"] = {
+                key: value
+                for key, value in self.web_settings.model_dump(mode="json").items()
+                if not key.endswith("_env") and key not in {"searxng_url", "firecrawl_url"}
+            }
+            result["web"]["endpoint_hash"] = fingerprint(
+                [self.web_settings.searxng_url, self.web_settings.firecrawl_url]
+            )
+            if "pi" not in self.web_settings.routing:
+                result["web"].pop("pi_providers", None)
         if knowledge is not None:
             result["knowledge"] = knowledge
         if harness != "general":
@@ -86,6 +78,8 @@ class SessionRuntime:
         return None
 
     async def validate(self, session):
+        if session.permission_mode not in {"ask", "auto", "full"}:
+            raise DomainError("runtime_mismatch", "Session permission mode is unsupported")
         binding = await self.policies.get(session.id)
         knowledge = binding["snapshot"].get("knowledge") if binding else None
         catalog = await self.catalog_for(session.tools)
@@ -97,7 +91,6 @@ class SessionRuntime:
                 harness=session.harness,
                 knowledge=knowledge,
                 mcp_catalog=catalog,
-                version=binding["snapshot"].get("version", 1) if binding else 4,
             ),
         )
 
@@ -112,7 +105,6 @@ class SessionRuntime:
             harness=status["session"].harness,
             knowledge=knowledge,
             mcp_catalog=catalog,
-            version=binding["snapshot"].get("version", 1) if binding else 4,
         )
         saved = binding["snapshot"] if binding else {}
         status["runtime"] = {

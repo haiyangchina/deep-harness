@@ -1,7 +1,7 @@
 # deep-harness Desktop
 
 专门操作 **deep-harness agent** 的 Electron + TypeScript + React 桌面端。
-不使用旧 Harness Desktop 的 RPC，不需要桌面账号、登录或 Codex。
+通过本机 API 连接独立 Python 后端。
 默认连接本机 Ollama 的 `qwen3.5:9b`；模型服务和该模型需要已安装并运行。
 
 ## Windows 启动
@@ -21,7 +21,7 @@
 ```
 
 脚本通过 `conda run -n deep-harness` 找到独立环境的 Python，并让桌面自动识别。
-它不修改旧 Harness 的 PM 环境或根依赖清单。首次安装 Electron 会下载较大的运行时，
+首次安装 Electron 会下载较大的运行时，
 请允许安装完成。若 GitHub 下载不可达，可在当前 PowerShell 设置
 `$env:ELECTRON_MIRROR='https://registry.npmmirror.com/-/binary/electron/'` 后重试安装；
 Electron 安装器仍校验包中锁定版本的校验和。该设置只影响 Electron 下载。
@@ -39,7 +39,7 @@ npm start
 
 1. **Python**：`deep-harness` Conda 环境中的 `python.exe`，不是 Conda base。
 2. **工作目录**：要分析或修改的项目目录。
-3. **状态目录**：桌面默认已提供独立目录，可以直接使用。
+3. **状态目录**：桌面默认已提供独立目录，可以直接使用。请选择适用于当前发布的状态目录。
 4. **Profile**：默认 `default`，然后点击“启动本机 Agent”。
 
 首次运行环境选择不是账号登录。成功后记住路径，之后直接打开工作台。
@@ -148,24 +148,18 @@ Python 测试仍使用仓库根 `scripts/run_tests.sh`，见上级 README。
 | 情况 | 操作 |
 | --- | --- |
 | Python 启动失败 | 确认 Python 3.12 来自 deep-harness，先运行上级 bootstrap.ps1 |
-| Profile owner 冲突 | 结束使用该 Profile 的旧 CLI/API，或改用新的独立状态目录 |
+| Profile owner 冲突 | 结束使用该 Profile 的CLI/API 实例，或改用新的独立状态目录 |
 | workspace_mismatch | 恢复原工作目录，或选择新 Profile；不要复制数据库来绕过绑定 |
 | 模型无回复 | 检查 Ollama 服务及 `ollama list`，查看右侧事件和任务 result |
-| 快照不兼容 | 恢复原模型/工具配置，或审阅状态后分支；UI 不改写旧快照 |
+| 快照不兼容 | 恢复原模型/工具配置，或审阅状态后分支 |
 | 操作结果 unknown | 核对实际文件、命令副作用与状态台账；UI 可显式创建安全分支 |
 | 提交结果未确认 | 先查看会话状态；保留的相同 submission_id 支持手动幂等重试 |
 
-unknown 对账、备份/还原、技能停用、记忆删除、子任务 steer/stop 等高级管理仍使用原 CLI/API。
-Cron、插件迁移、嵌入式交互终端和 Git diff 面板尚未在本桌面版实现，不显示虚假可用入口。
+unknown 对账、备份/还原、技能停用、记忆删除、子任务 steer/stop 等高级管理使用 CLI/API。
+Cron、插件市场、嵌入式交互终端和 Git diff 面板尚未在本桌面版实现，不显示虚假可用入口。
 
 
-此前验证的未签名 Windows x64 便携包约 105 MiB，已在 Windows 10 主机验证
-原生窗口启动、独立 Python 后端启动和 loopback health；完整干净机器安装仍待验收。
-该历史构建的 SHA-256：
-`2239D5DA9083D9254573EF22558E0B2F7560F55A26FE97B9CC60D4CB6FA5D1BB`。
-
-
-## 三种批准模式（2026-11-14 修订）
+## 三种批准模式
 
 新建会话和输入框右下角可选择「请求批准 / 帮我批准 / 完全访问权限」，新建默认请求批准。
 三档只是批准策略，不授予工具；差异落在审批频率与信任半径：
@@ -180,11 +174,10 @@ Cron、插件迁移、嵌入式交互终端和 Git diff 面板尚未在本桌面
 后台子任务未结束时不能切换。模式可持久恢复，历史消息和模型工具列表不会随切换改写。
 此菜单不是操作系统沙箱，完整规则见上级 README。
 
-源码更新后请停止并重启桌面后端；npm run build 更新开发版界面。本次没有重新生成
-release 下的便携 exe，旧便携包不会自动包含新菜单。
+源码更新后运行 `npm run build`，再重启桌面端。便携包可用 `npm run dist:win` 构建。
 
 
-## 启动连接诊断（2026-11-09）
+## 启动连接诊断
 
 `[deep-harness] Desktop ready; local backend connected` 是正常启动信息。
 桌面现在会在子进程报告端口后额外验证 `/health`，验证成功才显示已连接；验证失败
@@ -192,7 +185,7 @@ release 下的便携 exe，旧便携包不会自动包含新菜单。
 
 读取或写入的连接异常现在显示错误码和本机接口，例如 `ECONNREFUSED`、`ECONNRESET`、
 `TIMEOUT`、`INVALID_JSON`。诊断不包含请求正文、token 或查询文本。
-连接被拒绝/重置与超时的来源要结合实际新错误码判断，不能仅凭旧版“读取失败”确定。
+连接被拒绝/重置与超时的来源要结合实际新错误码判断。
 
 如果日志中还有带乱码的 `start-desktop.ps1` ParserError，请确认运行的是当前 checkout
 的脚本；当前脚本为 ASCII，并已通过原生 Windows PowerShell 5.1 解析及两种启动路径测试。

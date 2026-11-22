@@ -1,15 +1,4 @@
-"""The single agent-graph builder for the unified execution kernel.
-
-There is exactly one graph in deep-harness: a deepagents ``create_deep_agent``
-graph assembled here. Harness tiers (general/coding/research/research_web) are
-configuration profiles supplied by ``HarnessSpec`` -- they change prompts,
-reports and delegation availability, never the underlying loop. This is what
-removes the old user-facing engine choice (standard vs deep).
-
-The four contracts live in ``HarnessGuardMiddleware`` (approvals, receipts,
-fencing, recovery) and in the guarded tools produced by the runtime; the
-ledger layer is untouched.
-"""
+"""Deep Agents registration, prompts and specialist descriptors."""
 
 from deepagents.middleware import FilesystemMiddleware
 from deepagents.profiles import (

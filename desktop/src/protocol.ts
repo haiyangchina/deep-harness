@@ -28,10 +28,10 @@ export interface Session {
   engine: string
   harness: string
   tools: string[]
-  permission_mode?: PermissionMode
+  permission_mode: PermissionMode
   permission_revision?: number
 }
-export type PermissionMode = 'legacy' | 'ask' | 'auto' | 'full'
+export type PermissionMode = 'ask' | 'auto' | 'full'
 export interface CapabilitySpec {
   key: string
   label: string
@@ -71,7 +71,6 @@ export interface CapabilityManifest {
   capabilities: CapabilitySpec[]
   core_tools: string[]
   read_only_core: string[]
-  legacy_tools: string[]
   extensions: string[]
   access_scopes?: AccessScope[]
   permission_modes?: PermissionModeSpec[]

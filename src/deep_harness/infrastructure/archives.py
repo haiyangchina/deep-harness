@@ -12,6 +12,7 @@ from importlib.metadata import version
 from pathlib import Path, PurePosixPath
 
 from deep_harness.domain.models import DomainError
+from deep_harness.infrastructure.database import SCHEMA_VERSION
 from deep_harness.server_config import number
 
 MAX_ARCHIVE_BYTES = number("archives.max_bytes")
@@ -175,6 +176,10 @@ def restore_archive(scope, source):
                     raise DomainError(
                         "archive_corrupt", "Restored database failed integrity validation"
                     )
+                if name == "business.db":
+                    version = conn.execute("PRAGMA user_version").fetchone()[0]
+                    if version != SCHEMA_VERSION:
+                        raise DomainError("schema_unsupported", "Archive schema is unsupported")
         rebind_profile(staging / "business.db", manifest["profile_id"], scope.profile_id)
         os.replace(staging, scope.home)
         return {

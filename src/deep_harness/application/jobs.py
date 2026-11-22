@@ -132,8 +132,8 @@ class JobService:
         self.lock = asyncio.Lock()
         self.model_lock = asyncio.Lock()
 
-    def runtime_hash(self, version=4):
-        return fingerprint(self.app.sessions.snapshot(CORE_TOOLS, version=version))
+    def runtime_hash(self):
+        return fingerprint(self.app.sessions.snapshot(CORE_TOOLS))
 
     async def create(self, plan):
         async with self.lock:
@@ -310,7 +310,7 @@ class JobService:
             if job["deadline"] is not None and time.time() >= job["deadline"]:
                 await self.ledger.set_status(job_id, "blocked", "Long-task deadline has elapsed")
                 return
-            if job["runtime_hash"] not in {self.runtime_hash(), self.runtime_hash(version=3)}:
+            if job["runtime_hash"] != self.runtime_hash():
                 await self.ledger.set_status(job_id, "blocked", "Runtime configuration has changed")
                 return
             group = pending[0]["definition"]["group"]

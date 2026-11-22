@@ -40,10 +40,6 @@ from deep_harness.runtime.inference import normalized_usage, usage_totals
 from deep_harness.runtime.models import LangChainModel, to_langchain
 from deep_harness.server_config import number
 
-# ReceiptedModel is now the guard module's HarnessGuardMiddleware.
-# The alias preserves the historical name used by tests and external imports.
-ReceiptedModel = HarnessGuardMiddleware
-
 
 class HarnessRuntime:
     def __init__(
@@ -65,7 +61,6 @@ class HarnessRuntime:
         delegation_id=None,
         model_lock=None,
         pause_probe=None,
-        snapshot_version=4,
         tool_lock=None,
         background_launcher=None,
     ):
@@ -88,9 +83,8 @@ class HarnessRuntime:
         self.model = model
         self.saver = saver
         self.mcp = mcp
-        self.snapshot_version = snapshot_version
         self.tool_specs = tool_definitions(
-            session.tools, mcp_bindings, snapshot_version=snapshot_version
+            session.tools, mcp_bindings
         )
         self.gateway = ToolGateway(
             scope,
@@ -138,7 +132,7 @@ class HarnessRuntime:
 
     def _tool(self, spec):
         original = spec["name"]
-        name = f"harness_{original}" if original == "read_file" else original
+        name = original
 
         async def invoke(runtime: ToolRuntime, **arguments):
             await pause_at_boundary(self.pause_probe, self.claim.admission.generation)
@@ -281,7 +275,6 @@ class HarnessRuntime:
             mcp_bindings=self.gateway.mcp_bindings,
             web_client=self.gateway.web_client,
             record_messages=False,
-            snapshot_version=self.snapshot_version,
             delegation_id=delegation["id"],
             model_lock=self.model_lock,
             tool_lock=self.tool_lock,
@@ -324,14 +317,13 @@ class HarnessRuntime:
         ):
             return True
         proposal = {"tool_name": call.name, "arguments": call.arguments}
-        if self.session.permission_mode != "legacy":
-            proposal.update(
-                reason=self.gateway.approval_reason(call),
-                permission_mode=self.session.permission_mode,
-                permission_revision=self.session.permission_revision,
-                scope_key=scope_key,
-                reusable=can_reuse,
-            )
+        proposal.update(
+            reason=self.gateway.approval_reason(call),
+            permission_mode=self.session.permission_mode,
+            permission_revision=self.session.permission_revision,
+            scope_key=scope_key,
+            reusable=can_reuse,
+        )
         decision = await self.gateway.interaction(call, key, digest, proposal)
         if decision is None:
             interrupt(
@@ -514,9 +506,3 @@ def build_readonly_probe(model, checkpointer):
         checkpointer=checkpointer,
         name="deep-harness-deep-readonly-probe",
     )
-
-
-# Compatibility aliases: the unified kernel supersedes the old Deep engine, and
-# the public "build_agent" entry point lives in runtime/agent.py. External
-# imports of DeepRuntime keep working but now resolve to the single kernel.
-DeepRuntime = HarnessRuntime

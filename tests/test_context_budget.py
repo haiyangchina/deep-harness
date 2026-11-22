@@ -206,7 +206,7 @@ async def test_oversize_user_input_still_fails_explicitly():
 def test_deep_projection_keeps_current_tool_exchange_and_drops_old_external_content():
     from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-    from deep_harness.runtime.deep import ReceiptedModel
+    from deep_harness.runtime.guard import HarnessGuardMiddleware
 
     class Request:
         tools = []
@@ -218,7 +218,7 @@ def test_deep_projection_keeps_current_tool_exchange_and_drops_old_external_cont
             return Request(messages)
 
     limits = ExecutionSettings(max_context_characters=2000, summary_characters=256)
-    middleware = ReceiptedModel(SimpleNamespace(limits=limits, model=DiagnosticModel()))
+    middleware = HarnessGuardMiddleware(SimpleNamespace(limits=limits, model=DiagnosticModel()))
     current = [
         HumanMessage(content="new question"),
         AIMessage(content="", tool_calls=[{"name": "read", "args": {}, "id": "new"}]),

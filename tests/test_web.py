@@ -7,7 +7,6 @@ import pytest
 
 from deep_harness.application.capabilities import WEB_TOOLS
 from deep_harness.application.config import load_web_settings
-from deep_harness.application.permissions import legacy_reason
 from deep_harness.application.tools import (
     TOOL_ARGUMENTS,
     TOOL_DESCRIPTIONS,
@@ -321,12 +320,10 @@ def test_load_web_settings_reads_defaults_and_operator_override(tmp_path):
     assert custom.routing == ("fake",) and custom.max_response_chars == 1234
 
 
-def test_web_tools_are_registered_and_never_legacy_exempt():
+def test_web_tools_are_registered():
     assert set(WEB_TOOLS) <= set(TOOL_ARGUMENTS)
     assert all(name in TOOL_DESCRIPTIONS for name in WEB_TOOLS)
     assert len(tool_definitions(tuple(WEB_TOOLS))) == 4
-    for name in WEB_TOOLS:
-        assert legacy_reason(ToolCall("c", name, {})) == "需要逐项批准"
 
 
 async def test_gateway_dispatches_web_search_with_fake_backend(tmp_path):

@@ -18,7 +18,7 @@ async def test_workspace_binding_blocks_recovery_into_another_directory(tmp_path
     state = tmp_path / "state"
     host = ProjectHost(state, tmp_path)
     app = await host.application("writer")
-    session = await app.create_session("create", "Frozen", ("write_file",))
+    session = await app.create_session("create", "Frozen", ("write",))
     admission = await app.submit(session.id, "send", "/write result.txt correct")
     await app.wait_idle()
     pending = await app.store.get_admission(admission.id, session.id)
@@ -46,7 +46,7 @@ async def test_session_pages_and_pending_approvals_are_authorized_and_current(tm
     host = ProjectHost(tmp_path / "state", tmp_path)
     try:
         app = await host.application("one")
-        sessions = [await app.create_session(str(i), "Frozen", ("write_file",)) for i in range(3)]
+        sessions = [await app.create_session(str(i), "Frozen", ("write",)) for i in range(3)]
         await app.store.create_session(principal="other", request_id="hidden", prompt="", tools=())
         token = "a-local-operator-token-longer-than-thirty-two"
         headers = {"Authorization": f"Bearer {token}"}

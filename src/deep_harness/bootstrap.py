@@ -23,8 +23,7 @@ from deep_harness.application.scopes import ProfileResolver
 from deep_harness.application.session_runtime import SessionRuntime
 from deep_harness.application.tools import TOOL_ARGUMENTS
 from deep_harness.application.workspace import CODING_TOOLS, MUTATING_TOOLS, READ_TOOLS
-from deep_harness.domain.identity import fingerprint
-from deep_harness.domain.models import DomainError, ExecutionClaim
+from deep_harness.domain.models import DomainError
 from deep_harness.infrastructure.archives import create_archive, restore_archive
 from deep_harness.infrastructure.delegations import DelegationLedger
 from deep_harness.infrastructure.executions import ExecutionLedger
@@ -36,7 +35,6 @@ from deep_harness.infrastructure.reconciliation import reconcile
 from deep_harness.infrastructure.store import BusinessStore
 from deep_harness.infrastructure.web import WebClient
 from deep_harness.infrastructure.web.settings import WebSettings
-from deep_harness.runtime.approval_checkpoint import approval_ids, checkpoint_interrupts
 from deep_harness.runtime.deep import HarnessRuntime
 from deep_harness.runtime.mcp import McpRegistry
 from deep_harness.runtime.models import DiagnosticModel
@@ -117,8 +115,6 @@ class ProfileApplication:
             await self.saver.setup()
             queued = await self.executions.recover()
             await self.delegations.reconcile_background()
-            if self.recover_queued:
-                await self.restore_waits()
             for session_id in queued if self.recover_queued else ():
                 self.schedule(session_id)
             decided = await self.receipts.decided_waiting() if self.recover_queued else ()
@@ -131,28 +127,6 @@ class ProfileApplication:
             await self.resources.aclose()
             raise
         return self
-
-    async def restore_waits(self):
-        for admission in await self.executions.unbound_waits():
-            session = await self.store.get_session(admission.session_id, "operator")
-            try:
-                await self.sessions.validate(session)
-                binding = await self.sessions.policies.get(session.id)
-                runtime = self.runtime(
-                    session,
-                    ExecutionClaim(admission, self.owner),
-                    binding["snapshot"].get("mcp_bindings"),
-                    snapshot_version=binding["snapshot"].get("version", 1),
-                )
-                state = await runtime.graph.aget_state(runtime.config)
-                ids = approval_ids(checkpoint_interrupts(state), admission.generation)
-                await self.executions.bind_wait(admission, ids)
-                if not ids:
-                    logger.warning("No verified approval checkpoint for %s", admission.id)
-            except Exception as exc:
-                logger.warning(
-                    "Approval checkpoint for %s unavailable [%s]", admission.id, type(exc).__name__
-                )
 
     async def close(self, grace_seconds=SHUTDOWN_GRACE_SECONDS):
         async with self.control:
@@ -174,12 +148,12 @@ class ProfileApplication:
         tools: tuple[str, ...] | None = None,
         engine: str = "standard",
         harness: str = "general",
-        permission_mode: str = "legacy",
+        permission_mode: str = "ask",
         extensions: tuple[str, ...] = (),
         mcp_tools: tuple[str, ...] = (),
         full_access_acknowledged: bool = False,
     ):
-        if permission_mode not in {"legacy", "ask", "auto", "full"}:
+        if permission_mode not in {"ask", "auto", "full"}:
             raise DomainError("permission_mode", "Unknown permission mode")
         if permission_mode == "full" and not full_access_acknowledged:
             raise DomainError(
@@ -219,9 +193,6 @@ class ProfileApplication:
             harness=harness,
             permission_mode=permission_mode,
             runtime_snapshot=self.sessions.snapshot(frozen_tools, **snapshot_fields),
-            compatible_runtime_hashes=(
-                fingerprint(self.sessions.snapshot(frozen_tools, version=3, **snapshot_fields)),
-            ),
         )
 
     @mutation
@@ -363,13 +334,7 @@ class ProfileApplication:
         *,
         stage_limits=None,
         job_id=None,
-        snapshot_version=4,
     ):
-        # A single user-facing mode: users never choose an engine. The runtime is
-        # selected from the frozen session contract (derived automatically from
-        # the harness at creation time). Specialised harnesses use the unified
-        # deepagents kernel; the general tier keeps the compatible LangGraph loop.
-        # ``engine`` is a frozen compatibility field, not a user-facing toggle.
         runtime_type = HarnessRuntime if session.engine == "deep" else StandardRuntime
         kwargs = dict(
             session=session,
@@ -384,7 +349,6 @@ class ProfileApplication:
             mcp=self.mcp,
             mcp_bindings=mcp_bindings,
             web_client=self.web,
-            snapshot_version=snapshot_version,
         )
         if runtime_type is HarnessRuntime and stage_limits is None:
             kwargs["background_launcher"] = self.launch_background
@@ -451,7 +415,6 @@ class ProfileApplication:
                     mcp_bindings,
                     stage_limits=limits if stage else None,
                     job_id=stage["job_id"] if stage else None,
-                    snapshot_version=binding["snapshot"].get("version", 1) if binding else 4,
                 )
                 result = await runtime.run(resume=resume)
         except asyncio.CancelledError:
@@ -553,39 +516,12 @@ class ProfileApplication:
         return admission_id
 
     @mutation
-    async def bind_runtime(self, session_id, expected_fingerprint):
-        if await self.jobs.ledger.owner(session_id) is not None:
-            raise DomainError(
-                "job_stage_managed", "Permissions and binding are fixed for job stages"
-            )
-        async with self.locks.setdefault(session_id, asyncio.Lock()):
-            session = await self.store.get_session(session_id, "operator")
-            bound = await self.sessions.policies.get(session_id)
-            knowledge = bound["snapshot"].get("knowledge") if bound else None
-            catalog = await self.sessions.catalog_for(session.tools)
-            await self.sessions.policies.adopt(
-                session_id,
-                self.sessions.snapshot(
-                    session.tools,
-                    engine=session.engine,
-                    harness=session.harness,
-                    knowledge=knowledge,
-                    mcp_catalog=catalog,
-                    version=bound["snapshot"].get("version", 1) if bound else 4,
-                ),
-                expected_fingerprint,
-            )
-            await self.restore_waits()
-        self.schedule(session_id)
-        return await self.sessions.status(session_id)
-
-    @mutation
     async def set_permissions(
         self, session_id, mode, expected_revision, full_access_acknowledged=False
     ):
         if await self.jobs.ledger.owner(session_id) is not None:
             raise DomainError(
-                "job_stage_managed", "Permissions and binding are fixed for job stages"
+                "job_stage_managed", "Permissions are fixed for job stages"
             )
         status = await self.store.session_status(session_id, "operator")
         if status["active_admissions"]:

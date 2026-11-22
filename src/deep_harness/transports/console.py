@@ -3,11 +3,10 @@
 import asyncio
 import json
 import shlex
-import sys
 from dataclasses import asdict
 from uuid import uuid4
 
-from deep_harness.application.capabilities import CORE_TOOLS, READ_ONLY_CORE
+from deep_harness.application.capabilities import derive_grants
 from deep_harness.application.workspace import PROJECT_PROMPT
 from deep_harness.domain.models import DomainError
 from deep_harness.runtime.inference import usage_totals
@@ -21,9 +20,7 @@ def display(value):
 async def select_session(app, args):
     if args.session:
         if (
-            args.allow_write
-            or args.allow_exec
-            or args.allow_memory
+            args.allow_memory
             or args.allow_delegation
             or args.allow_patch
             or args.mcp_tool
@@ -36,28 +33,22 @@ async def select_session(app, args):
             raise DomainError("immutable_harness", "Existing session harness cannot be changed")
         return session
     if args.read_only and (
-        args.allow_write
-        or args.allow_exec
-        or args.allow_memory
+        args.allow_memory
         or args.allow_delegation
         or args.allow_patch
         or args.mcp_tool
     ):
         raise DomainError("immutable_grants", "--read-only cannot be combined with extra grants")
-    if args.allow_write or args.allow_exec:
-        print(
-            "注意：--allow-write / --allow-exec 对应的能力现在默认授予，参数仅为兼容保留。",
-            file=sys.stderr,
-        )
-    tools = READ_ONLY_CORE if args.read_only else CORE_TOOLS
-    if args.allow_patch:
-        tools += ("apply_patch",)
-    if args.allow_memory:
-        tools += ("save_memory",)
-    if args.allow_delegation:
-        tools += ("delegate_task", "check_delegation")
-    tools += tuple(args.mcp_tool)
     harness = args.harness or "general"
+    extensions = []
+    if args.allow_patch:
+        extensions.append("apply_patch")
+    if args.allow_memory:
+        extensions.append("save_memory")
+    if args.allow_delegation:
+        extensions.append("delegate_task")
+    grant_harness = "research" if args.read_only else harness
+    tools = derive_grants(grant_harness, extensions, args.mcp_tool)
     # The execution kernel is derived from the harness tier, never chosen by the
     # operator. Specialised tiers require the unified deepagents kernel.
     engine = "deep" if harness != "general" else "standard"
@@ -67,7 +58,7 @@ async def select_session(app, args):
         tools,
         engine=engine,
         harness=harness,
-        permission_mode=args.permission_mode or "legacy",
+        permission_mode=args.permission_mode or "ask",
         full_access_acknowledged=args.acknowledge_full_access,
     )
 
@@ -250,11 +241,6 @@ async def fork(app, args):
     return 0
 
 
-async def bind_session(app, args):
-    await app.bind_runtime(args.session, args.fingerprint)
-    await app.wait_idle()
-    display(await app.sessions.status(args.session))
-    return 0
 
 
 async def conversation(app, args):
@@ -300,7 +286,6 @@ COMMANDS = {
     "delegation-stop": delegation_stop,
     "approve": approve,
     "fork": fork,
-    "bind-session": bind_session,
     "chat": conversation,
     "repl": conversation,
 }

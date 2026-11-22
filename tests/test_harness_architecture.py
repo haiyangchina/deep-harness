@@ -32,7 +32,6 @@ from deep_harness.runtime.agent import (
     system_prompt_for,
 )
 from deep_harness.runtime.backend import ToolGatewayBackend
-from deep_harness.runtime.deep import HarnessGuardMiddleware, ReceiptedModel
 from deep_harness.runtime.harnesses import HarnessReport
 
 
@@ -64,12 +63,6 @@ def test_manifest_exposes_specs_and_context_policy_without_engine():
 def test_derive_grants_no_longer_takes_an_engine():
     assert derive_grants("research") == derive_grants("research", ())
     assert not set(derive_grants("research")) & {"write", "edit", "bash"}
-
-
-def test_unified_guard_replaces_the_legacy_receipted_model():
-    assert ReceiptedModel is HarnessGuardMiddleware
-    for hook in ("awrap_model_call", "abefore_model"):
-        assert callable(getattr(HarnessGuardMiddleware, hook))
 
 
 def test_backend_satisfies_deepagents_protocol():
@@ -110,7 +103,7 @@ def test_context_projection_key_is_unified_across_tiers():
         workspace = __import__("pathlib").Path(".")
 
     runtime = SessionRuntime(object(), _Scope(), _Model(), ExecutionSettings())
-    standard = runtime.snapshot(("read",), engine="standard", version=3)
-    deep = runtime.snapshot(("read",), engine="deep", version=3)
+    standard = runtime.snapshot(("read",), engine="standard")
+    deep = runtime.snapshot(("read",), engine="deep")
     assert standard["context_projection"] == CONTEXT_POLICY
     assert deep["context_projection"] == CONTEXT_POLICY

@@ -71,7 +71,7 @@ class DelegationLedger:
         harness,
         snapshot,
         task,
-        permission_mode="legacy",
+        permission_mode="ask",
     ):
         async with self.store.transaction() as conn:
             await self.executions.assert_claim(conn, claim)

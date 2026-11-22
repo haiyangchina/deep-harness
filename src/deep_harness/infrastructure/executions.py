@@ -295,53 +295,6 @@ class ExecutionLedger:
             )
             return ExecutionClaim(admission, owner)
 
-    async def unbound_waits(self):
-        async with self.store.engine.connect() as conn:
-            rows = await conn.execute(
-                select(s.admissions)
-                .outerjoin(s.approval_waits, s.approval_waits.c.admission_id == s.admissions.c.id)
-                .where(
-                    s.admissions.c.status == "waiting_approval",
-                    s.approval_waits.c.admission_id.is_(None),
-                )
-            )
-            return [admission_from(row) for row in rows.mappings()]
-
-    async def bind_wait(self, admission, interaction_ids):
-        ids = list(dict.fromkeys(interaction_ids))
-        if not ids:
-            return
-        async with self.store.transaction() as conn:
-            pending = await conn.scalar(
-                select(s.admissions.c.id).where(
-                    s.admissions.c.id == admission.id,
-                    s.admissions.c.status == "waiting_approval",
-                    s.admissions.c.generation == admission.generation,
-                )
-            )
-            matches = (
-                (
-                    await conn.execute(
-                        select(s.interactions.c.id).where(
-                            s.interactions.c.admission_id == admission.id,
-                            s.interactions.c.id.in_(ids),
-                        )
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            if pending and set(matches) == set(ids):
-                await conn.execute(
-                    insert(s.approval_waits)
-                    .prefix_with("OR IGNORE")
-                    .values(
-                        admission_id=admission.id,
-                        generation=admission.generation,
-                        interaction_ids=ids,
-                    )
-                )
-
     async def report_checkpoint(self, claim):
         async with self.store.transaction() as conn:
             await self.assert_claim(conn, claim)

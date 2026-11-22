@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import Admission, DomainError, ExecutionClaim, Session
 from deep_harness.infrastructure import schema as s
-from deep_harness.infrastructure.migrations import migrate
+from deep_harness.infrastructure.database import initialize_database
 from deep_harness.server_config import number
 
 LIVE_PAGE_SIZE = number("pagination.live_page_size")
@@ -42,7 +42,7 @@ class BusinessStore:
 
     async def open(self) -> None:
         await asyncio.to_thread(self.home.mkdir, parents=True, exist_ok=True)
-        await migrate(self.engine, self.home)
+        await initialize_database(self.engine)
         async with self.engine.begin() as conn:
             await conn.exec_driver_sql("PRAGMA journal_mode=WAL")
             await conn.exec_driver_sql("PRAGMA foreign_keys=ON")
@@ -211,16 +211,14 @@ class BusinessStore:
         tools: tuple[str, ...],
         engine: str = "standard",
         harness: str = "general",
-        permission_mode: str = "legacy",
+        permission_mode: str = "ask",
         runtime_snapshot: dict | None = None,
-        compatible_runtime_hashes: tuple[str, ...] = (),
     ) -> Session:
         tools = tuple(sorted(set(tools)))
         creation = {"prompt": prompt, "tools": tools, "engine": engine}
         if harness != "general":
             creation["harness"] = harness
-        if permission_mode != "legacy":
-            creation["permission_mode"] = permission_mode
+        creation["permission_mode"] = permission_mode
         digest = fingerprint(creation)
         async with self.transaction() as conn:
             row = (
@@ -250,11 +248,9 @@ class BusinessStore:
                     if binding is None:
                         raise DomainError(
                             "runtime_unbound",
-                            "Inspect and explicitly bind this legacy session before execution",
+                            "Session has no runtime binding",
                         )
-                    if binding != fingerprint(runtime_snapshot) and (
-                        binding not in compatible_runtime_hashes
-                    ):
+                    if binding != fingerprint(runtime_snapshot):
                         raise DomainError(
                             "idempotency_conflict", "Creation runtime parameters changed"
                         )
@@ -292,7 +288,7 @@ class BusinessStore:
             tuple(row["tools"]),
             row["engine"],
             row["harness"],
-            row.get("permission_mode", "legacy"),
+            row["permission_mode"],
             row.get("permission_revision", 0),
         )
 

@@ -1,4 +1,4 @@
-"""New business schema, separate from legacy Harness and graph checkpoints."""
+"""Business schema, separate from graph checkpoints."""
 
 from sqlalchemy import (
     JSON,
@@ -33,7 +33,7 @@ sessions = Table(
     Column("tools", JSON, nullable=False),
     Column("engine", String, nullable=False),
     Column("harness", String, nullable=False, default="general"),
-    Column("permission_mode", String, nullable=False, default="legacy"),
+    Column("permission_mode", String, nullable=False, default="ask"),
     Column("permission_revision", Integer, nullable=False, default=0),
     UniqueConstraint("profile_id", "principal", "request_id"),
 )

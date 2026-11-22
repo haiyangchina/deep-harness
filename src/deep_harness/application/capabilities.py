@@ -112,7 +112,6 @@ READ_ONLY_CORE: tuple[str, ...] = tuple(
         }
     )
 )
-LEGACY_TOOLS: tuple[str, ...] = ("read_file", "write_file", "run_command")
 EXTENSION_TOOLS: tuple[str, ...] = (
     "save_memory",
     "delegate_task",
@@ -128,7 +127,7 @@ READ_ONLY_HARNESSES: frozenset[str] = frozenset(
 )
 
 MUTATING_EXTENSIONS = frozenset(
-    {"save_memory", "write_file", "run_command", "write", "edit", "bash", "apply_patch"}
+    {"save_memory", "write", "edit", "bash", "apply_patch"}
 )
 
 
@@ -184,10 +183,8 @@ ALWAYS_PER_CALL: frozenset[str] = frozenset(
 READ_ONLY_SCOPES: frozenset[str] = frozenset({SCOPE_FILE_READ})
 
 # "exempt" never asks; "per_round" asks once per admission for that scope;
-# "per_call" asks for every invocation. legacy keeps its strict workspace-only
-# path policy and is not a UI option.
+# "per_call" asks for every invocation.
 PERMISSION_POLICY: dict[str, dict[str, str]] = {
-    "legacy": {"*": "per_call", SCOPE_FILE_READ: "exempt"},
     "ask": {"*": "per_call", SCOPE_FILE_READ: "exempt"},
     "auto": {
         "*": "per_call",
@@ -311,7 +308,6 @@ def manifest():
         "read_only_core": list(READ_ONLY_CORE),
         "harnesses": list(HARNESSES),
         "read_only_harnesses": sorted(READ_ONLY_HARNESSES),
-        "legacy_tools": list(LEGACY_TOOLS),
         "extensions": list(EXTENSION_TOOLS),
         "access_scopes": permission_policy()["access_scopes"],
         "permission_modes": permission_policy()["modes"],

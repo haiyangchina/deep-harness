@@ -161,13 +161,6 @@ files:
 patch:
   max_files: 8
   max_file_diff_chars: 16000
-legacy_files:
-  start_line: 1
-  max_lines: 120
-  max_lines_max: 400
-  content_max_length: 128000
-  max_bytes: 128000
-  output_max_bytes: 6000
 memory:
   content_max_length: 1000
   max_source_chars: 128
@@ -201,13 +194,6 @@ shell:
   timeout_seconds: 30
   timeout_seconds_max: 120
   stream_limit_bytes: 65536
-native_command:
-  argv_max_length: 64
-  cwd_max_length: 4096
-  timeout_seconds: 30
-  timeout_seconds_max: 120
-  argument_max_chars: 16000
-  terminate_wait_seconds: 5
 web_search:
   query_max_length: 512
   max_results: 5

@@ -100,15 +100,7 @@ class ContextProjector:
                 .first()
             )
         dropped = set(head["dropped_ids"]) if head else set()
-        legacy_summary = head is not None and head["summary_version"] == 0
-        if legacy_summary:
-            summary = summarize(
-                "",
-                [message for message in messages if message["id"] in dropped],
-                self.limits.summary_characters,
-            )
-        else:
-            summary = head["summary"] if head else ""
+        summary = head["summary"] if head else ""
         revision = head["revision"] if head else 0
         remaining = [message for message in messages if message["id"] not in dropped]
         archived = []
@@ -174,17 +166,6 @@ class ContextProjector:
         if archived:
             revision += 1
             await self.publish(claim, revision, dropped, summary, archived, head)
-        elif legacy_summary:
-            async with self.store.transaction() as conn:
-                await self.executions.assert_claim(conn, claim)
-                await conn.execute(
-                    update(s.context_heads)
-                    .where(
-                        s.context_heads.c.session_id == claim.admission.session_id,
-                        s.context_heads.c.revision == revision,
-                    )
-                    .values(summary=summary, summary_version=1)
-                )
         if summary:
             return [
                 {

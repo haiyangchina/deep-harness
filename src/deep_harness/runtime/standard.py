@@ -62,7 +62,6 @@ class StandardRuntime:
         web_client=None,
         model_lock=None,
         pause_probe=None,
-        snapshot_version=4,
     ):
         self.session = session
         self.claim = claim
@@ -74,7 +73,7 @@ class StandardRuntime:
         self.model_lock = model_lock
         self.pause_probe = pause_probe
         self.tool_specs = tool_definitions(
-            session.tools, mcp_bindings, snapshot_version=snapshot_version
+            session.tools, mcp_bindings
         )
         if hasattr(model, "with_tool_specs"):
             self.model = model.with_tool_specs(self.tool_specs)
@@ -144,14 +143,13 @@ class StandardRuntime:
         ):
             return True
         proposal = {"tool_name": call.name, "arguments": call.arguments}
-        if self.session.permission_mode != "legacy":
-            proposal.update(
-                reason=self.gateway.approval_reason(call),
-                permission_mode=self.session.permission_mode,
-                permission_revision=self.session.permission_revision,
-                scope_key=scope_key,
-                reusable=can_reuse,
-            )
+        proposal.update(
+            reason=self.gateway.approval_reason(call),
+            permission_mode=self.session.permission_mode,
+            permission_revision=self.session.permission_revision,
+            scope_key=scope_key,
+            reusable=can_reuse,
+        )
         # An interrupt resume replays this node from the beginning. Keep waiting for
         # the durable decision instead of turning a still-pending approval into a
         # permanent "Tool refused" tool result: on the next resume the same tool call

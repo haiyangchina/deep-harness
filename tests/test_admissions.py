@@ -23,7 +23,7 @@ async def session(store):
         principal="alice",
         request_id="create-1",
         prompt="Frozen",
-        tools=("read_file",),
+        tools=("read",),
     )
 
 
@@ -56,7 +56,7 @@ async def test_creation_retry_is_bound_to_policy_and_principal(store):
             principal="alice",
             request_id="create-1",
             prompt="Changed",
-            tools=("read_file",),
+            tools=("read",),
         )
     with pytest.raises(DomainError, match="not accessible"):
         await store.get_session(original.id, "bob")

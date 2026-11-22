@@ -234,30 +234,3 @@ async def test_job_accepts_final_verifier_after_failed_baseline_and_write(tmp_pa
         assert verification["files"][0]["path"] == "result.txt"
     finally:
         await host.close()
-
-
-async def test_pre_v4_session_replays_creation_and_keeps_frozen_tool_schema(tmp_path):
-    model = ScriptModel(calls=[])
-    host = ProjectHost(tmp_path / "state", tmp_path, lambda _: LangChainModel(model))
-    try:
-        app = await host.application("one")
-        tools = ("bash", "search_files")
-        snapshot = app.sessions.snapshot(tools, version=3)
-        fields = {spec["name"]: spec["parameters"]["properties"] for spec in snapshot["tools"]}
-        assert "purpose" not in fields["bash"]
-        assert "cursor" not in fields["search_files"]
-        session = await app.store.create_session(
-            principal="operator",
-            request_id="legacy",
-            prompt="Inspect",
-            tools=tools,
-            runtime_snapshot=snapshot,
-        )
-        replayed = await app.create_session("legacy", "Inspect", tools)
-        assert replayed == session
-        assert (await app.sessions.status(session.id))["runtime"]["compatible"]
-        admission = await app.submit(session.id, "send", "test")
-        await app.wait_idle()
-        assert (await app.store.get_admission(admission.id, session.id)).status == "completed"
-    finally:
-        await host.close()

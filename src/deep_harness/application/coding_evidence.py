@@ -2,8 +2,8 @@
 
 import json
 
-COMMANDS = {"bash", "run_command"}
-FILE_MUTATIONS = {"edit", "write", "write_file", "apply_patch"}
+COMMANDS = {"bash"}
+FILE_MUTATIONS = {"edit", "write", "apply_patch"}
 
 
 def coding_evidence(messages):

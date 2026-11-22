@@ -9,21 +9,17 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from deep_harness.application.capabilities import CORE_TOOLS, LEGACY_TOOLS, READ_ONLY_CORE
+from deep_harness.application.capabilities import CORE_TOOLS, READ_ONLY_CORE
 from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import DomainError
 from deep_harness.server_config import number, setting
 
-# Legacy aliases remain valid for explicit CLI/HTTP grants, but they are no
-# longer part of a derived core grant and are never shown in the capability UI.
-READ_TOOLS = (*READ_ONLY_CORE, "read_file")
+READ_TOOLS = READ_ONLY_CORE
 MUTATING_TOOLS = frozenset(set(CORE_TOOLS) - set(READ_ONLY_CORE)) | {
-    "write_file",
-    "run_command",
     "save_memory",
     "apply_patch",
 }
-CODING_TOOLS = frozenset({*CORE_TOOLS, *LEGACY_TOOLS, "apply_patch"})
+CODING_TOOLS = frozenset({*CORE_TOOLS, "apply_patch"})
 PROJECT_PROMPT = (
     "You are deep-harness, a careful coding and project analysis assistant. "
     "For project questions, inspect the configured workspace with list_files, then read "
@@ -36,7 +32,7 @@ PROJECT_PROMPT = (
     "with the full-file hash to avoid overwriting concurrent changes. A partial read is "
     "not the entire file: read all needed ranges before rewriting it. Use granted tools "
     "directly; the host applies the operator's approval policy to every command. "
-    "Use bash (or legacy run_command) for shell queries, tests and git inspection "
+    "Use bash for shell queries, tests and git inspection "
     "when granted; report only tests actually run. "
     "For questions needing current external information, prefer web_research: it returns a "
     "bounded, cited evidence pack in one call. Use web_search for a narrow lookup and "

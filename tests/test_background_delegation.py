@@ -84,7 +84,7 @@ async def parent_completed(app, session, admission):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["legacy", "auto", "full"])
+@pytest.mark.parametrize("mode", ["ask", "auto", "full"])
 async def test_background_parent_completes_then_steer_runs_next_turn(tmp_path, mode):
     started, release = asyncio.Event(), asyncio.Event()
     model = BackgroundModel(started, release)
@@ -106,7 +106,7 @@ async def test_background_parent_completes_then_steer_runs_next_turn(tmp_path, m
         child = await app.store.get_session(row["child_session_id"], "operator")
         assert child.permission_mode == mode
         with pytest.raises(DomainError, match="pending work"):
-            await app.set_permissions(session.id, "ask", 0)
+            await app.set_permissions(session.id, "auto" if mode == "ask" else "ask", 0)
         steered = await app.steer_delegation(session.id, row["id"], "steer-1", "steer")
         duplicate = await app.steer_delegation(session.id, row["id"], "steer-1", "steer")
         assert duplicate.id == steered.id
