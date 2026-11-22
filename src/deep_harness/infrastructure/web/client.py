@@ -74,10 +74,12 @@ class WebClient:
             if providers is not None
             else build_providers(self.settings, self.client, self._public_client)
         )
+        pi_providers = set(self.settings.pi_providers) if "pi" in self.settings.routing else set()
         self.search_chain = [
             self.providers[name]
             for name in self.settings.routing
             if name not in _SEARCH_EXCLUDED
+            and name not in pi_providers
             and name in self.providers
             and self.providers[name].available
             and getattr(self.providers[name], "search_available", True)
@@ -85,7 +87,7 @@ class WebClient:
         self.fetch_chain = [
             self.providers[name]
             for name in self.settings.extract_routing
-            if name in self.providers and self.providers[name].available
+            if name != "pi" and name in self.providers and self.providers[name].available
         ]
         self._cache: OrderedDict[tuple, tuple[float, object]] = OrderedDict()
         self._inflight: dict[tuple, asyncio.Task] = {}
@@ -162,9 +164,13 @@ class WebClient:
     ) -> SearchBatch:
         groups: list[tuple[str, list[SearchHit]]] = []
         attempts: list[BackendAttempt] = []
+        preferred = "pi" if self.settings.routing[:1] == ("pi",) else None
         chain = sorted(
             self.search_chain,
-            key=lambda provider: len(_ignored_filters(provider, options)),
+            key=lambda provider: (
+                provider.name != preferred,
+                len(_ignored_filters(provider, options)),
+            ),
         )
         for provider in chain[:self.settings.max_search_backends]:
             started = time.monotonic()
@@ -450,6 +456,9 @@ class WebClient:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        if pi := self.providers.get("pi"):
+            if close := getattr(pi, "close", None):
+                await close()
         self._cache.clear()
         if self._owns_client:
             await asyncio.gather(self.client.aclose(), self._public_client.aclose())

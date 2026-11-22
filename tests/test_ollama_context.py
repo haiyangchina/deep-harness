@@ -128,6 +128,30 @@ async def test_provider_context_rejection_is_actionable_and_not_unknown(tmp_path
         await client._client.aclose()
 
 
+@pytest.mark.parametrize("failure", [httpx.ConnectError, httpx.ConnectTimeout])
+async def test_model_connection_failure_interrupts_without_dispatching_a_tool(tmp_path, failure):
+    def respond(request):
+        raise failure("private endpoint details", request=request)
+
+    model = ollama_model(model="local", base_url="http://ollama.test")
+    client = AsyncClient(host="http://ollama.test", transport=httpx.MockTransport(respond))
+    model.model._async_client = client
+    host = ProjectHost(tmp_path / "state", tmp_path, lambda scope: model)
+    try:
+        app = await host.application("one")
+        session = await app.create_session("create", "Search", tools=("web_search",))
+        admission = await app.submit(session.id, "input", "Find today's weather")
+        await app.wait_idle()
+        done = await app.store.get_admission(admission.id, session.id)
+        assert done.status == "interrupted"
+        assert "model_connection_failed" in done.result
+        assert "private endpoint details" not in done.result
+        assert (await app.sessions.status(session.id))["active_effects"] == []
+    finally:
+        await host.close()
+        await client._client.aclose()
+
+
 async def test_small_window_preflight_stops_before_provider_call(tmp_path):
     called = []
 

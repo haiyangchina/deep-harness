@@ -54,6 +54,8 @@ class SessionRuntime:
                 result["web"]["endpoint_hash"] = fingerprint(
                     [self.web_settings.searxng_url, self.web_settings.firecrawl_url]
                 )
+                if "pi" not in self.web_settings.routing:
+                    result["web"].pop("pi_providers", None)
         if knowledge is not None:
             result["knowledge"] = knowledge
         if harness != "general":

@@ -123,10 +123,14 @@ context_window_tokens = 32768
 npm run dist:win
 ```
 
-生成 `release/deep-harness-1.1.0-x64.exe`（portable 目标）。这是桌面壳的便携包，
+生成 `release/deep-harness-1.1.1-x64.exe`（portable 目标）。这是桌面壳的便携包，
 **不包含 Conda、Python 依赖和 Ollama 模型**。目标 Windows 机器仍须先安装 deep-harness
 独立环境；启动后选择其 Python 路径即可。打包配置已提供，不等于已完成签名/干净机器安装验收。
 尚未提供自动安装 Python/模型的一体化安装器与自动更新。
+
+打包命令会在 deep-harness Conda 环境内构建 Pi 搜索工作进程，并将脚本和许可证放入便携包。
+打包后的桌面端使用自带的 Electron 运行搜索进程，默认优先搜索 Pi。
+开发版通过 `npm run build:pi` 构建搜索进程。自定义运行配置可以覆盖 `web.routing`。
 
 ## 验证与排错
 

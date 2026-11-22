@@ -132,6 +132,7 @@ desktop.ini
 /desktop/node_modules/
 /desktop/dist/
 /desktop/release/
+/src/deep_harness/infrastructure/web/pi_dist/
 
 # 本地工作区数据（WorkBuddy 记忆日志等，非项目资产）
 /.workbuddy/

@@ -311,7 +311,7 @@ def test_evidence_pack_is_bounded_cited_and_untrusted():
 
 def test_load_web_settings_reads_defaults_and_operator_override(tmp_path):
     default = load_web_settings()
-    assert default.routing[0] == "tavily"
+    assert default.routing[0] == "pi"
     assert default.max_response_chars == 8000
     path = tmp_path / "config.toml"
     path.write_text(

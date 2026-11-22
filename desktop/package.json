@@ -1,6 +1,6 @@
 {
   "name": "deep-harness-desktop",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "private": true,
   "type": "module",
   "description": "Local desktop workspace for deep-harness",
@@ -11,10 +11,11 @@
   },
   "scripts": {
     "build": "node build.mjs",
+    "build:pi": "conda run --no-capture-output -n deep-harness python ../scripts/build_pi_worker.py",
     "start": "npm run build && electron .",
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-strip-types --test tests/*.test.ts",
-    "dist:win": "npm run build && electron-builder --win portable"
+    "dist:win": "npm run build:pi && npm run build && electron-builder --win portable"
   },
   "dependencies": {
     "react": "19.3.0",
@@ -41,6 +42,13 @@
     "files": [
       "dist/**/*",
       "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../src/deep_harness/infrastructure/web/pi_dist",
+        "to": "pi-search",
+        "filter": ["search.cjs", "LICENSES.txt"]
+      }
     ],
     "win": {
       "target": "portable",

@@ -18,6 +18,7 @@ from deep_harness.domain.models import DomainError
 from deep_harness.infrastructure.web.bing_cn import BROWSER_UA, parse_bing_results
 from deep_harness.infrastructure.web.extract import MAX_HTML_BYTES, extract_page, publication_date
 from deep_harness.infrastructure.web.models import FetchResult, SearchHit, SearchOptions
+from deep_harness.infrastructure.web.pi_provider import PiProvider
 from deep_harness.infrastructure.web.security import resolve_fetch_addresses, validate_public_url
 from deep_harness.server_config import number, setting
 
@@ -627,6 +628,7 @@ def build_providers(
 ) -> dict[str, SearchProvider]:
     """Create every backend; unavailable ones stay in the dict but leave the chain."""
     return {
+        "pi": PiProvider(settings),
         "tavily": TavilyProvider(client, _key(settings.tavily_api_key_env)),
         "exa": ExaProvider(client, _key(settings.exa_api_key_env)),
         "brave": BraveProvider(client, _key(settings.brave_api_key_env)),

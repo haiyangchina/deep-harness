@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "deep-harness"
-version = "1.1.0"
+version = "1.1.1"
 description = "Isolated Python with LangChain, LangGraph and Deep Agents"
 requires-python = ">=3.12,<3.13"
 dependencies = [
@@ -46,7 +46,11 @@ deep-harness = "deep_harness.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-deep_harness = ["server.yaml"]
+deep_harness = [
+  "server.yaml",
+  "infrastructure/web/pi_dist/search.cjs",
+  "infrastructure/web/pi_dist/LICENSES.txt",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

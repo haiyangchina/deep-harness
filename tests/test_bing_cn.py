@@ -66,6 +66,7 @@ def test_parser_bounds_title_and_snippet():
 
 def test_default_routing_prefers_bing_cn_over_foreign_keyless_backends():
     routing = WebSettings().routing
+    assert routing[0] == "pi"
     assert "bing_cn" in routing
     assert routing.index("bing_cn") < routing.index("ddgs")
     assert routing.index("bing_cn") < routing.index("jina")

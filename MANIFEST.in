@@ -1,0 +1,2 @@
+include scripts/build_pi_worker.py
+include web-worker/build.mjs web-worker/search.ts web-worker/package.json web-worker/package-lock.json

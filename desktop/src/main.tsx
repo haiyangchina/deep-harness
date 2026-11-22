@@ -83,10 +83,13 @@ function Chat({ newSession }: { newSession: () => void }) {
   const running = status?.active_admissions.some(a => ['queued', 'started', 'waiting_approval'].includes(a.status))
   // Only unknown/reconciled mean a write may have landed without a receipt. An
   // interrupted run is a deterministic local stop with no uncertain side effects.
-  const uncertain = status?.active_admissions.some(a => ['unknown', 'reconciled'].includes(a.status))
-  const interrupted = status?.active_admissions.some(a => a.status === 'interrupted')
+  const uncertain = status?.active_admissions.find(a => ['unknown', 'reconciled'].includes(a.status))
+  const interrupted = status?.active_admissions.find(a => a.status === 'interrupted')
+  const paused = uncertain || interrupted
+  const queuedCount = status?.active_admissions.filter(a => a.status === 'queued').length ?? 0
   const send = () =>
     void perform(async () => {
+      if (paused) return
       if (!sessionId) {
         newSession()
         return
@@ -213,7 +216,9 @@ function Chat({ newSession }: { newSession: () => void }) {
               <div className="message-content">{deltas}</div>
             </article>
           )}
-          {latest?.result && latest.status !== 'completed' && <p className="notice">{latest.result}</p>}
+          {(paused?.result || (latest?.status !== 'completed' && latest?.result)) && (
+            <p className="notice">{paused?.result || latest?.result}</p>
+          )}
           {latest?.status === 'completed' && !latest.result && !running && (
             <p className="notice">
               本次执行已完成，但模型没有返回文本结果。常见原因是模型开启了 thinking / reasoning
@@ -231,7 +236,8 @@ function Chat({ newSession }: { newSession: () => void }) {
           {uncertain && (
             <div className="notice">
               <strong>任务结果不确定，已停止自动推进。</strong>
-              <p>先核对实际文件与右侧状态台账。分支只复制完整已完成轮次，不会重做未知操作。</p>
+              {queuedCount > 0 && <p>此会话有 {queuedCount} 条消息尚未执行。</p>}
+              <p>核对文件与右侧状态台账后，创建分支并重新发送问题。分支只复制完整已完成轮次。</p>
               <button
                 disabled={busy}
                 onClick={() =>
@@ -262,7 +268,10 @@ function Chat({ newSession }: { newSession: () => void }) {
         {status?.job_id ? (
           <p className="notice">此会话属于长任务阶段。可在右侧审批，在「长任务」页控制执行。</p>
         ) : (
-          <TaskComposer draft={draft} pending={Boolean(pending)} updateDraft={updateDraft} send={send} />
+          <TaskComposer
+            draft={draft} pending={Boolean(pending)} paused={Boolean(paused)}
+            updateDraft={updateDraft} send={send}
+          />
         )}
       </main>
       <TaskInspector />

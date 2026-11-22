@@ -5,10 +5,11 @@ import { PermissionPicker } from './permission-picker'
 interface TaskComposerProps {
   draft: string
   pending: boolean
+  paused: boolean
   updateDraft: (value: string) => void
   send: () => void
 }
-export function TaskComposer({ draft, pending, updateDraft, send }: TaskComposerProps) {
+export function TaskComposer({ draft, pending, paused, updateDraft, send }: TaskComposerProps) {
   const conversation = useStore($conversation)
   const busy = useStore($busy)
   const runtime = useStore($runtime)!
@@ -16,9 +17,6 @@ export function TaskComposer({ draft, pending, updateDraft, send }: TaskComposer
   const status = conversation?.status
   const latest = status?.latest_admission
   const running = status?.active_admissions.some(a => ['queued', 'started', 'waiting_approval'].includes(a.status))
-  // Also block after a deterministic interruption: the worker stops on a non-completed
-  // admission, so the user must start a fresh session (see the Chat notice).
-  const unknown = status?.active_admissions.some(a => ['unknown', 'interrupted', 'reconciled'].includes(a.status))
   const childRunning = conversation?.delegations.some(row => row !== null && typeof row === 'object'
     && 'status' in row && !['completed', 'failed', 'cancelled', 'stopped'].includes(String(row.status)))
   return (
@@ -33,7 +31,7 @@ export function TaskComposer({ draft, pending, updateDraft, send }: TaskComposer
           onKeyDown={e => {
             if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
               e.preventDefault()
-              send()
+              if (!busy && !paused) send()
             }
           }}
         />
@@ -49,7 +47,7 @@ export function TaskComposer({ draft, pending, updateDraft, send }: TaskComposer
           </span>
           <div className="actions">
             {status && <PermissionPicker value={status.session.permission_mode ?? 'legacy'}
-              disabled={busy || pending || Boolean(running) || Boolean(unknown) || Boolean(childRunning)}
+              disabled={busy || pending || Boolean(running) || paused || Boolean(childRunning)}
               onChange={mode => void perform(async () => {
                 await api(`/sessions/${sessionId}/permissions`, 'POST', {
                   permission_mode: mode,
@@ -73,7 +71,7 @@ export function TaskComposer({ draft, pending, updateDraft, send }: TaskComposer
             )}
             <button
               className="primary send"
-              disabled={busy || Boolean(unknown) || (Boolean(sessionId) && !draft.trim() && !pending)}
+              disabled={busy || paused || (Boolean(sessionId) && !draft.trim() && !pending)}
               onClick={send}
             >
               {pending ? '核对后重试相同请求' : sessionId ? '发送 ↑' : '新建会话 →'}
@@ -82,7 +80,9 @@ export function TaskComposer({ draft, pending, updateDraft, send }: TaskComposer
         </div>
       </div>
       <p className="composer-hint">
-        {pending
+        {paused
+          ? '当前会话已暂停。请使用上方的恢复入口继续提问。'
+          : pending
           ? '上次提交未确认。草稿已保留；手动重试沿用同一 submission_id。'
           : childRunning
             ? '后台子任务仍在执行，完成后可切换批准模式。'

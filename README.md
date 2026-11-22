@@ -79,14 +79,15 @@
 ### 后端与配置
 
 `server.yaml` 的 `web` 段与 `--config` 覆盖文件均可配置。默认检索链为
-`tavily → exa → brave → serper → searxng → bing_cn → ddgs → jina`，只有已配置
-（有 API key、有 SearXNG 地址、已安装 `ddgs`）的后端才进入链。`bing_cn` 和 `ddgs`
+`pi → tavily → exa → brave → serper → searxng → bing_cn → ddgs → jina`。
+已配置的后端参与路由，Pi 已接管的同名供应商会从外层路由中跳过。`bing_cn` 和 `ddgs`
 免密钥，实际可用性取决于网络。Jina Search 需要密钥，Jina Reader 仍可无密钥使用。
 配置文件只引用环境变量名：
 `TAVILY_API_KEY`、`EXA_API_KEY`、`BRAVE_SEARCH_API_KEY`、`SERPER_API_KEY`、
 `JINA_API_KEY`、`FIRECRAWL_API_KEY`。
 
-零配置时优先使用 `bing_cn`（`cn.bing.com`，按网络环境直连或经系统代理）。它用标准库
+Pi 默认先尝试免密钥可用的 Exa 和 Parallel。两者未能提供有效候选时，项目继续尝试
+其他已配置后端。Bing 中国（`bing_cn`）按网络环境直连或经系统代理。它用标准库
 `HTMLParser` 解析 `li.b_algo`，无额外依赖；**必须发送完整浏览器 User-Agent**，
 否则 Bing 只返回空页或挑战页。自建 SearXNG 设置
 `searxng_url = "http://127.0.0.1:8888"`（运维自有端点，不受私网 URL 校验约束）。页面读取
@@ -101,12 +102,45 @@
 网页读取预算。单个页面失败时仍会返回已取得的正文或摘要，标记未完成部分。
 
 `web_search` 和 `web_research` 支持可选的 `language`、`region` 和 `freshness`
-（`day`、`week`、`month`、`year`）。工具优先选择支持所需筛选项的后端，回退到
-不支持所有筛选项的后端时会在诊断中标记。后端次数、单次超时、搜索预算比例和相关性阈值
+（`day`、`week`、`month`、`year`）。当 `pi` 配置在首位时，工具先调用 Pi，
+再按筛选项覆盖程度安排其他后端。诊断会标记后端未支持的筛选项。后端次数、单次超时、搜索预算比例和相关性阈值
 均在 `server.yaml` 的 `web` 段配置。
 
 桌面会话会在工具结果上显示检索状态，展开后可查看后端耗时、抓取失败原因和引用来源。
 升级前创建且冻结了旧联网工具定义的会话可按界面提示分支，以绑定更新后的工具定义。
+
+### 默认的 Pi 多源搜索
+
+内置后端 `pi` 复用社区项目 `nicobailon/pi-web-access` 0.48.0 的搜索和供应商路由。
+在开发环境用 deep-harness 的 Conda Python 构建一次工作进程。构建需要 Node.js 24+
+和 npm，会在该 Conda 环境内根据 npm 锁文件安装构建依赖。
+
+```powershell
+conda run --no-capture-output -n deep-harness python scripts/build_pi_worker.py
+```
+
+默认配置已启用 Pi。已有配置如果覆盖了 `web.routing`，可把 `pi` 放在列表首位，例如下方
+的 YAML。桌面端在「运行设置」选文件，CLI 和 HTTP 服务用 `--config` 传入路径。
+重新启动后端后，新建会话或分支现有会话以使用新的路由。
+
+```yaml
+web:
+  routing: [pi, bing_cn]
+  pi_providers: [exa, parallel-mcp]
+```
+
+在一次子查询内，Pi 按 `pi_providers` 的顺序切换供应商。当前支持
+`exa`、`parallel-mcp`、`bocha`、`brave` 和 `tavily`。Pi 已接管的同名后端只调用一次。
+未配置 Exa 密钥时，示例中的 Exa 和 Parallel 都使用供应商的公开远程 MCP 搜索入口。
+设置 Exa 密钥会优先使用其直连 HTTP API。博查、Brave 和 Tavily 分别读取
+`BOCHA_API_KEY`、`BRAVE_SEARCH_API_KEY`、`TAVILY_API_KEY`，按供应商规则计费或计入配额。
+
+Python 通过本地标准输入输出调用随项目构建的工作进程。项目侧无需安装 Pi Agent 或配置 MCP。
+`web_research` 负责并发子查询、读取命中的原文和生成引用。证据包可显示
+`pi/exa / static`，表示 Exa 发现链接、项目的静态抓取器读取原文。
+Pi 会转发时间范围，语言和地区支持由项目诊断标记。
+源码运行和单独安装 Python wheel 时需要 Node.js 24+ 在 PATH 中。
+发布 wheel 前先执行上述构建命令，Windows 桌面便携包自动构建和携带该工作进程。
 
 ### 审批与 Deep 研究模式
 

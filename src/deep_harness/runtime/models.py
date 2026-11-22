@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from ipaddress import ip_address
 from urllib.parse import urlsplit
 
+import httpx
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langsmith import tracing_context
 
@@ -39,7 +40,7 @@ def model_errors():
         else:
             message = f"Ollama rejected the model request (HTTP {exc.status_code})."
         raise DomainError("ollama_response_error", message) from exc
-    except ConnectionError as exc:
+    except (ConnectionError, httpx.ConnectError, httpx.ConnectTimeout) as exc:
         raise DomainError(
             "model_connection_failed", "Could not connect to the model endpoint."
         ) from exc

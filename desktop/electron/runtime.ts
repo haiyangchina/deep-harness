@@ -6,11 +6,17 @@ import { apiPath } from './routes.ts'
 import { localJson } from './local-api.ts'
 
 export class LocalRuntime {
+  private readonly piWorker?: { electron: string; bundle?: string }
   private child: ChildProcessWithoutNullStreams | null = null
   private token = ''
   private base = ''
   private profile = ''
   error = ''
+
+  constructor(piWorker?: { electron: string; bundle?: string }) {
+    this.piWorker = piWorker
+  }
+
   get ready() {
     return Boolean(this.child && this.base)
   }
@@ -34,7 +40,12 @@ export class LocalRuntime {
     if (settings.configFile) args.push('--config', settings.configFile)
     if (settings.diagnostic) args.push('--provider', 'diagnostic')
     args.push('serve')
-    const child = spawn(settings.python, args, { windowsHide: true, stdio: 'pipe' })
+    const env = { ...process.env }
+    if (this.piWorker) {
+      env.DEEP_HARNESS_PI_ELECTRON = this.piWorker.electron
+      if (this.piWorker.bundle) env.DEEP_HARNESS_PI_BUNDLE = this.piWorker.bundle
+    }
+    const child = spawn(settings.python, args, { windowsHide: true, stdio: 'pipe', env })
     this.child = child
     child.stdin.on('error', () => {
       /* Exit is reported by the process owner below. */

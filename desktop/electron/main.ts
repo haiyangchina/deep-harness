@@ -6,7 +6,10 @@ import type { Settings } from '../src/protocol'
 import { LocalRuntime } from './runtime'
 import { validateSettings } from './settings'
 
-const runtime = new LocalRuntime()
+const runtime = new LocalRuntime({
+  electron: process.execPath,
+  bundle: app.isPackaged ? path.join(process.resourcesPath, 'pi-search', 'search.cjs') : undefined
+})
 let settings: Settings
 let closing = false
 const page = pathToFileURL(path.join(__dirname, 'index.html')).href

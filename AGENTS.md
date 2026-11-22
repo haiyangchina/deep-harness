@@ -18,17 +18,12 @@ requirements, and update the manifest and lock; do not ask again for routine add
 - Record new dependencies in pyproject.toml and refresh the environment lock.
 - Report experimental features and missing parity honestly in DEVELOPMENT.md.
 
-## 版本号规则（2026-11-14 起）
+## 版本号规则（2026-11-22 起）
 
-当前基线版本为 **v1.0.0**（当前生效版本见下方 2026-11-15 例外：**v1.0.5**）。
-此后每次产生内容变更，版本号按 `0.0.1` 递增；
-MAJOR / MINOR / PATCH 三个段位各是 0-9 的单个数位，任一段位满 10 时归零并向左进 1：
+当前生效版本为 **v1.1.1**。只有用户明确要求修改版本号时才改版本。
+日常功能修复与其他项目修改沿用当前版本号。本规则取代旧的逐次递增规则。
 
-    1.0.8 -> 1.0.9 -> 1.1.0 -> ... -> 1.9.9 -> 2.0.0
-
-MAJOR 无左侧段位，9.9.9 的下一个版本写作 10.0.0。设定基线本身不额外递增。
-
-每次递增必须同步以下全部位置，缺一不可：
+用户明确要求修改版本号时，必须同步以下全部位置：
 - `pyproject.toml` 的 `[project].version`
 - `src/deep_harness/__init__.py` 的 `__version__`
 - `desktop/package.json` 的 `version`
@@ -37,25 +32,25 @@ MAJOR 无左侧段位，9.9.9 的下一个版本写作 10.0.0。设定基线本�
 
 客户端「运行设置」侧边栏的版本号不手工维护：`desktop/build.mjs` 在构建时从
 `desktop/package.json` 读取 `version`，经 esbuild `define` 注入 `desktop/src/main.tsx`
-的 `__APP_VERSION__`。递增后需重新 `npm run build` 并重启桌面端才会显示新值。
+的 `__APP_VERSION__`。修改版本号后需重新 `npm run build` 并重启桌面端才会显示新值。
 
 `desktop/release/` 下的产物由 `npm run dist:win` 按 `${version}` 重新生成，不手工改名；
 `desktop/node_modules/.package-lock.json` 由 `npm ci` 生成，不同步修改。
 注意 `package-lock.json` 中第三方依赖 `cross-dirname` 的版本恰为 `0.1.0`，
 禁止对版本号做全局替换。
 
+### 历史版本记录
+
 2026-11-14 例外（用户明确要求）：「内置能力清单、本地命令统一逐次确认、删除
 `local_time` 独立工具」这一轮保持 **v1.0.4**，未按上述规则递增，也未改动 6 处版本号。
 同日「三档批准策略与安全访问权限对齐」这一轮同样按用户要求保持 **v1.0.4**，
 内部 `CAPABILITY_VERSION` 也保持 1。同日「移除只读时钟子能力、统一为本地命令执行」
 这一轮沿用该约定，仍保持 **v1.0.4** 与 `CAPABILITY_VERSION = 1`。
-后续产生内容变更时仍按规则递增。
 
 2026-11-15 例外（用户明确要求）：「将当前版本定为 **v1.0.5**」。当天联网检索能力、
 `research_web` 只读契约收口、国内免密钥搜索后端三轮改动整体归并到 **v1.0.5**，
 6 处版本号由 1.0.7 统一回设为 1.0.5 并重新 `npm run build`。下方两节标题中的
 v1.0.6 / v1.0.7 及其「递增至…」表述均为当时的过程记录，不代表当前生效版本。
-本次设定本身不递增，后续产生内容变更时从 **v1.0.6** 起按规则递增。
 
 ## 2026-11-15：联网检索能力（方案 II + IV，v1.0.5）
 
