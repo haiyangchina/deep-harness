@@ -30,9 +30,10 @@ def summarize(previous, messages, limit):
         content = message.get("content", "")
         if not isinstance(content, str):
             content = json.dumps(content, ensure_ascii=False)
-        parts.append(
-            f"{message['role']}: {content[: number('execution.summary_per_message_chars')]}"
-        )
+        excerpt = content[: number("execution.summary_per_message_chars")]
+        if image_ids := message.get("image_ids"):
+            excerpt += f" [Archived image references: {', '.join(image_ids)}]"
+        parts.append(f"{message['role']}: {excerpt}")
     summary = "\n".join(parts)
     if len(summary) > limit:
         half = limit // 2

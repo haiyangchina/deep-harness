@@ -13,15 +13,20 @@ export async function localJson(
   method: string,
   token: string,
   body?: unknown,
-  timeoutMs = 20_000
+  timeoutMs = 20_000,
+  upload?: { name: string; data: ArrayBuffer }
 ): Promise<unknown> {
   let response: Response
   let result: unknown
   try {
     response = await fetch(endpoint, {
       method, redirect: 'error',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: body === undefined ? undefined : JSON.stringify(body),
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': upload ? 'application/octet-stream' : 'application/json',
+        ...(upload ? { 'X-Filename': encodeURIComponent(upload.name) } : {})
+      },
+      body: upload?.data ?? (body === undefined ? undefined : JSON.stringify(body)),
       signal: AbortSignal.timeout(timeoutMs)
     })
     result = await response.json()

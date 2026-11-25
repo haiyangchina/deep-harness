@@ -1,7 +1,7 @@
 import { LongTasks } from "./long-tasks"
 import { createRoot } from 'react-dom/client'
 import { useStore } from '@nanostores/react'
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Capabilities, CreateSession, Knowledge, Setup } from './components'
 import {
   $busy,
@@ -26,7 +26,10 @@ import type { Admission } from './protocol'
 import { TaskComposer } from './task-composer'
 import { TaskInspector } from './task-inspector'
 import { webResultStatus } from './web-result'
+import { appendImages, ImageStrip, stageImages } from './image-input'
+import type { ImageDraft } from './image-input'
 import './styles.css'
+import './images.css'
 
 // build.mjs injects the package version.
 declare const __APP_VERSION__: string
@@ -84,19 +87,28 @@ function readCodingReport(value?: string): CodingReport | null {
   return null
 }
 
-function Chat({ newSession }: { newSession: () => void }) {
+function Chat({ newSession, openModelSettings }: { newSession: () => void; openModelSettings: () => void }) {
   const conversation = useStore($conversation)
   const busy = useStore($busy)
   const sessionId = conversation?.id ?? ''
   const [draft, setDraft] = useState('')
-  const [pending, setPending] = useState<{ submission_id: string; text: string } | null>(null)
+  const [pending, setPending] = useState<{ submission_id: string; text: string; image_ids?: string[] } | null>(null)
+  const [images, setImages] = useState<ImageDraft[]>([])
+  const loadImage = useCallback(async (id: string, full = false) => {
+    const result = await api<{ data: string; media_type: string }>(
+      `/sessions/${sessionId}/images/${id}?encoding=base64${full ? '' : '&thumbnail=1'}`
+    )
+    return `data:${result.media_type};base64,${result.data}`
+  }, [sessionId])
   const tail = useRef<HTMLDivElement>(null)
   const follow = useRef(true)
   useEffect(() => {
     follow.current = true
     setDraft(localStorage.getItem(storageKey('draft', sessionId)) || '')
     const raw = localStorage.getItem(storageKey('pending', sessionId))
-    setPending(raw ? JSON.parse(raw) : null)
+    const saved = raw ? JSON.parse(raw) : null
+    setPending(saved)
+    setImages(saved?.image_ids?.map((id: string) => ({ id })) ?? [])
   }, [sessionId])
   const updateDraft = (value: string) => {
     setDraft(value)
@@ -104,6 +116,13 @@ function Chat({ newSession }: { newSession: () => void }) {
   }
   const status = conversation?.status
   const latest = status?.latest_admission
+  const imagesDisabled = !sessionId || status?.vision === false
+  const addImages = (items: ImageDraft[]) => {
+    if (busy || pending || imagesDisabled) return
+    const result = appendImages(images, items)
+    setImages(result.images)
+    if (result.error) report(result.error)
+  }
   const codingReport = status?.session.harness === 'coding' && latest?.status === 'completed'
     ? readCodingReport(latest.result)
     : null
@@ -121,18 +140,38 @@ function Chat({ newSession }: { newSession: () => void }) {
         newSession()
         return
       }
-      const submission = pending || { submission_id: crypto.randomUUID(), text: draft.trim() }
-      if (!submission.text) return
+      if (!pending && !draft.trim() && !images.length) return
+      const imageIds = pending ? pending.image_ids : await stageImages(images, async file => {
+        const uploaded = await window.deepHarness.request<{ id: string }>({
+          method: 'POST', path: `/sessions/${sessionId}/images`,
+          upload: { name: file.name, data: await file.arrayBuffer() }
+        })
+        return uploaded.id
+      }, staged => { if ($conversation.get()?.id === sessionId) setImages(staged) })
+      const submission = pending || {
+        submission_id: crypto.randomUUID(), text: draft.trim(), image_ids: imageIds
+      }
       localStorage.setItem(storageKey('pending', sessionId), JSON.stringify(submission))
       setPending(submission)
       const existing = pending ? await api<Admission | null>(
         `/sessions/${sessionId}/submission?submission_id=${encodeURIComponent(submission.submission_id)}`
       ) : null
-      if (!existing) await api<Admission>(`/sessions/${sessionId}/inputs`, 'POST', submission)
+      if (!existing) {
+        try {
+          await api<Admission>(`/sessions/${sessionId}/inputs`, 'POST', submission)
+        } catch (error) {
+          if (error instanceof Error && /本机 API 返回 HTTP 4\d\d/.test(error.message)) {
+            localStorage.removeItem(storageKey('pending', sessionId))
+            if ($conversation.get()?.id === sessionId) setPending(null)
+          }
+          throw error
+        }
+      }
       localStorage.removeItem(storageKey('pending', sessionId))
       localStorage.removeItem(storageKey('draft', sessionId))
       if ($conversation.get()?.id === sessionId) {
         setPending(null)
+        setImages([])
         setDraft('')
       }
       await refreshConversation()
@@ -211,7 +250,7 @@ function Chat({ newSession }: { newSession: () => void }) {
             }}>加载更早的消息</button>
           )}
           {conversation?.messages
-            .filter(message => message.content !== '' && message.content !== null)
+            .filter(message => message.image_ids?.length || (message.content !== '' && message.content !== null))
             .map((message, index) => (
               <article className={`message ${message.role}`} key={message.id || index}>
                 <div className="message-role">
@@ -229,6 +268,10 @@ function Chat({ newSession }: { newSession: () => void }) {
                     {typeof message.content === 'string' ? message.content : JSON.stringify(message.content, null, 2)}
                   </div>
                 )}
+                <ImageStrip images={message.image_ids?.map(id => ({ id })) ?? []} load={loadImage}
+                  reuse={id => addImages([{ id }])} disabled={imagesDisabled || busy || Boolean(pending)}
+                  context={status?.active_admissions.some(row => message.id === `${row.id}:user` && row.status === 'queued')
+                    ? undefined : status?.image_context ?? undefined} />
               </article>
             ))}
           {latest && !conversation?.messages.some(message => message.id === `${latest.id}:user`) && (
@@ -320,7 +363,10 @@ function Chat({ newSession }: { newSession: () => void }) {
         ) : (
           <TaskComposer
             draft={draft} pending={Boolean(pending)} paused={Boolean(paused)}
-            updateDraft={updateDraft} send={send}
+            updateDraft={updateDraft} send={send} openModelSettings={openModelSettings}
+            images={images} loadImage={loadImage}
+            imagesDisabled={imagesDisabled} addImages={files => addImages(files.map(file => ({ file })))}
+            removeImage={index => setImages(rows => rows.filter((_, position) => position !== index))}
           />
         )}
       </main>
@@ -446,7 +492,7 @@ function App() {
         {!ready || page === 'settings' ? (
           <Setup onClose={ready ? () => setPage('chat') : undefined} />
         ) : page === 'chat' ? (
-          <Chat newSession={() => setCreating(true)} />
+          <Chat newSession={() => setCreating(true)} openModelSettings={() => setPage('settings')} />
         ) : page === 'jobs' ? (
           <LongTasks openStage={id => {
             setPage('chat')

@@ -400,17 +400,20 @@ nav button span {
 }
 .composer-bottom {
   display: flex;
-  justify-content: space-between;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   padding: 9px 12px 12px;
 }
-.model-label {
-  font-size: 10px;
-  color: #b7c5a9;
+.composer-submit {
+  margin-inline-start: auto;
+  justify-content: flex-end;
 }
-.model-label span {
-  color: #647181;
+.composer-model {
+  padding: 6px 9px;
+  color: #b7c5a9;
+  font-size: 11px;
+  white-space: nowrap;
 }
 .actions {
   display: flex;
@@ -784,9 +787,6 @@ button.danger:not(:disabled) {
   .composer-wrap {
     padding: 10px 18px;
   }
-  .model-label span {
-    display: none;
-  }
 }
 @media (prefers-reduced-motion: reduce) {
   * {
@@ -822,6 +822,7 @@ button.danger:not(:disabled) {
 .permission-full .permission-trigger { color: #ff8749; border-color: #a15a353d; background: #ff87490b; }
 .permission-menu { position: absolute; right: 0; z-index: 60; width: 350px; max-width: calc(100vw - 40px); padding: 6px; border: 1px solid #465163; border-radius: 12px; background: #202731; box-shadow: 0 14px 45px #0007; }
 .permission-menu-up { bottom: calc(100% + 9px); }
+.composer-tools .permission-menu-up { left: 0; right: auto; }
 .permission-menu-down { top: calc(100% + 9px); left: 0; right: auto; }
 .permission-menu button { display: flex; width: 100%; align-items: center; gap: 10px; text-align: left; border: 0; background: transparent; padding: 10px 8px; }
 .permission-menu button:hover, .permission-menu button:focus-visible { background: #ffffff0b; }

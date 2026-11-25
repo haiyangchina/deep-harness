@@ -4,10 +4,13 @@ import asyncio
 import json
 import shlex
 from dataclasses import asdict
+from hashlib import sha256
+from pathlib import Path
 from uuid import uuid4
 
 from deep_harness.application.capabilities import derive_grants
 from deep_harness.application.workspace import PROJECT_PROMPT
+from deep_harness.domain.images import MAX_IMAGE_BYTES, MAX_IMAGES
 from deep_harness.domain.models import DomainError
 from deep_harness.runtime.inference import usage_totals
 from deep_harness.server_config import number
@@ -63,10 +66,59 @@ async def select_session(app, args):
     )
 
 
-async def send(app, session_id, text, submission_id=None):
-    admission = await app.submit(session_id, submission_id or str(uuid4()), text)
+async def upload_images(app, session_id, paths):
+    if len(paths) > MAX_IMAGES:
+        raise DomainError("invalid_attachments", "Use up to four images per message")
+    ids = []
+    for path in paths:
+        row = await app.publish_attachment(session_id, image_chunks(path), path.name, image=True)
+        ids.append(row["id"])
+    return ids
+
+
+async def image_chunks(path):
+    try:
+        with path.open("rb") as source:
+            while data := await asyncio.to_thread(source.read, 64 * 1024):
+                yield data
+    except OSError as exc:
+        raise DomainError("image_read", f"Could not read image: {path.name}") from exc
+
+
+async def send(app, session_id, text, submission_id=None, image_paths=()):
+    if image_paths and submission_id:
+        existing = await app.store.find_submission(session_id, submission_id)
+        if existing:
+            ids = await app.store.admission_image_ids(existing)
+            if existing.text != text or len(ids) != len(image_paths):
+                raise DomainError("idempotency_conflict", "Submission payload changed")
+            for image_id, path in zip(ids, image_paths, strict=True):
+                row, _ = await app.get_image(session_id, image_id)
+                if await asyncio.to_thread(image_digest, path) != row["sha256"]:
+                    raise DomainError("idempotency_conflict", "Submission image changed")
+            if existing.status == "queued":
+                app.schedule(session_id)
+            await app.wait_idle()
+            return await display_admission(app, session_id, existing.id)
+    image_ids = await upload_images(app, session_id, image_paths)
+    admission = await app.submit(
+        session_id, submission_id or str(uuid4()), text, image_ids=image_ids
+    )
     await app.wait_idle()
-    final = await app.store.get_admission(admission.id, session_id)
+    return await display_admission(app, session_id, admission.id)
+
+
+def image_digest(path):
+    try:
+        with path.open("rb") as source:
+            data = source.read(MAX_IMAGE_BYTES + 1)
+    except OSError as exc:
+        raise DomainError("image_read", f"Could not read image: {path.name}") from exc
+    return sha256(data).hexdigest()
+
+
+async def display_admission(app, session_id, admission_id):
+    final = await app.store.get_admission(admission_id, session_id)
     output = {**asdict(final), "admission_id": final.id}
     if final.status == "waiting_approval":
         output["approvals"] = (await app.sessions.status(session_id))["approvals"]
@@ -76,7 +128,8 @@ async def send(app, session_id, text, submission_id=None):
 
 async def repl(app, session):
     print(f"Session: {session.id}")
-    print("Commands: /status, /approve ID GENERATION, /deny ID GENERATION, /exit")
+    print("Commands: /image PATH [TEXT], /status, /approve ID GENERATION, "
+          "/deny ID GENERATION, /exit")
     while True:
         try:
             text = await asyncio.to_thread(input, "you> ")
@@ -90,6 +143,20 @@ async def repl(app, session):
         try:
             if text == "/status":
                 display(await app.sessions.status(session.id))
+            elif text == "/image" or text.startswith("/image "):
+                try:
+                    # Preserve Windows path separators as well as spaces inside quoted paths.
+                    parts = shlex.split(text, posix=False)
+                except ValueError as exc:
+                    raise DomainError(
+                        "invalid_command", "Image command has invalid quoting"
+                    ) from exc
+                if len(parts) < 2:
+                    raise DomainError("invalid_command", "Use /image PATH [TEXT]")
+                name = parts[1]
+                if name[:1] in {'"', "'"}:
+                    name = name[1:-1]
+                await send(app, session.id, " ".join(parts[2:]), image_paths=[Path(name)])
             elif text.startswith(("/approve", "/deny")):
                 try:
                     parts = shlex.split(text)
@@ -247,7 +314,7 @@ async def conversation(app, args):
     session = await select_session(app, args)
     if args.command == "repl":
         return await repl(app, session)
-    final = await send(app, session.id, args.text, args.submission_id)
+    final = await send(app, session.id, args.text, args.submission_id, args.image)
     return {"completed": 0, "waiting_approval": 3}.get(final.status, 1)
 
 

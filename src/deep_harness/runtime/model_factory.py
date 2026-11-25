@@ -12,6 +12,12 @@ from deep_harness.infrastructure.credentials import read_secret
 from deep_harness.runtime.models import DiagnosticModel, deepseek_model, ollama_model, openai_model
 
 
+def default_vision(settings):
+    if settings.vision is not None:
+        return settings.vision
+    return settings.provider == "ollama" and settings.name.split(":", 1)[0] == "qwen3.5"
+
+
 def open_model(
     settings: ModelSettings,
     secret_env="OPENAI_API_KEY",
@@ -27,11 +33,13 @@ def open_model(
         request_timeout=settings.request_timeout_seconds,
     )
     if settings.provider == "ollama":
-        return ollama_model(
+        model = ollama_model(
             **common,
             context_window_tokens=settings.context_window_tokens,
             reasoning=settings.reasoning,
         )
+        model.vision = default_vision(settings)
+        return model
     api_key = read_secret(secret_env, secret_file)
     if not api_key:
         raise DomainError(
@@ -47,11 +55,14 @@ def open_model(
             context_window_tokens=settings.context_window_tokens,
             reasoning=settings.reasoning,
         )
-    return openai_model(
+    model = openai_model(
         **common,
         api_key=api_key,
         context_window_tokens=settings.context_window_tokens if remote_window else None,
     )
+
+    model.vision = default_vision(settings)
+    return model
 
 
 @dataclass(frozen=True)
@@ -80,6 +91,14 @@ class ModelCatalog:
             entry.settings, entry.secret_env, remote_window=True, secret_file=entry.secret_file
         )
 
+    def capabilities(self, model_id):
+        entry = self.entries.get(model_id or self.default)
+        if entry is None:
+            return frozenset()
+        if entry.settings.provider not in {"ollama", "openai"}:
+            return entry.capabilities - {"vision"}
+        return entry.capabilities | ({"vision"} if default_vision(entry.settings) else set())
+
     def get(self, model_id, *, tools=False, required=()):
         model_id = model_id or self.default
         entry = self.entries.get(model_id)
@@ -88,10 +107,11 @@ class ModelCatalog:
         needed = set(required)
         if tools:
             needed.add("tool_calls")
-        if needed - entry.capabilities:
+        supported = self.capabilities(model_id)
+        if needed - supported:
             raise DomainError(
                 "model_capability",
-                "Model lacks these capabilities: " + ", ".join(sorted(needed - entry.capabilities)),
+                "Model lacks these capabilities: " + ", ".join(sorted(needed - supported)),
             )
         if model_id not in self.models:
             self.models[model_id] = self.factory(entry)
@@ -104,7 +124,7 @@ class ModelCatalog:
                 "label": entry.label,
                 "provider": entry.settings.provider,
                 "model": entry.settings.name,
-                "capabilities": sorted(entry.capabilities),
+                "capabilities": sorted(self.capabilities(key)),
                 "configured": (
                     entry.settings.provider not in {"openai", "deepseek"}
                     or bool(os.environ.get(entry.secret_env or ""))
@@ -118,7 +138,9 @@ class ModelCatalog:
         entry = self.entries[model_id]
         return fingerprint(
             {
-                "settings": entry.settings.model_dump(),
+                "settings": entry.settings.model_dump(
+                    exclude={"vision"} if entry.settings.vision is None else None
+                ),
                 "capabilities": sorted(entry.capabilities),
             }
         )

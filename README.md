@@ -1,4 +1,4 @@
-# deep-harness v1.1.4
+# deep-harness v1.1.5
 
 deep-harness 是可在本机或服务器运行的 Python Agent 宿主，提供 CLI、Windows 桌面端、免登录浏览器工作台和 REST/SSE API。CLI 默认使用本机 Ollama 的 `qwen3.5:9b`。各入口复用统一的会话授权、审批、回执和恢复机制。
 
@@ -23,6 +23,8 @@ deep-harness 是可在本机或服务器运行的 Python Agent 宿主，提供 C
 conda activate deep-harness
 deep-harness --state-dir .state --workspace . repl
 deep-harness --state-dir .state --workspace . chat "分析这个项目" --harness research
+deep-harness --state-dir .state --workspace . chat --image screenshot.png "解释截图中的错误"
+deep-harness --state-dir .state --workspace . chat --image screenshot.jpg
 deep-harness --state-dir .state --workspace . repl --harness coding --allow-patch
 deep-harness --state-dir .state --workspace . --provider diagnostic chat "/read README.md"
 deep-harness --help

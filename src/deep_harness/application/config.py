@@ -11,6 +11,7 @@ from deep_harness.server_config import defaults_for, number, read_operator_confi
 
 class ModelSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, validate_default=True)
+    vision: bool | None = None
     provider: Literal["ollama", "openai", "deepseek", "diagnostic"]
     name: str = Field(min_length=1)
     base_url: str | None = None

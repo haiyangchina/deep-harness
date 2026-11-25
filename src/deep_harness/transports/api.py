@@ -1,18 +1,21 @@
 """Local development HTTP API; credentials never enter model/checkpoint state."""
 
 import secrets
+from base64 import b64encode
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from typing import Annotated, Literal
+from urllib.parse import unquote
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from deep_harness.application.capabilities import manifest
 from deep_harness.application.jobs import CreateJob, JobBudget
 from deep_harness.application.workspace import PROJECT_PROMPT
+from deep_harness.domain.images import MAX_IMAGES
 from deep_harness.domain.models import DomainError, Harness
 from deep_harness.runtime.inference import usage_totals
 from deep_harness.server_config import number
@@ -47,7 +50,8 @@ class RevokeReuse(RequestModel):
 
 class SubmitInput(RequestModel):
     submission_id: str = Field(min_length=1, max_length=number("api.submission_id_max_length"))
-    text: str = Field(min_length=1, max_length=number("api.text_max_length"))
+    text: str = Field(default="", max_length=number("api.text_max_length"))
+    image_ids: tuple[str, ...] = Field(default=(), max_length=MAX_IMAGES)
 
 
 class ApprovalResponse(RequestModel):
@@ -86,6 +90,8 @@ def create_api(host, token: str) -> FastAPI:
     @app.exception_handler(DomainError)
     async def domain_error(request, exc):
         status = 404 if exc.code.endswith("_not_found") else 409
+        if exc.code == "upload_too_large":
+            status = 413
         return JSONResponse(status_code=status, content={"code": exc.code, "message": str(exc)})
 
     @app.get("/health")
@@ -198,6 +204,7 @@ def create_api(host, token: str) -> FastAPI:
             result = await service.sessions.status(session_id)
         else:
             result = await service.store.session_status(session_id, "operator")
+            result["vision"] = await service.sessions.session_vision(session_id)
         stage = await service.jobs.ledger.owner(session_id)
         if stage:
             result["job_id"] = stage["job_id"]
@@ -325,7 +332,51 @@ def create_api(host, token: str) -> FastAPI:
     )
     async def submit(profile_id: str, session_id: str, body: SubmitInput):
         service = await host.application(profile_id)
-        return asdict(await service.submit(session_id, body.submission_id, body.text))
+        return asdict(
+            await service.submit(
+                session_id, body.submission_id, body.text, image_ids=body.image_ids
+            )
+        )
+
+    @app.post(
+        "/profiles/{profile_id}/sessions/{session_id}/images",
+        status_code=201,
+        dependencies=[Depends(authenticate)],
+    )
+    async def upload_image(
+        request: Request,
+        profile_id: str,
+        session_id: str,
+        x_filename: Annotated[str, Header(max_length=1000)] = "image",
+    ):
+        service = await host.application(profile_id)
+        return await service.publish_attachment(
+            session_id, request.stream(), unquote(x_filename), image=True
+        )
+
+    @app.get(
+        "/profiles/{profile_id}/sessions/{session_id}/images/{image_id}",
+        dependencies=[Depends(authenticate)],
+    )
+    async def read_image(
+        profile_id: str, session_id: str, image_id: str,
+        encoding: Literal["base64"] | None = None, thumbnail: bool = False,
+    ):
+        service = await host.application(profile_id)
+        row, path = await service.get_image(session_id, image_id)
+        if thumbnail or encoding == "base64":
+            data = (
+                await service.artifacts.thumbnail(row, path)
+                if thumbnail else await service.artifacts.image_bytes(row, path)
+            )
+            media_type = "image/png" if thumbnail else row["kind"]
+            if encoding == "base64":
+                return {"media_type": media_type, "data": b64encode(data).decode("ascii")}
+            return Response(data, media_type=media_type, headers={"Cache-Control": "no-store"})
+        return FileResponse(
+            path, media_type=row["kind"],
+            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+        )
 
     @app.get("/profiles/{profile_id}/sessions/{session_id}", dependencies=[Depends(authenticate)])
     async def snapshot(profile_id: str, session_id: str):

@@ -7,6 +7,7 @@ from sqlalchemy import func, insert, select, update
 from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import DomainError
 from deep_harness.infrastructure import schema as s
+from deep_harness.infrastructure.artifacts import run_artifacts
 from deep_harness.server_config import number
 
 
@@ -72,6 +73,7 @@ class DelegationLedger:
         snapshot,
         task,
         permission_mode="ask",
+        image_ids=(),
     ):
         async with self.store.transaction() as conn:
             await self.executions.assert_claim(conn, claim)
@@ -117,7 +119,9 @@ class DelegationLedger:
                     session_id=session_id,
                     principal="operator",
                     submission_id="initial",
-                    payload_hash=fingerprint({"text": task}),
+                    payload_hash=fingerprint(
+                        {"text": task, **({"image_ids": image_ids} if image_ids else {})}
+                    ),
                     text=task,
                     status="queued",
                     generation=0,
@@ -128,9 +132,19 @@ class DelegationLedger:
                     id=f"{admission_id}:user",
                     session_id=session_id,
                     admission_id=admission_id,
-                    payload={"id": f"{admission_id}:user", "role": "user", "content": task},
+                    payload={
+                        "id": f"{admission_id}:user",
+                        "role": "user",
+                        "content": task,
+                        **({"image_ids": list(image_ids)} if image_ids else {}),
+                    },
                 )
             )
+            if image_ids:
+                await conn.execute(
+                    insert(run_artifacts),
+                    [{"run_id": admission_id, "artifact_id": image_id} for image_id in image_ids],
+                )
             await conn.execute(
                 update(s.delegations)
                 .where(s.delegations.c.id == identifier)

@@ -1,12 +1,15 @@
-import { useCallback, useEffect, useState, type FormEvent } from 'react'
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import { createRoot } from 'react-dom/client'
-import { api, requestId, upload } from './api'
+import { api, HttpError, requestId, upload } from './api'
+import { appendImages, dropImages, ImagePicker, ImageStrip, pasteImages, stageImages } from '../image-input'
+import type { ImageDraft } from '../image-input'
 import './style.css'
+import '../images.css'
 
 declare const __APP_VERSION__: string
 
 type Workspace = { id: string; mode: string }
-type Model = { id: string; label: string; provider: string; model: string; configured: boolean }
+type Model = { id: string; label: string; provider: string; model: string; configured: boolean; capabilities: string[] }
 type Agent = { id: string; label: string; workflow: string | null }
 type Catalog = {
   default_workspace: string; default_model: string
@@ -21,10 +24,12 @@ type Approval = {
 type Effect = { id: string; proposal_hash: string; status: string }
 type Status = {
   latest_admission: Run | null; model_id: string
+  vision: boolean; image_context: string[] | null
   approvals: Approval[]; active_effects: Effect[]
 }
-type Message = { seq: number; message: { role: string; content: unknown } }
-type Artifact = { id: string; name: string; size: number }
+type Message = { seq: number; message: { id: string; role: string; content: unknown; image_ids?: string[] } }
+type Artifact = { id: string; name: string; size: number; kind: string }
+type Submission = { text: string; submission_id: string; artifact_ids?: string[]; image_ids?: string[] }
 type Job = {
   id: string; goal: string; status: string; notice?: string
   stages?: { position: number; definition: { title: string }; session_id: string | null;
@@ -45,6 +50,7 @@ function Workbench() {
   const [workspace, setWorkspace] = useState('')
   const [model, setModel] = useState('')
   const [agent, setAgent] = useState('')
+  const [harness, setHarness] = useState('general')
   const [sessions, setSessions] = useState<Session[]>([])
   const [jobs, setJobs] = useState<Job[]>([])
   const [session, setSession] = useState('')
@@ -55,6 +61,9 @@ function Workbench() {
   const [older, setOlder] = useState(false)
   const [artifacts, setArtifacts] = useState<Artifact[]>([])
   const [files, setFiles] = useState<File[]>([])
+  const [images, setImages] = useState<ImageDraft[]>([])
+  const [submission, setSubmission] = useState<Submission | null>(null)
+  const selection = useRef('')
   const [input, setInput] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
@@ -66,6 +75,27 @@ function Workbench() {
   const [lookup, setLookup] = useState<Record<string, unknown>>({})
   const base = rootPath(workspace)
   const sessionPath = `${base}/sessions/${session}`
+  const submissionKey = `deep-harness-web:${workspace}:${session}:pending`
+  const loadImage = useCallback((id: string, full = false) =>
+    `${sessionPath}/images/${id}${full ? '' : '?thumbnail=1'}`, [sessionPath])
+  const imagesDisabled = status?.vision === false
+  const addImages = (items: ImageDraft[]) => {
+    if (busy || submission || imagesDisabled) return
+    const result = appendImages(images, items)
+    setImages(result.images)
+    setError(result.error)
+  }
+  const addFiles = (items: File[]) => addImages(items.map(file => ({ file })))
+
+  useEffect(() => {
+    selection.current = sessionPath
+    const saved = session ? sessionStorage.getItem(submissionKey) : null
+    const previous: Submission | null = saved ? JSON.parse(saved) : null
+    setSubmission(previous)
+    setImages(previous?.image_ids?.map(id => ({ id })) ?? [])
+    setInput(previous?.text ?? '')
+    setFiles([])
+  }, [session, sessionPath, submissionKey])
   const selectedAgent = catalog?.agents.find(row => row.id === agent)
   const sandbox = catalog?.workspaces.find(row => row.id === workspace)?.mode === 'sandbox'
 
@@ -120,7 +150,7 @@ function Workbench() {
     events.onerror = () => setReady(false)
     for (const event of ['admission.accepted', 'execution.started', 'execution.completed',
       'execution.unknown', 'execution.interrupted', 'execution.cancelled', 'execution.reconciled',
-      'execution.waiting_approval', 'interaction.resolved', 'artifact.ready', 'model.delta']) {
+      'execution.waiting_approval', 'interaction.resolved', 'artifact.ready', 'model.started', 'model.delta']) {
       events.addEventListener(event, () => {
         clearTimeout(timer)
         timer = setTimeout(() => void refresh(), 100)
@@ -174,10 +204,10 @@ function Workbench() {
   async function create() {
     if (!workspace || !model) return
     const created = await api<Session>(`${base}/sessions`, {
-      request_id: requestId(), model_id: model, agent_id: agent || null,
+      request_id: requestId(), model_id: model, agent_id: agent || null, harness,
       tools: agent ? [] : [
         ...(useFiles ? ['read', 'list_files', 'search_files'] : []),
-        ...(sandbox && useShell ? ['bash'] : [])
+        ...(sandbox && useShell && !harness.startsWith('research') ? ['bash'] : [])
       ],
     })
     await refreshLists()
@@ -186,25 +216,40 @@ function Workbench() {
 
   function send(event: FormEvent) {
     event.preventDefault()
-    if (!input.trim() || !session) return
+    if (!session || (!submission && !input.trim() && !images.length)) return
     void perform(async () => {
-      const key = `deep-harness-web:${workspace}:${session}:pending`
-      const saved = sessionStorage.getItem(key)
-      const previous = saved ? JSON.parse(saved) as {
-        text: string; submission_id: string; artifact_ids: string[]
-      } : null
-      const selected: string[] = []
-      if (!previous) {
-        for (const file of files) {
-          selected.push((await upload(`${sessionPath}/attachments`, file)).id)
+      let payload = submission
+      if (!payload) {
+        const imageIds = await stageImages(images, async file =>
+          (await upload(`${sessionPath}/images`, file)).id,
+        staged => { if (selection.current === sessionPath) setImages(staged) })
+        const artifactIds: string[] = []
+        for (const file of files) artifactIds.push((await upload(`${sessionPath}/attachments`, file)).id)
+        payload = { submission_id: requestId(), text: input.trim(), artifact_ids: artifactIds, image_ids: imageIds }
+        sessionStorage.setItem(submissionKey, JSON.stringify(payload))
+        if (selection.current === sessionPath) setSubmission(payload)
+      }
+      const existing = submission && await api<Run | null>(
+        `${sessionPath}/submission?submission_id=${encodeURIComponent(payload.submission_id)}`
+      )
+      if (!existing) {
+        try {
+          await api(`${sessionPath}/runs`, payload)
+        } catch (error) {
+          if (error instanceof HttpError && error.status < 500) {
+            sessionStorage.removeItem(submissionKey)
+            if (selection.current === sessionPath) setSubmission(null)
+          }
+          throw error
         }
       }
-      const payload = previous || { submission_id: requestId(), text: input.trim(), artifact_ids: selected }
-      sessionStorage.setItem(key, JSON.stringify(payload))
-      await api(`${sessionPath}/runs`, payload)
-      sessionStorage.removeItem(key)
-      setInput('')
-      setFiles([])
+      sessionStorage.removeItem(submissionKey)
+      if (selection.current === sessionPath) {
+        setSubmission(null)
+        setInput('')
+        setImages([])
+        setFiles([])
+      }
     })
   }
 
@@ -279,7 +324,7 @@ function Workbench() {
           {step.session_id && <button onClick={() => openSession(step.session_id!)}>查看会话</button>}
         </li>)}</ol>
       </section> : session ? <>
-        <div className="thread-head"><div><h1>会话</h1><small>{status?.model_id || '—'} · {workspace}</small></div>
+        <div className="thread-head"><div><h1>会话</h1><small>{status?.model_id || '—'} · {status?.vision === false ? '仅文字' : '图文'} · {workspace}</small></div>
           {active && <span className="pill">{stateText(active.status)}</span>}
           {active && ['queued', 'started', 'waiting_approval'].includes(active.status) &&
             <button disabled={busy} onClick={() => void perform(async () => {
@@ -296,6 +341,10 @@ function Workbench() {
           {messages.map(row => <article key={row.seq} className={'message ' + row.message.role}>
             <h2>{row.message.role === 'user' ? '你' : row.message.role === 'tool' ? '工具' : 'Agent'}</h2>
             <div className="content">{typeof row.message.content === 'string' ? row.message.content : JSON.stringify(row.message.content, null, 2)}</div>
+            <ImageStrip images={row.message.image_ids?.map(id => ({ id })) ?? []} load={loadImage}
+              reuse={id => addImages([{ id }])} disabled={imagesDisabled || busy || Boolean(submission)}
+              context={status?.latest_admission?.status === 'queued' && row.message.id === `${status.latest_admission.id}:user`
+                ? undefined : status?.image_context ?? undefined} />
           </article>)}
           {status?.approvals.map(approval => <article key={approval.id} className="notice">
             <h2>待审批 · {approval.proposal.tool_name}</h2>
@@ -328,14 +377,33 @@ function Workbench() {
               setEvidence('')
             })}>确认对账</button>
           </article>}
-          {artifacts.length > 0 && <section className="artifacts"><h2>产物</h2>{artifacts.map(row =>
+          {artifacts.some(row => !row.kind.startsWith('image/')) && <section className="artifacts"><h2>产物</h2>{artifacts.filter(row => !row.kind.startsWith('image/')).map(row =>
             <a key={row.id} href={`${base}/artifacts/${row.id}`} download>{row.name}<span>{row.size} B</span></a>
           )}</section>}
         </section>
-        <form className="composer" onSubmit={send}>
-          <textarea aria-label="任务输入" placeholder="输入你的任务…" value={input} onChange={event => setInput(event.target.value)} />
-          <div className="actions"><label className="upload">附件<input type="file" multiple onChange={event => setFiles(Array.from(event.target.files || []).slice(0, 8))} /></label>
-            <span>{files.map(file => file.name).join(' · ')}</span><button className="primary" disabled={busy || !input.trim()}>发送</button>
+        <form className="composer" onSubmit={send}
+          onDragOver={event => { if (event.dataTransfer.types.includes('Files')) event.preventDefault() }}
+          onDrop={event => dropImages(event, addFiles, imagesDisabled || busy || Boolean(submission))}>
+          <textarea aria-label="任务输入" placeholder="输入任务或粘贴截图…" value={input} disabled={Boolean(submission)}
+            onChange={event => setInput(event.target.value)}
+            onPaste={event => { if (!imagesDisabled) pasteImages(event, addFiles) }} />
+          <ImageStrip images={images} load={loadImage} disabled={busy || Boolean(submission)}
+            remove={index => setImages(rows => rows.filter((_, position) => position !== index))} />
+          <div className="actions">
+            <ImagePicker add={addFiles} disabled={imagesDisabled || busy || Boolean(submission)} />
+            <label className="upload">附件<input type="file" multiple disabled={busy || Boolean(submission)}
+              onChange={event => {
+                const selected = Array.from(event.target.files ?? [])
+                const pictures = selected.filter(file => file.type.startsWith('image/') || /\.(png|jpe?g)$/i.test(file.name))
+                if (pictures.length && imagesDisabled) setError('当前模型仅支持文字，请选择支持图文的模型。')
+                else if (pictures.length) addFiles(pictures)
+                setFiles(selected.filter(file => !pictures.includes(file)).slice(0, 8))
+                event.currentTarget.value = ''
+              }} /></label>
+            <span>{files.map(file => file.name).join(' · ')}</span>
+            <button className="primary" disabled={busy || (!input.trim() && !images.length && !submission)}>
+              {submission ? '核对后重试相同请求' : '发送'}
+            </button>
           </div>
         </form>
       </> : <section className="paper start">
@@ -343,16 +411,22 @@ function Workbench() {
         <h1>新建任务</h1>
         <div className="fields">
           <label>模型<select value={model} onChange={event => setModel(event.target.value)}>
-            {catalog?.models.map(row => <option key={row.id} value={row.id} disabled={!row.configured}>{row.label} · {row.model}</option>)}
+            {catalog?.models.map(row => <option key={row.id} value={row.id} disabled={!row.configured}>{row.label} · {row.model} · {row.capabilities.includes('vision') ? '图文' : '仅文字'}</option>)}
           </select></label>
           <label>Agent<select value={agent} onChange={event => setAgent(event.target.value)}>
             <option value="">通用 Agent</option>
             {catalog?.agents.map(row => <option key={row.id} value={row.id}>{row.label}</option>)}
           </select></label>
         </div>
+        {!agent && <label>Harness<select value={harness} onChange={event => setHarness(event.target.value)}>
+          <option value="general">通用</option>
+          <option value="research">研究</option>
+          <option value="research_web">联网研究</option>
+          <option value="coding">编码</option>
+        </select></label>}
         {!agent && <div className="checks">
           <label><input type="checkbox" checked={useFiles} onChange={event => setUseFiles(event.target.checked)} /> 工作目录只读工具</label>
-          {sandbox && <label><input type="checkbox" checked={useShell} onChange={event => setUseShell(event.target.checked)} /> 隔离命令执行</label>}
+          {sandbox && !harness.startsWith('research') && <label><input type="checkbox" checked={useShell} onChange={event => setUseShell(event.target.checked)} /> 隔离命令执行</label>}
         </div>}
         {selectedAgent?.workflow && <textarea aria-label="工作流目标" placeholder="工作流目标" value={input} onChange={event => setInput(event.target.value)} />}
         <div className="actions"><button className="primary" disabled={busy || !catalog} onClick={() => void perform(create)}>创建会话</button>

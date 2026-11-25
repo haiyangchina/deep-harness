@@ -14,6 +14,7 @@ from deep_harness.application.config import (
     load_web_settings,
 )
 from deep_harness.bootstrap import ProjectHost
+from deep_harness.domain.images import MAX_IMAGE_BYTES
 from deep_harness.domain.models import DomainError
 from deep_harness.runtime.model_factory import open_model
 from deep_harness.server_config import number, setting
@@ -35,7 +36,10 @@ def parser():
     result.add_argument("--api-key-env", default="OPENAI_API_KEY")
     commands = result.add_subparsers(dest="command", required=True)
     chat = commands.add_parser("chat")
-    chat.add_argument("text")
+    chat.add_argument("text", nargs="?", default="")
+    chat.add_argument(
+        "--image", action="append", type=Path, default=[], help="Attach a PNG or JPEG (repeatable)"
+    )
     chat.add_argument("--session", help="Continue an existing session")
     chat.add_argument("--harness", choices=list(HARNESSES))
     chat.add_argument("--permission-mode", choices=["ask", "auto", "full"])
@@ -201,12 +205,16 @@ def build_host(args):
         recover_queued=recover_queued,
         execution_limits=execution_limits,
         web_settings=web_settings,
+        upload_limit=MAX_IMAGE_BYTES,
     )
 
 
 def main():
     sys.stdout.reconfigure(encoding="utf-8")
-    args = parser().parse_args()
+    command_line = parser()
+    args = command_line.parse_args()
+    if args.command == "chat" and (not args.text.strip() and not args.image):
+        command_line.error("chat requires text or --image")
     if args.command == "web":
         from deep_harness.transports.web_launcher import serve_web
 

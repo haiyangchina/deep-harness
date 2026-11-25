@@ -170,8 +170,19 @@ class BusinessStore:
                 .mappings()
                 .first()
             )
+            image_context = await conn.scalar(
+                select(s.events.c.payload)
+                .where(
+                    s.events.c.session_id == session_id,
+                    s.events.c.type == "model.started",
+                    s.events.c.payload["image_ids"].as_string().is_not(None),
+                )
+                .order_by(s.events.c.seq.desc())
+                .limit(1)
+            )
         return {
             "session": session,
+            "image_context": image_context["image_ids"] if image_context else None,
             "active_admissions": active,
             "approvals": approvals,
             "latest_admission": admission_from(latest) if latest is not None else None,
@@ -319,12 +330,15 @@ class BusinessStore:
         submission_id: str,
         text: str,
         artifact_ids: tuple[str, ...] = (),
+        image_ids: tuple[str, ...] = (),
     ) -> Admission:
         if session.profile_id != self.profile_id or session.principal != principal:
             raise DomainError("scope_mismatch", "Input does not belong to this profile/principal")
         payload = {"text": text}
         if artifact_ids:
             payload["artifact_ids"] = artifact_ids
+        if image_ids:
+            payload["image_ids"] = image_ids
         digest = fingerprint(payload)
         async with self.transaction() as conn:
             row = (
@@ -362,19 +376,34 @@ class BusinessStore:
                     id=f"{admission_id}:user",
                     session_id=session.id,
                     admission_id=admission_id,
-                    payload={"id": f"{admission_id}:user", "role": "user", "content": text},
+                    payload={
+                        "id": f"{admission_id}:user",
+                        "role": "user",
+                        "content": text,
+                        **({"image_ids": list(image_ids)} if image_ids else {}),
+                    },
                 )
             )
-            if artifact_ids:
+            if artifact_ids or image_ids:
                 from deep_harness.infrastructure.artifacts import run_artifacts
 
                 await conn.execute(
                     insert(run_artifacts),
                     [{"run_id": admission_id, "artifact_id": artifact_id}
-                     for artifact_id in artifact_ids],
+                     for artifact_id in (*artifact_ids, *image_ids)],
                 )
             await self.append_event(conn, session.id, "admission.accepted", {"id": admission_id})
         return Admission(admission_id, session.id, text, "queued", 0)
+
+    async def admission_image_ids(self, admission):
+        async with self.engine.connect() as conn:
+            payload = await conn.scalar(
+                select(s.messages.c.payload).where(
+                    s.messages.c.id == f"{admission.id}:user",
+                    s.messages.c.session_id == admission.session_id,
+                )
+            )
+        return payload.get("image_ids", []) if payload else []
 
     async def queued_count(self):
         async with self.engine.connect() as conn:

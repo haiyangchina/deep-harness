@@ -25,6 +25,7 @@ from deep_harness.application.session_runtime import SessionRuntime
 from deep_harness.application.tools import TOOL_ARGUMENTS
 from deep_harness.application.workspace import CODING_TOOLS, MUTATING_TOOLS, READ_TOOLS
 from deep_harness.domain.identity import fingerprint
+from deep_harness.domain.images import MAX_IMAGES
 from deep_harness.domain.models import DomainError
 from deep_harness.infrastructure.archives import create_archive, restore_archive
 from deep_harness.infrastructure.artifacts import ArtifactStore
@@ -222,7 +223,7 @@ class ProfileApplication:
 
     @mutation
     async def submit(
-        self, session_id: str, submission_id: str, text: str, *, artifact_ids=()
+        self, session_id: str, submission_id: str, text: str, *, artifact_ids=(), image_ids=()
     ):
         if self.closing:
             raise DomainError("draining", "Application is closing")
@@ -230,6 +231,18 @@ class ProfileApplication:
         if await self.jobs.ledger.owner(session_id) is not None:
             raise DomainError("job_stage_managed", "Submit long-task stages from the job page")
         await self.sessions.validate(session)
+        if not text.strip() and not image_ids:
+            raise DomainError("input_empty", "Enter text or attach an image")
+        if len(image_ids) > MAX_IMAGES or len(set((*image_ids, *artifact_ids))) != (
+            len(image_ids) + len(artifact_ids)
+        ):
+            raise DomainError("invalid_attachments", "Use up to four distinct images per message")
+        if image_ids:
+            if self.artifacts is None:
+                raise DomainError("artifact_not_found", "Images are unavailable")
+            await self.sessions.require_vision(session)
+            for image_id in image_ids:
+                await self.artifacts.image(session.id, image_id)
         if artifact_ids:
             if self.artifacts is None:
                 raise DomainError("artifact_not_found", "Attachments are unavailable")
@@ -240,6 +253,7 @@ class ProfileApplication:
             submission_id=submission_id,
             text=text,
             artifact_ids=artifact_ids,
+            image_ids=image_ids,
         )
         self.schedule(session_id)
         return admission
@@ -254,9 +268,20 @@ class ProfileApplication:
             self.track(task)
 
     @mutation
-    async def publish_attachment(self, session_id, chunks, name):
-        await self.store.get_session(session_id, "operator")
+    async def publish_attachment(self, session_id, chunks, name, *, image=False):
+        session = await self.store.get_session(session_id, "operator")
+        if self.artifacts is None:
+            raise DomainError("artifact_not_found", "Attachments are unavailable")
+        if image:
+            await self.sessions.require_vision(session)
+            return await self.artifacts.publish_image(session_id, chunks, name)
         return await self.artifacts.publish(session_id, chunks, name)
+
+    async def get_image(self, session_id, image_id):
+        await self.store.get_session(session_id, "operator")
+        if self.artifacts is None:
+            raise DomainError("artifact_not_found", "Images are unavailable")
+        return await self.artifacts.image(session_id, image_id)
 
     async def drain_scheduled(self, session_id: str):
         try:
@@ -304,7 +329,7 @@ class ProfileApplication:
         await self.store.get_session(session_id, "operator")
         return await self.delegations.get(session_id, delegation_id)
 
-    async def launch_background(self, session, claim, call, delegation, mcp_bindings):
+    async def launch_background(self, session, claim, call, delegation, mcp_bindings, image_ids=()):
         kind = call.arguments["kind"]
         allowed = (
             CODING_TOOLS
@@ -326,6 +351,7 @@ class ProfileApplication:
             permission_mode=session.permission_mode,
             snapshot=snapshot,
             task=call.arguments["task"],
+            image_ids=image_ids,
         )
         self.schedule(handle["session_id"])
         return handle
@@ -390,6 +416,7 @@ class ProfileApplication:
             mcp=self.mcp,
             mcp_bindings=mcp_bindings,
             web_client=self.web,
+            artifacts=self.artifacts,
         )
         if self.executor is not None:
             kwargs["executor"] = self.executor
@@ -494,6 +521,8 @@ class ProfileApplication:
                     "model_connection_failed",
                     "model_request_failed",
                     "sandbox_state_lost",
+                    "artifact_not_found",
+                    "image_corrupt",
                 }
                 else "unknown"
             )

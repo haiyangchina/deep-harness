@@ -15,11 +15,13 @@ import json
 
 from langchain.agents.middleware import AgentMiddleware, ModelResponse
 from langchain_core.messages import AIMessage, HumanMessage
+from langsmith import tracing_context
 
 from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import DomainError
 from deep_harness.runtime.approval_checkpoint import pause_at_boundary
 from deep_harness.runtime.context import summarize
+from deep_harness.runtime.images import image_content, included_ids
 from deep_harness.runtime.inference import normalized_usage, usage_totals
 from deep_harness.runtime.models import model_errors
 
@@ -59,10 +61,25 @@ class HarnessGuardMiddleware(AgentMiddleware):
             raise DomainError("budget_exhausted", "Model call limit reached")
         if totals["total_tokens"] >= owner.limits.max_run_tokens:
             raise DomainError("budget_exhausted", "Per-run token budget exhausted")
+        image_turns = [
+            (index, message.content, message.additional_kwargs["image_ids"])
+            for index, message in enumerate(request.messages)
+            if isinstance(message, HumanMessage) and message.additional_kwargs.get("image_ids")
+        ]
+        images = await image_content(owner.artifacts, owner.session.id, image_turns)
+        if images:
+            request = request.override(messages=[
+                message.model_copy(update={"content": images[index], "additional_kwargs": {}})
+                if index in images else message
+                for index, message in enumerate(request.messages)
+            ])
+        event = {"id": key}
+        if owner.record_messages and owner.artifacts is not None:
+            event["image_ids"] = included_ids(image_turns, images)
         async with owner.store.transaction() as conn:
             await owner.executions.assert_claim(conn, owner.claim)
-            await owner.store.append_event(conn, owner.session.id, "model.started", {"id": key})
-        with model_errors():
+            await owner.store.append_event(conn, owner.session.id, "model.started", event)
+        with tracing_context(enabled=False), model_errors():
             async with asyncio.timeout(owner.request_timeout):
                 response = await handler(request)
         if len(response.result) != 1 or not isinstance(response.result[0], AIMessage):
@@ -132,7 +149,11 @@ class HarnessGuardMiddleware(AgentMiddleware):
             retained = original[first_turn:]
             retained_payload = messages[first_turn:]
             user_history = [
-                {"role": "user", "content": message.content}
+                {
+                    "role": "user",
+                    "content": message.content,
+                    "image_ids": message.additional_kwargs.get("image_ids", []),
+                }
                 for message in original[:first_turn]
                 if isinstance(message, HumanMessage)
             ]

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "deep-harness"
-version = "1.1.4"
+version = "1.1.5"
 description = "Isolated Python with LangChain, LangGraph and Deep Agents"
 requires-python = ">=3.12,<3.13"
 dependencies = [
@@ -31,6 +31,7 @@ dependencies = [
   "ddgs<10,>=9",
   "PyYAML<7,>=6",
   "langchain-deepseek<2,>=1",
+  "Pillow<13,>=12.1",
 ]
 
 [project.optional-dependencies]

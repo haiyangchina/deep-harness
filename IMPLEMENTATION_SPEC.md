@@ -1,4 +1,4 @@
-# v1.1.4 Web 接口与业务扩展
+# v1.1.5 Web 接口与业务扩展
 
 Web 服务运行一个 Uvicorn worker。实例锁保护状态卷，每个登记的工作目录对应一个内部 Profile。浏览器和 API 客户端通过可信入口共享同一实例的会话、审批、任务和产物。启动命令、反向代理和备份操作见[部署指南](deploy/README.md)。
 
@@ -26,7 +26,7 @@ Web 服务运行一个 Uvicorn worker。实例锁保护状态卷，每个登记�
 | 方法和路径 | 请求或用途 |
 | --- | --- |
 | `POST /sessions` | 提交稳定的 `request_id`，可选 `agent_id`、`model_id`。也可指定提示、Harness 和授权工具。 |
-| `GET /sessions`、`GET /sessions/{id}`、`GET /sessions/{id}/messages` | 分页读取会话、模型绑定、待审批和对话历史。 |
+| `GET /sessions`、`GET /sessions/{id}`、`GET /sessions/{id}/messages` | 分页读取会话、模型绑定、待审批和对话历史。用户消息可含有序的 `image_ids`。 |
 | `POST /sessions/{id}/runs` | 提交 `submission_id`、`text` 和可选 `artifact_ids`，返回 HTTP 202 及 Run ID。 |
 | `GET /runs/{id}` | 读取状态、代际、结果和用量。 |
 | `GET /runs/{id}/events`、`GET /sessions/{id}/events` | 从 `Last-Event-ID` 或 `after` 续读持久 SSE 事件。 |
@@ -34,6 +34,9 @@ Web 服务运行一个 Uvicorn worker。实例锁保护状态卷，每个登记�
 | `POST /runs/{id}/cancel` | 请求取消运行。 |
 | `GET /runs/{id}/effects/{effect_id}/status`、`POST /runs/{id}/reconciliation` | 查询连接器提供的外部状态，人工提交结论及证据。 |
 | `POST /sessions/{id}/attachments` | 以 `application/octet-stream` 上传附件，可通过 `X-Filename` 指定显示名称。 |
+| `POST /sessions/{id}/images` | 上传 PNG 或 JPEG，使用 `application/octet-stream` 和 `X-Harness-Upload: 1`。提交 Run 时加入 `image_ids`，纯图片可省略 `text`。 |
+| `GET /sessions/{id}/images/{image_id}` | 在会话范围内读取原图，使用 `?thumbnail=1` 获取缩略图。 |
+| `GET /sessions/{id}/submission?submission_id=...` | 在写入结果未知时核对已受理的 Run。 |
 | `GET /runs/{id}/artifacts`、`GET /artifacts/{id}` | 列出产物并按 ID 下载。 |
 | `POST /workflows/{id}/runs` | 提交 `request_id`、`agent_id`、`goal` 及可选 `model_id`。 |
 | `GET /jobs`、`GET /jobs/{id}`、`POST /jobs/{id}/commands` | 查询工作流任务和阶段状态，暂停、恢复、取消或验收阶段。 |

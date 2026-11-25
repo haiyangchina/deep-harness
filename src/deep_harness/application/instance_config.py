@@ -12,7 +12,7 @@ from deep_harness.application.config import load_model_settings
 from deep_harness.server_config import number
 
 Identifier = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$")]
-Capability = Literal["text", "streaming", "tool_calls", "structured_output"]
+Capability = Literal["text", "streaming", "tool_calls", "structured_output", "vision"]
 
 
 class Settings(BaseModel):

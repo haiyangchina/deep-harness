@@ -55,7 +55,12 @@ def to_langchain(message: dict):
     common = {"content": message.get("content", ""), "id": message.get("id")}
     role = message["role"]
     factories = {
-        "user": lambda: HumanMessage(**common),
+        "user": lambda: HumanMessage(
+            **common,
+            additional_kwargs=(
+                {"image_ids": message["image_ids"]} if message.get("image_ids") else {}
+            ),
+        ),
         "system": lambda: SystemMessage(**common),
         "assistant": lambda: AIMessage(
             **common,

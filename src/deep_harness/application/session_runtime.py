@@ -1,5 +1,7 @@
 """Session configuration and branching authority, independent of transport entry points."""
 
+from copy import deepcopy
+
 from deep_harness.application.capabilities import WEB_TOOLS
 from deep_harness.application.harness_spec import CONTEXT_POLICY
 from deep_harness.application.tools import tool_definitions
@@ -8,6 +10,20 @@ from deep_harness.domain.models import DomainError
 from deep_harness.infrastructure.branches import BranchLedger
 from deep_harness.infrastructure.policies import PolicyLedger
 from deep_harness.runtime.harnesses import harness_contract
+
+
+def preserve_image_tool_binding(binding, snapshot):
+    """Recognize the single optional delegation argument added to old sessions."""
+    if not binding or binding["fingerprint"] == fingerprint(snapshot):
+        return snapshot
+    legacy = deepcopy(snapshot)
+    for tool in legacy["tools"]:
+        if tool["name"] == "delegate_task":
+            tool["parameters"]["properties"].pop("share_images", None)
+            if binding["fingerprint"] == fingerprint(legacy):
+                return legacy
+            break
+    return snapshot
 
 
 class SessionRuntime:
@@ -77,6 +93,21 @@ class SessionRuntime:
             return self.model
         return self.models.get(model_id, tools=bool(tools))
 
+    def supports_vision(self, model_id=None):
+        if self.models is not None:
+            return "vision" in self.models.capabilities(model_id)
+        return getattr(self.model, "vision", False)
+
+    async def session_vision(self, session_id):
+        if self.models is None:
+            return self.supports_vision()
+        binding = await self.policies.get(session_id)
+        return self.supports_vision(binding["snapshot"].get("model_id") if binding else None)
+
+    async def require_vision(self, session):
+        if not await self.session_vision(session.id):
+            raise DomainError("model_capability", "The selected model cannot accept images")
+
     async def catalog_for(self, tools):
         if any(name.startswith("mcp__") for name in tools):
             if self.mcp is None:
@@ -99,16 +130,16 @@ class SessionRuntime:
         binding = await self.policies.get(session.id)
         knowledge = binding["snapshot"].get("knowledge") if binding else None
         catalog = await self.catalog_for(session.tools)
+        current = self.snapshot(
+            session.tools,
+            engine=session.engine,
+            harness=session.harness,
+            knowledge=knowledge,
+            mcp_catalog=catalog,
+            model_id=binding["snapshot"].get("model_id") if binding else None,
+        )
         await self.policies.assert_matches(
-            session.id,
-            self.snapshot(
-                session.tools,
-                engine=session.engine,
-                harness=session.harness,
-                knowledge=knowledge,
-                mcp_catalog=catalog,
-                model_id=binding["snapshot"].get("model_id") if binding else None,
-            ),
+            session.id, preserve_image_tool_binding(binding, current)
         )
 
     async def status(self, session_id):
@@ -117,6 +148,7 @@ class SessionRuntime:
         knowledge = binding["snapshot"].get("knowledge") if binding else None
         catalog = await self.catalog_for(status["session"].tools)
         saved = binding["snapshot"] if binding else {}
+        status["vision"] = self.supports_vision(saved.get("model_id"))
         try:
             current = self.snapshot(
                 status["session"].tools,
@@ -131,6 +163,7 @@ class SessionRuntime:
                 raise
             status["runtime"] = {"binding": binding, "compatible": False, "error": exc.code}
             return status
+        current = preserve_image_tool_binding(binding, current)
         status["runtime"] = {
             "binding": binding,
             "current_snapshot": current,

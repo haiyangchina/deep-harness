@@ -15,6 +15,7 @@ export interface ApiRequest {
   method: 'GET' | 'POST' | 'DELETE'
   path: string
   body?: unknown
+  upload?: { name: string; data: ArrayBuffer }
 }
 export interface DesktopBridge {
   info(): Promise<RuntimeInfo>
@@ -93,6 +94,8 @@ export interface SessionStatus {
   job_id?: string
   session: Session
   latest_admission: Admission | null
+  image_context?: string[] | null
+  vision?: boolean
   active_admissions: Admission[]
   approvals: Approval[]
   runtime?: { compatible: boolean; current_fingerprint: string; changed_fields?: string[] }
@@ -107,6 +110,7 @@ export interface Message {
   id: string
   role: string
   content: unknown
+  image_ids?: string[]
 }
 declare global {
   interface Window {

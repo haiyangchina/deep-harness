@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import io
 import json
 import os
 import re
@@ -9,9 +10,12 @@ import time
 from pathlib import Path
 from uuid import uuid4
 
+from PIL import Image
 from sqlalchemy import Column, Integer, MetaData, String, Table, delete, insert, select, update
 
+from deep_harness.domain.images import IMAGE_TYPES, MAX_IMAGE_BYTES, MAX_IMAGE_PIXELS
 from deep_harness.domain.models import DomainError
+from deep_harness.infrastructure import schema as s
 
 metadata = MetaData()
 artifacts = Table(
@@ -160,6 +164,48 @@ class ArtifactStore:
             raise DomainError("artifact_not_found", "Artifact is not accessible")
         return dict(row), path
 
+    async def publish_image(self, session_id, chunks, name):
+        data = bytearray()
+        async for chunk in chunks:
+            if len(data) + len(chunk) > min(self.max_upload_bytes, MAX_IMAGE_BYTES):
+                raise DomainError("upload_too_large", "Image exceeds the upload size limit")
+            data.extend(chunk)
+        media_type = await asyncio.to_thread(validate_image, data)
+
+        async def validated():
+            yield data
+
+        return await self.publish(session_id, validated(), name, kind=media_type)
+
+    async def image(self, session_id, image_id):
+        row, path = await self.get(image_id)
+        if row["kind"] not in IMAGE_TYPES:
+            raise DomainError("artifact_not_found", "Expected an uploaded image")
+        if row["session_id"] != session_id:
+            async with self.store.engine.connect() as conn:
+                allowed = await conn.scalar(
+                    select(run_artifacts.c.artifact_id)
+                    .join(s.admissions, s.admissions.c.id == run_artifacts.c.run_id)
+                    .where(
+                        s.admissions.c.session_id == session_id,
+                        run_artifacts.c.artifact_id == image_id,
+                    )
+                    .limit(1)
+                )
+            if allowed is None:
+                raise DomainError("artifact_not_found", "Image is not accessible in this session")
+        return row, path
+
+    async def image_bytes(self, row, path):
+        data = await asyncio.to_thread(read_image, path)
+        if len(data) != row["size"] or hashlib.sha256(data).hexdigest() != row["sha256"]:
+            raise DomainError("image_corrupt", "Stored image failed its integrity check")
+        return data
+
+    async def thumbnail(self, row, path):
+        data = await self.image_bytes(row, path)
+        return await asyncio.to_thread(make_thumbnail, data)
+
     async def list(self, run_id):
         async with self.store.engine.connect() as conn:
             rows = await conn.execute(
@@ -194,3 +240,36 @@ def read_excerpt(path: Path, limit: int):
     if b"\x00" in data:
         return ""
     return data[:limit].decode("utf-8", errors="replace")
+
+
+
+def read_image(path):
+    with path.open("rb") as file:
+        return file.read(MAX_IMAGE_BYTES + 1)
+
+
+def validate_image(data):
+    try:
+        with Image.open(io.BytesIO(data), formats=["PNG", "JPEG"]) as image:
+            if image.width * image.height > MAX_IMAGE_PIXELS:
+                raise DomainError("image_dimensions", "Image exceeds the pixel limit")
+            if getattr(image, "is_animated", False):
+                raise DomainError("image_format", "Animated images are unsupported")
+            media_type = f"image/{image.format.lower()}"
+            image.verify()
+        with Image.open(io.BytesIO(data), formats=["PNG", "JPEG"]) as image:
+            image.load()
+        return media_type
+    except Image.DecompressionBombError as exc:
+        raise DomainError("image_dimensions", "Image exceeds the pixel limit") from exc
+    except (OSError, ValueError, SyntaxError) as exc:
+        raise DomainError("image_format", "Expected a valid PNG or JPEG image") from exc
+
+
+
+def make_thumbnail(data):
+    with Image.open(io.BytesIO(data)) as image:
+        image.thumbnail((200, 160))
+        result = io.BytesIO()
+        image.convert("RGBA").save(result, format="PNG")
+        return result.getvalue()

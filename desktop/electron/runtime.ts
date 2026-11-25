@@ -111,7 +111,13 @@ export class LocalRuntime {
   async request(request: ApiRequest): Promise<unknown> {
     if (!this.ready) throw new Error(this.error || '本机后端尚未就绪')
     const path = apiPath(this.profile, request)
-    return localJson(this.base + path, request.method, this.token, request.body)
+    if (request.upload && (
+      request.method !== 'POST' || !/^\/sessions\/[a-z0-9-]+\/images$/.test(request.path)
+      || !(request.upload.data instanceof ArrayBuffer)
+      || request.upload.data.byteLength > 8 * 1024 * 1024
+      || typeof request.upload.name !== 'string' || request.upload.name.length > 255
+    )) throw new Error('无效的图片上传请求')
+    return localJson(this.base + path, request.method, this.token, request.body, undefined, request.upload)
   }
 
   async stop(): Promise<void> {

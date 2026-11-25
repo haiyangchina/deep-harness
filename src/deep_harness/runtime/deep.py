@@ -8,7 +8,7 @@ from deepagents import create_deep_agent
 from deepagents.backends import StateBackend
 from deepagents.middleware import FilesystemMiddleware
 from langchain.tools import ToolRuntime
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage
 from langchain_core.tools import StructuredTool
 from langgraph.types import interrupt
 from pydantic import ValidationError
@@ -36,6 +36,7 @@ from deep_harness.runtime.approval_checkpoint import (
 )
 from deep_harness.runtime.guard import HarnessGuardMiddleware
 from deep_harness.runtime.harnesses import HarnessReport, parse_report
+from deep_harness.runtime.images import user_message
 from deep_harness.runtime.inference import normalized_usage, usage_totals
 from deep_harness.runtime.models import LangChainModel, to_langchain
 from deep_harness.server_config import number
@@ -64,12 +65,14 @@ class HarnessRuntime:
         tool_lock=None,
         background_launcher=None,
         executor=None,
+        artifacts=None,
     ):
         if not isinstance(model, LangChainModel):
             raise DomainError("deep_model", "Deep engine requires a LangChain chat model")
         self.session = session
         self.claim = claim
         self.store = store
+        self.artifacts = artifacts
         self.executions = executions
         self.receipts = receipts
         self.limits = limits
@@ -138,6 +141,8 @@ class HarnessRuntime:
 
         async def invoke(runtime: ToolRuntime, **arguments):
             await pause_at_boundary(self.pause_probe, self.claim.admission.generation)
+            if original == "delegate_task" and arguments.get("share_images") is None:
+                arguments.pop("share_images", None)
             raw_id = (
                 runtime.tool_call_id or fingerprint({"name": original, "arguments": arguments})[:32]
             )
@@ -241,11 +246,15 @@ class HarnessRuntime:
             return payload["content"] if payload is not None else None
 
     async def _delegate(self, call, delegation):
+        image_ids = (
+            await self.store.admission_image_ids(self.claim.admission)
+            if call.arguments.get("share_images") else []
+        )
         if call.arguments.get("background"):
             if self.background_launcher is None:
                 raise DomainError("delegation_unavailable", "Background launcher is unavailable")
             handle = await self.background_launcher(
-                self.session, self.claim, call, delegation, self.gateway.mcp_bindings
+                self.session, self.claim, call, delegation, self.gateway.mcp_bindings, image_ids
             )
             return json.dumps(handle, ensure_ascii=False)
         if delegation["status"] == "completed":
@@ -282,6 +291,7 @@ class HarnessRuntime:
             model_lock=self.model_lock,
             executor=self.gateway.executor,
             tool_lock=self.tool_lock,
+            artifacts=self.artifacts,
         )
         child.config["configurable"]["thread_id"] = (
             f"{self.session.id}:delegate:{self.claim.admission.id}:{call.id}"
@@ -294,7 +304,12 @@ class HarnessRuntime:
         value = (
             resume_command(checkpoint)
             if checkpoint.next
-            else {"messages": [HumanMessage(id=f"{call.id}:task", content=call.arguments["task"])]}
+            else {"messages": [to_langchain({
+                "id": f"{call.id}:task",
+                "role": "user",
+                "content": call.arguments["task"],
+                "image_ids": image_ids,
+            })]}
         )
         result = await child.graph.ainvoke(
             value,
@@ -482,7 +497,7 @@ class HarnessRuntime:
                 value = {
                     "messages": [
                         *(to_langchain(message) for message in inherited),
-                        HumanMessage(id=admission_message_id, content=self.claim.admission.text),
+                        to_langchain(await user_message(self)),
                     ]
                 }
             result = await self.graph.ainvoke(value, config=self.config, durability="sync")

@@ -17,6 +17,7 @@ from deep_harness.runtime.approval_checkpoint import (
     resume_command,
 )
 from deep_harness.runtime.context import ContextProjector
+from deep_harness.runtime.images import user_message
 from deep_harness.runtime.inference import Inference, usage_totals
 from deep_harness.server_config import number
 
@@ -61,11 +62,13 @@ class StandardRuntime:
         model_lock=None,
         pause_probe=None,
         executor=None,
+        artifacts=None,
     ):
         self.session = session
         self.claim = claim
         self.model = model
         self.store = store
+        self.artifacts = artifacts
         self.executions = executions
         self.receipts = receipts
         self.limits = limits
@@ -237,11 +240,7 @@ class StandardRuntime:
             value = {
                 "messages": [
                     *inherited,
-                    {
-                        "id": f"{self.claim.admission.id}:user",
-                        "role": "user",
-                        "content": self.claim.admission.text,
-                    },
+                    await user_message(self),
                 ],
                 "admission_id": self.claim.admission.id,
                 "step": 0,

@@ -7,6 +7,7 @@ from sqlalchemy import insert, select
 from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import DomainError
 from deep_harness.infrastructure import schema as s
+from deep_harness.infrastructure.artifacts import run_artifacts
 
 
 class BranchLedger:
@@ -119,6 +120,11 @@ class BranchLedger:
             .all()
         )
         for message in messages:
+            if image_ids := message.get("image_ids"):
+                await conn.execute(
+                    insert(run_artifacts),
+                    [{"run_id": admission_id, "artifact_id": image_id} for image_id in image_ids],
+                )
             payload = {**message, "id": f"{target_id}:inherited:{message['id']}"}
             await conn.execute(
                 insert(s.messages).values(

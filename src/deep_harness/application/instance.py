@@ -198,7 +198,9 @@ class InstanceHost:
             engine="standard" if harness == "general" else "deep",
         )
 
-    async def submit(self, workspace_id, session_id, submission_id, text, artifact_ids):
+    async def submit(
+        self, workspace_id, session_id, submission_id, text, artifact_ids, image_ids=()
+    ):
         app = await self.application(workspace_id)
         async with self.submit_lock:
             prior = await app.store.find_submission(session_id, submission_id)
@@ -209,7 +211,9 @@ class InstanceHost:
                     total += await profile.store.queued_count()
                 if total >= self.settings.limits.queued_runs:
                     raise DomainError("queue_full", "The instance queue is full")
-            return await app.submit(session_id, submission_id, text, artifact_ids=artifact_ids)
+            return await app.submit(
+                session_id, submission_id, text, artifact_ids=artifact_ids, image_ids=image_ids
+            )
 
     async def start_workflow(self, workspace_id, workflow_id, body):
         app = await self.application(workspace_id)

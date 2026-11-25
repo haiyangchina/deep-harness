@@ -54,6 +54,9 @@ class DelegateTaskArgs(BaseModel):
     kind: Literal["research", "coding"]
     task: str = Field(min_length=1, max_length=number("delegation.task_max_length"))
     background: bool = False
+    share_images: bool | None = Field(
+        default=None, description="Pass the current user message's images to this specialist"
+    )
 
 
 class CheckDelegationArgs(BaseModel):

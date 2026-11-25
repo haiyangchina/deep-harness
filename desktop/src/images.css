@@ -1,0 +1,64 @@
+.image-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .65rem;
+  padding-block: .45rem;
+}
+.message-picture {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: .25rem;
+}
+.message-picture button.image-preview {
+  display: block;
+  padding: 0;
+  overflow: hidden;
+}
+.image-preview img {
+  display: block;
+  width: 92px;
+  height: 76px;
+  object-fit: contain;
+}
+.image-dialog {
+  max-width: 90vw;
+  max-height: 90vh;
+}
+.image-dialog img { display: block; max-width: 85vw; max-height: 78vh; object-fit: contain; }
+.image-dialog::backdrop { background: #0009; }
+.image-picker {
+  position: relative;
+  display: inline-block;
+  cursor: pointer;
+  padding: .45rem .7rem;
+}
+.image-picker:focus-within { outline: auto; }
+.image-picker:has(input:disabled) { opacity: .5; cursor: default; }
+.image-picker input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+
+.image-picker-icon {
+  display: inline-grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border-radius: 8px;
+  color: #c9d1dc;
+}
+.image-picker-icon:not(:has(input:disabled)):hover { background: #ffffff12; }
+.image-picker-plus {
+  position: relative;
+  display: block;
+  width: 16px;
+  height: 16px;
+}
+.image-picker-plus::before,
+.image-picker-plus::after {
+  position: absolute;
+  inset: 7px 1px;
+  border-radius: 1px;
+  background: currentColor;
+  content: '';
+}
+.image-picker-plus::after { transform: rotate(90deg); }

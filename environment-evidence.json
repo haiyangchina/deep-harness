@@ -65,6 +65,7 @@
     "orjson": "3.13.0",
     "ormsgpack": "1.13.0",
     "packaging": "26.3",
+    "pillow": "12.3.0",
     "pip": "26.2.2",
     "pluggy": "1.7.0",
     "primp": "2.0.1",

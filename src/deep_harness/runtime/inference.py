@@ -6,6 +6,7 @@ from sqlalchemy import func, select
 
 from deep_harness.domain.models import DomainError
 from deep_harness.infrastructure import schema as s
+from deep_harness.runtime.images import image_content, included_ids
 from deep_harness.runtime.models import with_timeout
 from deep_harness.server_config import number
 
@@ -78,14 +79,31 @@ class Inference:
             >= runtime.limits.max_run_tokens
         ):
             raise DomainError("budget_exhausted", "Per-run token budget exhausted")
+        image_turns = [
+            (i, row["content"], row["image_ids"])
+            for i, row in enumerate(messages)
+            if row["role"] == "user" and row.get("image_ids")
+        ]
+        images = await image_content(runtime.artifacts, runtime.session.id, image_turns)
+        event = {"id": key}
+        if runtime.artifacts is not None:
+            event["image_ids"] = included_ids(image_turns, images)
         async with runtime.store.transaction() as conn:
             await runtime.executions.assert_claim(conn, runtime.claim)
-            await runtime.store.append_event(conn, runtime.session.id, "model.started", {"id": key})
+            await runtime.store.append_event(conn, runtime.session.id, "model.started", event)
+        model_messages = [
+            {**row, "content": images[i]} if i in images else row
+            for i, row in enumerate(messages)
+        ]
         if hasattr(runtime.model, "stream"):
-            response = await with_timeout(self.stream(key, messages), runtime.model.request_timeout)
+            response = await with_timeout(
+                self.stream(key, model_messages), runtime.model.request_timeout
+            )
         else:
             response = await with_timeout(
-                runtime.model.complete(runtime.session.prompt, messages, runtime.session.tools),
+                runtime.model.complete(
+                    runtime.session.prompt, model_messages, runtime.session.tools
+                ),
                 runtime.model.request_timeout,
             )
         return {**response, "usage": normalized_usage(response, runtime.session.prompt, messages)}

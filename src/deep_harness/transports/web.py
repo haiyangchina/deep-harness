@@ -6,13 +6,14 @@ from pathlib import Path
 from typing import Annotated
 from urllib.parse import unquote
 
-from fastapi import APIRouter, FastAPI, Header, Query, Request
+from fastapi import APIRouter, FastAPI, Header, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from deep_harness.domain.images import MAX_IMAGES
 from deep_harness.domain.models import DomainError, Harness
 from deep_harness.runtime.inference import usage_totals
 from deep_harness.transports.api import JobCommand, RequestModel
@@ -45,7 +46,8 @@ class WebSession(RequestModel):
 
 class WebInput(RequestModel):
     submission_id: str = Field(min_length=1, max_length=128)
-    text: str = Field(min_length=1, max_length=64000)
+    text: str = Field(default="", max_length=64000)
+    image_ids: tuple[str, ...] = Field(default=(), max_length=MAX_IMAGES)
     artifact_ids: tuple[str, ...] = Field(default=(), max_length=8)
 
 
@@ -136,7 +138,7 @@ def create_web_api(instance, assets=STATIC):
                         mime == "application/octet-stream"
                         and request.headers.get("x-harness-upload") == "1"
                     )
-                    if request.url.path.endswith("/attachments")
+                    if request.url.path.endswith(("/attachments", "/images"))
                     else mime == "application/json"
                 )
                 if not allowed:
@@ -151,7 +153,8 @@ def create_web_api(instance, assets=STATIC):
             response.headers["Cache-Control"] = "no-store"
         else:
             response.headers["Content-Security-Policy"] = (
-                "default-src 'self'; frame-ancestors 'none'; object-src 'none'; base-uri 'none'"
+                "default-src 'self'; img-src 'self' blob:; frame-ancestors 'none'; "
+                "object-src 'none'; base-uri 'none'"
             )
         return response
 
@@ -200,6 +203,7 @@ def create_web_api(instance, assets=STATIC):
         # Keep frozen prompts and connector connection configuration out of runtime diagnostics.
         snapshot = binding["snapshot"] if binding else {}
         status["model_id"] = snapshot.get("model_id")
+        status["vision"] = service.sessions.supports_vision(status["model_id"])
         status["model_revision"] = snapshot.get("model_revision")
         return jsonable_encoder(status)
 
@@ -218,9 +222,23 @@ def create_web_api(instance, assets=STATIC):
         if len(set(body.artifact_ids)) != len(body.artifact_ids):
             raise DomainError("artifact_selection", "Attachment IDs must be unique")
         result = await instance.submit(
-            workspace_id, session_id, body.submission_id, body.text, body.artifact_ids
+            workspace_id,
+            session_id,
+            body.submission_id,
+            body.text,
+            body.artifact_ids,
+            body.image_ids,
         )
         return run_payload(result)
+
+    @router.get(WORKSPACE + "/sessions/{session_id}/submission")
+    async def submission(
+        workspace_id: str, session_id: str, submission_id: str = Query(max_length=128)
+    ):
+        service = await instance.application(workspace_id)
+        await service.store.get_session(session_id, "operator")
+        row = await service.store.find_submission(session_id, submission_id)
+        return run_payload(row) if row else None
 
     @router.get(WORKSPACE + "/runs/{run_id}")
     async def run(workspace_id: str, run_id: str):
@@ -301,6 +319,28 @@ def create_web_api(instance, assets=STATIC):
         if tool not in instance.connectors.definitions:
             raise DomainError("connector_reconcile", "This effect requires manual reconciliation")
         return await instance.connectors.reconcile(tool, effect_id)
+
+    @router.post(WORKSPACE + "/sessions/{session_id}/images", status_code=201)
+    async def upload_image(
+        request: Request,
+        workspace_id: str,
+        session_id: str,
+        x_filename: Annotated[str, Header(max_length=1000)] = "image",
+    ):
+        service = await instance.application(workspace_id)
+        return await service.publish_attachment(
+            session_id, request.stream(), unquote(x_filename), image=True
+        )
+
+    @router.get(WORKSPACE + "/sessions/{session_id}/images/{image_id}")
+    async def read_image(
+        workspace_id: str, session_id: str, image_id: str, thumbnail: bool = False
+    ):
+        service = await instance.application(workspace_id)
+        row, path = await service.get_image(session_id, image_id)
+        if thumbnail:
+            return Response(await service.artifacts.thumbnail(row, path), media_type="image/png")
+        return FileResponse(path, media_type=row["kind"])
 
     @router.post(WORKSPACE + "/sessions/{session_id}/attachments", status_code=201)
     async def upload(
