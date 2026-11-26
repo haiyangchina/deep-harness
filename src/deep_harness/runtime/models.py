@@ -12,7 +12,7 @@ from langsmith import tracing_context
 from deep_harness.application.tools import tool_definitions
 from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import DomainError
-from deep_harness.server_config import number
+from deep_harness.server_config import number, setting
 
 
 @contextmanager
@@ -260,6 +260,7 @@ def ollama_model(
     request_timeout: float = number("model.request_timeout_seconds"),
     context_window_tokens: int = number("model.context_window_tokens"),
     reasoning: bool = False,
+    keep_alive: int | str | None = setting("model.keep_alive"),
 ):
     from langchain_ollama import ChatOllama
 
@@ -283,6 +284,7 @@ def ollama_model(
             num_ctx=context_window_tokens,
             client_kwargs=client_kwargs,
             reasoning=reasoning,
+            keep_alive=keep_alive,
         ),
         request_timeout,
         identity={

@@ -372,3 +372,74 @@ class ExecutionLedger:
                 .distinct()
             )
             return list(queued.scalars())
+
+    async def recover_stale_active(
+        self, live_ids: set[str], session_id: str | None = None
+    ) -> list[dict]:
+        """Settle `started` admissions that no longer have a live execution task.
+
+        Startup ``recover()`` only runs once, so a crash between claim and settle
+        that happens later leaves the admission in ``started`` forever. Since
+        ``started`` is blocking, every later input in that session is starved.
+        An admission that is started but absent from the owner's live task set
+        is provably no longer executing. Settlement follows the same
+        no-replay principle as startup recovery:
+
+        * no dispatched effect and no model receipt means no observable work
+          was committed, so the input is safely re-queued;
+        * an outstanding dispatched effect, or a completed report checkpoint,
+          is handled as in ``recover()`` (report-only re-queues, otherwise
+          ``unknown``) and still requires explicit reconciliation.
+        """
+        recovered: list[dict] = []
+        async with self.store.transaction() as conn:
+            query = select(s.admissions).where(s.admissions.c.status == "started")
+            if session_id is not None:
+                query = query.where(s.admissions.c.session_id == session_id)
+            rows = (await conn.execute(query)).mappings().all()
+            for row in rows:
+                admission = admission_from(row)
+                if admission.id in live_ids:
+                    continue
+                pending_effect = await conn.scalar(
+                    select(s.effects.c.id)
+                    .where(
+                        s.effects.c.admission_id == admission.id,
+                        s.effects.c.status == "dispatched",
+                    )
+                    .limit(1)
+                )
+                model_receipt = await conn.scalar(
+                    select(s.model_receipts.c.id)
+                    .where(s.model_receipts.c.admission_id == admission.id)
+                    .limit(1)
+                )
+                report_only = pending_effect is None and await self._has_report_checkpoint(
+                    conn, admission
+                )
+                untouched = pending_effect is None and model_receipt is None
+                status = "queued" if (untouched or report_only) else "unknown"
+                reason = "untouched" if untouched else ("report" if report_only else "effect")
+                await conn.execute(
+                    update(s.admissions)
+                    .where(s.admissions.c.id == admission.id)
+                    .values(status=status, owner=None)
+                )
+                await self.store.append_event(
+                    conn,
+                    admission.session_id,
+                    f"execution.{status}",
+                    {
+                        "admission_id": admission.id,
+                        "recovered": "orphaned_started",
+                        "reason": reason,
+                    },
+                )
+                recovered.append(
+                    {
+                        "admission_id": admission.id,
+                        "session_id": admission.session_id,
+                        "status": status,
+                    }
+                )
+        return recovered

@@ -24,10 +24,10 @@ class FilePatch(BaseModel):
 class PatchArgs(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    files: list[FilePatch] = Field(min_length=2, max_length=number("patch.max_files"))
+    files: list[FilePatch] = Field(min_length=1, max_length=number("patch.max_files"))
 
 
-def apply_hunks(source, diff, path, *, creating):
+def apply_hunks(source, diff, path, *, creating, deleting=False):
     lines = source.split("\n")
     source_lines = [line + "\n" for line in lines[:-1]]
     if lines[-1]:
@@ -42,7 +42,9 @@ def apply_hunks(source, diff, path, *, creating):
             len(rows) < 3
             or rows[0][4:].partition("\t")[0] not in previous
             or not rows[1].startswith("+++ ")
-            or rows[1][4:].partition("\t")[0] not in {name, f"b/{name}"}
+            or rows[1][4:].partition("\t")[0] not in (
+                {"/dev/null"} if deleting else {name, f"b/{name}"}
+            )
         ):
             raise DomainError("patch_format", f"Unified file headers do not match {path}")
         rows = rows[2:]
@@ -104,7 +106,17 @@ def prepare_file(target, patch):
     has_crlf = source != normalized
     if "\r" in normalized or (has_crlf and "\n" in source.replace("\r\n", "")):
         raise DomainError("patch_context", "Patch requires a consistent LF or CRLF file")
-    result = apply_hunks(normalized, patch.diff, patch.path, creating=original is None)
+    header = patch.diff.splitlines()[:2]
+    deleting = len(header) == 2 and header[0].startswith("--- ") and (
+        header[1].partition("\t")[0] == "+++ /dev/null"
+    )
+    result = apply_hunks(
+        normalized, patch.diff, patch.path, creating=original is None, deleting=deleting
+    )
+    if deleting:
+        if original is None or result:
+            raise DomainError("patch_context", "A deletion must remove the entire existing file")
+        return None
     data = (result.replace("\n", "\r\n") if has_crlf else result).encode("utf-8")
     if len(data) > MAX_FILE_BYTES:
         raise DomainError("file_too_large", f"Patch result exceeds file limit for {patch.path}")

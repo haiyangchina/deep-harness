@@ -143,7 +143,7 @@ class ReceiptLedger:
                     },
                 )
 
-    async def save_effect(self, claim: ExecutionClaim, key: str, result: str):
+    async def save_effect(self, claim: ExecutionClaim, key: str, result: str, *, verification=None):
         async with self.store.transaction() as conn:
             await self.executions.assert_claim(conn, claim)
             await conn.execute(
@@ -153,6 +153,35 @@ class ReceiptLedger:
                     s.effects.c.status == "dispatched",
                 )
                 .values(status="succeeded", result=result)
+            )
+            if verification is not None:
+                await self.store.append_event(
+                    conn,
+                    claim.admission.session_id,
+                    "coding.verification",
+                    {"id": key, **verification},
+                )
+
+    async def latest_verification(self, claim: ExecutionClaim, command=None):
+        filters = []
+        if command is not None:
+            filters = [
+                s.events.c.payload["command"].as_string() == command,
+                s.events.c.payload["cwd"].as_string() == ".",
+            ]
+        async with self.store.engine.connect() as conn:
+            return await conn.scalar(
+                select(s.events.c.payload)
+                .where(
+                    s.events.c.session_id == claim.admission.session_id,
+                    s.events.c.type == "coding.verification",
+                    *filters,
+                    s.events.c.payload["id"].as_string().startswith(
+                        claim.admission.id + ":", autoescape=True
+                    ),
+                )
+                .order_by(s.events.c.seq.desc())
+                .limit(1)
             )
 
     async def interaction(

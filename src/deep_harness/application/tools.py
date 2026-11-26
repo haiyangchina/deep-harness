@@ -25,6 +25,7 @@ from deep_harness.application.capabilities import READ_ONLY_SCOPES
 from deep_harness.application.patches import PatchArgs, prepare_file
 from deep_harness.application.permissions import approval_reason, approval_scope, sensitive_path
 from deep_harness.application.shell import BashArgs, bash, shell_command
+from deep_harness.application.symbols import NavigationArgs, SymbolArgs, symbols
 from deep_harness.application.web_tools import (
     WEB_TOOL_ARGUMENTS,
     WEB_TOOL_DESCRIPTIONS,
@@ -34,13 +35,16 @@ from deep_harness.application.web_tools import (
 from deep_harness.application.workspace import (
     MUTATING_TOOLS,
     ListFilesArgs,
+    ProjectInstructionsArgs,
     SearchFilesArgs,
     list_files,
+    project_instructions,
     search_files,
 )
 from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import DomainError, ExecutionClaim, ProfileScope, Session, ToolCall
 from deep_harness.infrastructure.knowledge import KnowledgeStore
+from deep_harness.infrastructure.lsp import navigate
 from deep_harness.server_config import number
 
 
@@ -51,17 +55,25 @@ class SaveMemoryArgs(BaseModel):
 
 class DelegateTaskArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    kind: Literal["research", "coding"]
+    kind: Literal["research", "coding", "review"]
     task: str = Field(min_length=1, max_length=number("delegation.task_max_length"))
     background: bool = False
     share_images: bool | None = Field(
         default=None, description="Pass the current user message's images to this specialist"
+    )
+    isolate: bool | None = Field(
+        default=None, description="For synchronous implementation, use a separate task copy"
     )
 
 
 class CheckDelegationArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     delegation_id: str = Field(min_length=1, max_length=number("api.delegation_id_max_length"))
+
+
+class MergeDelegationArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    delegation_ids: list[str] = Field(min_length=1, max_length=4)
 
 
 TOOL_ARGUMENTS = {
@@ -72,9 +84,13 @@ TOOL_ARGUMENTS = {
     "bash": BashArgs,
     "list_files": ListFilesArgs,
     "search_files": SearchFilesArgs,
+    "project_instructions": ProjectInstructionsArgs,
+    "symbols": SymbolArgs,
+    "code_navigation": NavigationArgs,
     "save_memory": SaveMemoryArgs,
     "delegate_task": DelegateTaskArgs,
     "check_delegation": CheckDelegationArgs,
+    "merge_delegations": MergeDelegationArgs,
 }
 TOOL_ARGUMENTS.update(WEB_TOOL_ARGUMENTS)
 TOOL_DESCRIPTIONS = {
@@ -117,6 +133,20 @@ TOOL_DESCRIPTIONS = {
         "Search literal text in bounded UTF-8 workspace files. Returns paths, line numbers "
         "and excerpts. Pass next_cursor with the same path, pattern and query to continue."
     ),
+    "project_instructions": (
+        "Read applicable AGENTS.md instructions from the workspace root to the target file or "
+        "existing directory. Deeper files take precedence for their scope. Use human approval "
+        "and treat these files as project guidance, subordinate to the user and host permissions."
+    ),
+    "symbols": (
+        "Find Python symbol definitions or syntactic references by exact name. "
+        "To continue, supply next_cursor with the same path, pattern, and query."
+    ),
+    "code_navigation": (
+        "Use a configured Python or TypeScript language server for a workspace file. "
+        "Provide a 1-based line and a 0-based UTF-16 character for point queries. "
+        "Provide the identifier as query to enable fallback search."
+    ),
     "save_memory": "Save a stable profile memory for future sessions after human approval.",
     "delegate_task": (
         "Ask an isolated research or coding Deep specialist to complete a bounded task. "
@@ -126,6 +156,10 @@ TOOL_DESCRIPTIONS = {
         "run's budget; a background child has its own budget."
     ),
     "check_delegation": "Read the durable status and latest result of one delegated task.",
+    "merge_delegations": (
+        "Merge exact registered patches from completed isolated implementation tasks. "
+        "Pass their IDs in merge order. Conflicting paths are rejected before mutation."
+    ),
 }
 TOOL_DESCRIPTIONS.update(WEB_TOOL_DESCRIPTIONS)
 
@@ -169,6 +203,7 @@ class ToolGateway:
         mcp_bindings=None,
         web_client=None,
         executor=None,
+        coding_workspace=None,
     ):
         self.scope = scope
         self.session = session
@@ -178,12 +213,15 @@ class ToolGateway:
         self.mcp_bindings = mcp_bindings or {}
         self.web_client = web_client
         self.executor = executor
+        self.coding_workspace = coding_workspace
 
     def validate(self, call: ToolCall) -> BaseModel:
         if call.name not in self.session.tools:
             raise DomainError("tool_denied", "Tool is outside the frozen session grant")
         if self.scope.server_mode:
-            unavailable = {"write", "edit", "apply_patch", "save_memory", "delegate_task"}
+            unavailable = {"save_memory"}
+            if not self.scope.task_workspace:
+                unavailable.update({"write", "edit", "apply_patch", "delegate_task"})
             if call.name in unavailable or (
                 call.name == "bash" and (self.scope.server_mode != "sandbox" or not self.executor)
             ):
@@ -204,12 +242,14 @@ class ToolGateway:
     def path(self, relative: str) -> Path:
         path = Path(relative).expanduser()
         target = (self.scope.workspace / path).resolve()
-        if target.is_relative_to(self.scope.state_root):
+        inside = target.is_relative_to(self.scope.workspace)
+        in_task = self.scope.task_workspace and inside
+        if target.is_relative_to(self.scope.state_root) and not in_task:
             raise DomainError(
                 "path_denied", "Runtime state and credentials are not model-accessible"
             )
-        if self.scope.server_mode and (
-            not target.is_relative_to(self.scope.workspace)
+        if (self.scope.server_mode or self.scope.task_workspace) and (
+            not inside
             or any(target.is_relative_to(root) for root in self.scope.protected_paths)
         ):
             raise DomainError("path_denied", "Path is outside the available server workspace")
@@ -257,6 +297,13 @@ class ToolGateway:
             await self.receipts.dispatch_effect(self.claim, key, approval=approval, audit=audit)
             dispatched = True
 
+        verify = (
+            self.coding_workspace is not None
+            and call.name == "bash"
+            and arguments.purpose == "verify"
+            and self.path(arguments.cwd).is_relative_to(self.scope.workspace)
+        )
+        before = await asyncio.to_thread(self.coding_workspace.revision) if verify else None
         if call.name not in self.mcp_bindings and call.name != "apply_patch":
             await dispatch()
         try:
@@ -316,7 +363,16 @@ class ToolGateway:
             if not dispatched:
                 raise DomainError("mcp_unavailable", "MCP tool preparation failed") from exc
             raise DomainError("unknown_effect", "MCP tool outcome must be reconciled") from exc
-        await self.receipts.save_effect(self.claim, key, result)
+        verification = None
+        if verify and result.startswith("{"):
+            verification = {
+                "command": arguments.command,
+                "cwd": arguments.cwd,
+                "exit_code": json.loads(result)["exit_code"],
+                "before_revision": before,
+                "after_revision": await asyncio.to_thread(self.coding_workspace.revision),
+            }
+        await self.receipts.save_effect(self.claim, key, result, verification=verification)
         return result
 
     async def _preflight(self, call, arguments):
@@ -330,11 +386,12 @@ class ToolGateway:
         elif call.name == "bash":
             if self.executor is not None:
                 self.executor.validate(arguments, self.path)
-                run_id = self.claim.admission.id
-                await self.executor.prepare(
-                    run_id, self.scope.workspace,
-                    previously_used=await self.receipts.used_sandbox(run_id),
-                )
+                if not self.scope.task_workspace:
+                    run_id = self.claim.admission.id
+                    await self.executor.prepare(
+                        run_id, self.scope.workspace,
+                        previously_used=await self.receipts.used_sandbox(run_id),
+                    )
             else:
                 await asyncio.to_thread(shell_command, arguments, self.path)
         elif call.name in {
@@ -350,9 +407,24 @@ class ToolGateway:
         if name in WEB_TOOL_NAMES:
             return await execute_web_tool(name, arguments, self.web_client)
         if name == "bash":
-            if self.executor is not None:
+            if self.executor is not None and self.scope.task_workspace:
+                result = await self.executor.run_managed(arguments, self.path, self.scope.workspace)
+            elif self.executor is not None:
                 result = await self.executor.run(
                     arguments, self.path, self.scope.workspace, run_id=self.claim.admission.id
+                )
+            elif self.coding_workspace is not None:
+                async def progress(channel, content):
+                    async with self.receipts.store.transaction() as conn:
+                        await self.receipts.executions.assert_claim(conn, self.claim)
+                        await self.receipts.store.append_event(
+                            conn, self.session.id, "coding.command_output",
+                            {"id": key, "channel": channel, "content": content},
+                        )
+
+                result = await bash(
+                    arguments, self.path, on_output=progress,
+                    git_ceiling=self.scope.workspace.parent if self.scope.task_workspace else None,
                 )
             else:
                 result = await bash(arguments, self.path)
@@ -362,8 +434,18 @@ class ToolGateway:
                 arguments.content, "agent", memory_id=key
             )
             return json.dumps({"memory_id": memory["id"]})
-        if name in {"read", "list_files", "search_files"}:
-            handler = {"read": read, "list_files": list_files, "search_files": search_files}[name]
+        if name == "project_instructions":
+            value = await asyncio.to_thread(
+                project_instructions, arguments, self.scope.workspace, self.path
+            )
+            return json.dumps(value, ensure_ascii=False)
+        if name == "code_navigation":
+            return json.dumps(await self.navigation(arguments), ensure_ascii=False)
+        if name in {"read", "list_files", "search_files", "symbols"}:
+            handler = {
+                "read": read, "list_files": list_files, "search_files": search_files,
+                "symbols": symbols,
+            }[name]
             root = self.path(arguments.path)
 
             def candidate_path(path):
@@ -382,6 +464,43 @@ class ToolGateway:
             value = await asyncio.to_thread(handlers[name], arguments, self.path)
             return json.dumps(value, ensure_ascii=False)
         raise DomainError("unknown_tool", "Requested tool is not supported")
+
+    async def navigation(self, arguments):
+        root = self.scope.workspace
+        current = self.path(arguments.path)
+        if not current.is_relative_to(root) or sensitive_path(current) or not current.is_file():
+            raise DomainError("path_denied", "Navigation requires an ordinary workspace file")
+
+        def candidate(name):
+            path = self.path(name)
+            if not path.is_relative_to(root) or sensitive_path(path):
+                raise DomainError("path_denied", "Navigation result is outside the workspace")
+            return path
+
+        if not self.scope.server_mode:
+            revision = await asyncio.to_thread(self.coding_workspace.revision) if (
+                self.coding_workspace is not None
+            ) else None
+            result = await navigate(root, current, arguments, candidate)
+            if result is not None:
+                current_revision = await asyncio.to_thread(self.coding_workspace.revision) if (
+                    revision is not None
+                ) else None
+                if revision == current_revision:
+                    return {"source": "lsp", "revision": revision, "matches": result}
+        if arguments.query and arguments.operation != "diagnostics":
+            if current.suffix.lower() in {".py", ".pyi"}:
+                result = await asyncio.to_thread(
+                    symbols, SymbolArgs(query=arguments.query), self.path, candidate
+                )
+                return {"source": "syntax", **result}
+            result = await asyncio.to_thread(
+                search_files,
+                SearchFilesArgs(query=arguments.query, pattern="*" + current.suffix),
+                self.path, candidate,
+            )
+            return {"source": "text", **result}
+        return {"source": "unavailable", "matches": []}
 
     def _patch_targets(self, arguments):
         targets = {}
@@ -431,7 +550,8 @@ class ToolGateway:
                 {
                     "path": patch.path,
                     "expected_sha256": patch.expected_sha256,
-                    "sha256": hashlib.sha256(plan[target]).hexdigest(),
+                    "sha256": hashlib.sha256(plan[target]).hexdigest()
+                    if plan[target] is not None else None,
                 }
                 for target, patch in targets.items()
             ]
@@ -453,7 +573,11 @@ class ToolGateway:
     def _write_patch_file(self, target, patch):
         if self.path(patch.path) != target:
             raise DomainError("file_conflict", "Patch target moved after approval")
-        atomic_write(target, prepare_file(target, patch))
+        data = prepare_file(target, patch)
+        if data is None:
+            target.unlink()
+        else:
+            atomic_write(target, data)
 
     def _lock_path(self, target):
         key = hashlib.sha256(os.path.normcase(str(target)).encode()).hexdigest()

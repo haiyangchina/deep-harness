@@ -97,7 +97,32 @@ export function TaskInspector() {
           </div>
         </section>
       ))}
-      {status?.session.permission_mode === 'auto' && status.latest_admission && (
+      {(() => {
+        const blocked = (status?.active_admissions ?? []).filter(a =>
+          ['unknown', 'interrupted', 'reconciled'].includes(a.status)
+        )
+        if (!blocked.length) return null
+        return (
+          <section className="approval blocked-notice">
+            <span className="eyebrow">INPUT NEEDS ATTENTION</span>
+            <h3>有输入未正常完成</h3>
+            <p className="muted small">
+              下面的输入没有可靠结果，已暂停后续执行。撤销审批复用不能解除此状态。
+            </p>
+            {blocked.map(a => (
+              <p className="muted small" key={a.id}>
+                · {a.status}
+                {a.result ? `：${a.result.slice(0, 120)}` : ''}
+              </p>
+            ))}
+          </section>
+        )
+      })()}
+      {status?.session.permission_mode === 'auto' &&
+        status.latest_admission &&
+        !(status.active_admissions ?? []).some(a =>
+          ['unknown', 'interrupted', 'reconciled'].includes(a.status)
+        ) && (
         <button
           className="revoke-reuse"
           disabled={busy}

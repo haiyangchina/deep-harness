@@ -118,6 +118,10 @@ EXTENSION_TOOLS: tuple[str, ...] = (
     "check_delegation",
     "apply_patch",
 )
+CODING_SESSION_TOOLS = (
+    "apply_patch", "delegate_task", "check_delegation", "project_instructions", "symbols",
+    "merge_delegations", "code_navigation",
+)
 CAPABILITY_VERSION = 2
 
 # Harness names and tier attributes come from harness_spec, the single source of
@@ -127,7 +131,7 @@ READ_ONLY_HARNESSES: frozenset[str] = frozenset(
 )
 
 MUTATING_EXTENSIONS = frozenset(
-    {"save_memory", "write", "edit", "bash", "apply_patch"}
+    {"save_memory", "write", "edit", "bash", "apply_patch", "merge_delegations"}
 )
 
 
@@ -272,6 +276,8 @@ def derive_grants(harness, extensions=(), mcp_tools=()):
     spec = spec_for(harness)
     read_only = spec.read_only
     granted = set(READ_ONLY_CORE if read_only else CORE_TOOLS)
+    if harness == "coding":
+        granted.update(CODING_SESSION_TOOLS)
     requested = list(extensions) + list(mcp_tools)
     for name in requested:
         if name.startswith("mcp__"):
@@ -309,6 +315,7 @@ def manifest():
         "harnesses": list(HARNESSES),
         "read_only_harnesses": sorted(READ_ONLY_HARNESSES),
         "extensions": list(EXTENSION_TOOLS),
+        "coding_session_tools": list(CODING_SESSION_TOOLS),
         "access_scopes": permission_policy()["access_scopes"],
         "permission_modes": permission_policy()["modes"],
         "permission_policy": permission_policy(),

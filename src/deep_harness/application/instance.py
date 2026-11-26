@@ -8,15 +8,22 @@ from filelock import FileLock, Timeout
 from jsonschema import Draft202012Validator
 
 from deep_harness.application.config import ExecutionSettings
+from deep_harness.application.instance_config import WorkspaceSettings
 from deep_harness.application.jobs import ConfiguredStep, CreateJob, StagePlan
-from deep_harness.application.workspace import READ_TOOLS
+from deep_harness.application.workspace import CODING_RESEARCH_TOOLS, READ_TOOLS
 from deep_harness.bootstrap import ProjectHost
 from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import DomainError
 from deep_harness.infrastructure.connectors import HttpTools
+from deep_harness.infrastructure.web.projects import LocalProjects
 from deep_harness.infrastructure.web.settings import WebSettings
 from deep_harness.runtime.model_factory import CatalogEntry, ModelCatalog
 from deep_harness.runtime.sandbox import DockerExecutor
+
+SANDBOX_CODING = CODING_RESEARCH_TOOLS | {
+    "write", "edit", "apply_patch", "bash", "delegate_task", "check_delegation",
+    "merge_delegations",
+}
 
 
 class InstanceHost:
@@ -63,6 +70,9 @@ class InstanceHost:
         if config_path:
             hidden.append(config_path.resolve())
         self.protected_paths = tuple(hidden)
+        self.projects = LocalProjects(self.state_dir, self.protected_paths)
+        self.registered = {}
+        self.workspaces = dict(settings.workspaces)
         self.hosts = {}
         for name, workspace in settings.workspaces.items():
             root = workspace.path.resolve(strict=True)
@@ -77,22 +87,68 @@ class InstanceHost:
                 raise ValueError("A sandbox workspace cannot contain the state or configuration")
             if root.is_relative_to(self.state_dir):
                 raise ValueError("The work directory cannot be part of the instance state")
-            self.hosts[name] = ProjectHost(
-                self.state_dir,
-                root,
-                execution_limits=ExecutionSettings(),
-                web_settings=WebSettings(),
-                models=self.models,
-                run_slots=self.run_slots,
-                server_mode=workspace.mode,
-                protected_paths=self.protected_paths,
-                connectors=self.connectors,
-                executor=self.executor if workspace.mode == "sandbox" else None,
-                upload_limit=settings.limits.max_upload_bytes,
-                mcp_objects={name: (python_tools or {}).get(name, {})},
-            )
+            self.hosts[name] = self.make_host(name, workspace, (python_tools or {}).get(name, {}))
         for name, workflow in settings.workflows.items():
             self.workflow_schemas(name, workflow)
+
+    def make_host(self, name, workspace, tools=None):
+        return ProjectHost(
+            self.state_dir,
+            workspace.path,
+            execution_limits=ExecutionSettings(),
+            web_settings=WebSettings(),
+            models=self.models,
+            run_slots=self.run_slots,
+            server_mode=workspace.mode,
+            protected_paths=self.protected_paths,
+            connectors=self.connectors,
+            executor=self.executor if workspace.mode == "sandbox" else None,
+            upload_limit=self.settings.limits.max_upload_bytes,
+            mcp_objects={name: tools or {}},
+        )
+
+    @property
+    def can_add_sandbox(self):
+        return bool(self.executor and any(
+            row.mode == "sandbox" for row in self.settings.workspaces.values()
+        ))
+
+    def project_row(self, name, workspace):
+        return {
+            "id": name,
+            "label": self.registered[name]["label"] if name in self.registered else name,
+            "mode": workspace.mode,
+            "mcp_tools": list(workspace.mcp_tools),
+        }
+
+    async def add_project(self, path, label, mode):
+        async with self.submit_lock:
+            root = await asyncio.to_thread(self.projects.directory, path)
+            if mode == "sandbox" and (
+                not self.can_add_sandbox
+                or any(item.is_relative_to(root) for item in self.projects.protected_paths)
+            ):
+                raise DomainError("project_directory", "此目录无法使用 Docker 沙箱。")
+            for name, workspace in self.workspaces.items():
+                if workspace.path.resolve() == root:
+                    return self.project_row(name, workspace)
+            if len(self.registered) >= 128:
+                raise DomainError("project_limit", "已达到本机项目数量上限。")
+            name = "project-" + fingerprint(str(root))[:32]
+            if name in self.workspaces:
+                raise DomainError("project_conflict", "项目标识已被使用。")
+            workspace = WorkspaceSettings(path=root, mode=mode)
+            host = self.make_host(name, workspace)
+            registered = {
+                **self.registered,
+                name: {"path": str(root), "label": label or root.name or str(root), "mode": mode},
+            }
+            await asyncio.to_thread(self.projects.save, registered)
+            self.resources.push_async_callback(host.close)
+            self.registered = registered
+            self.workspaces[name] = workspace
+            self.hosts[name] = host
+            return self.project_row(name, workspace)
 
     def workflow_schemas(self, name, workflow):
         schemas = {}
@@ -126,6 +182,8 @@ class InstanceHost:
             raise DomainError("owner_exists", "Another server owns this state directory") from exc
         self.resources.callback(lock.release)
         try:
+            if self.settings.web.local_projects:
+                self.registered = await asyncio.to_thread(self.projects.load)
             if self.executor and any(
                 w.mode == "sandbox" for w in self.settings.workspaces.values()
             ):
@@ -135,6 +193,26 @@ class InstanceHost:
             for name, host in self.hosts.items():
                 self.resources.push_async_callback(host.close)
                 await host.application(name)
+            for name, item in self.registered.items():
+                if name in self.hosts:
+                    continue
+                try:
+                    path = await asyncio.to_thread(self.projects.directory, item["path"])
+                    mode = item["mode"]
+                    if mode == "sandbox" and (
+                        not self.can_add_sandbox or any(
+                            value.is_relative_to(path) for value in self.projects.protected_paths
+                        )
+                    ):
+                        continue
+                    workspace = WorkspaceSettings(path=path, mode=mode)
+                    host = self.make_host(name, workspace)
+                except (DomainError, OSError):
+                    continue
+                self.resources.push_async_callback(host.close)
+                await host.application(name)
+                self.workspaces[name] = workspace
+                self.hosts[name] = host
         except BaseException:
             await self.resources.aclose()
             raise
@@ -148,11 +226,13 @@ class InstanceHost:
             raise DomainError("workspace_not_found", "Workspace is not configured")
         return await host.application(workspace_id)
 
-    def tool_names(self, workspace_id, tools):
-        workspace = self.settings.workspaces[workspace_id]
+    def tool_names(self, workspace_id, tools, *, managed_coding=False):
+        workspace = self.workspaces[workspace_id]
         available = set(READ_TOOLS) | set(workspace.mcp_tools) | set(self.connectors.catalog)
         if workspace.mode == "sandbox":
             available.add("bash")
+            if managed_coding:
+                available.update(SANDBOX_CODING)
         resolved = tuple(self.connectors.public_names.get(tool, tool) for tool in tools)
         if set(resolved) - available:
             raise DomainError("tool_denied", "Agent requests tools outside this workspace")
@@ -164,15 +244,17 @@ class InstanceHost:
         if body.agent_id and agent is None:
             raise DomainError("agent_not_found", "Agent is not configured")
         if agent:
-            tools = self.tool_names(workspace_id, agent.tools)
             harness = agent.harness
             model_id = body.model_id or agent.model
             prompt = agent.instructions
         else:
-            tools = self.tool_names(workspace_id, body.tools)
             harness = body.harness
             model_id = body.model_id
             prompt = body.prompt
+        managed_coding = harness == "coding" and self.workspaces[workspace_id].mode == "sandbox"
+        defaults = SANDBOX_CODING if managed_coding else ()
+        requested = agent.tools if agent else (defaults if body.tools is None else body.tools)
+        tools = self.tool_names(workspace_id, requested, managed_coding=managed_coding)
         if harness in {"research", "research_web"} and any(
             name not in READ_TOOLS
             and (
@@ -196,6 +278,8 @@ class InstanceHost:
             harness=harness,
             model_id=model_id,
             engine="standard" if harness == "general" else "deep",
+            workspace_mode="copy" if managed_coding else None,
+            verification_command=body.verification_command,
         )
 
     async def submit(
@@ -271,8 +355,7 @@ class InstanceHost:
             "default_workspace": self.settings.default_workspace,
             "default_model": self.settings.default_model,
             "workspaces": [
-                {"id": name, "mode": row.mode, "mcp_tools": list(row.mcp_tools)}
-                for name, row in self.settings.workspaces.items()
+                self.project_row(name, row) for name, row in self.workspaces.items()
             ],
             "models": self.models.list(),
             "agents": [

@@ -21,7 +21,7 @@ from deep_harness.application.workspace import MUTATING_TOOLS
 
 SENSITIVE_PARTS = {".git", ".ssh", ".aws", ".azure", ".kube", ".gnupg"}
 SENSITIVE_NAMES = {"agents.md", "claude.md", ".env", ".npmrc", ".netrc", "credentials"}
-FILE_TOOLS = {"read", "write", "edit", "list_files", "search_files"}
+FILE_TOOLS = {"read", "write", "edit", "list_files", "search_files", "symbols", "code_navigation"}
 FILE_WRITES = {"write", "edit"}
 
 
@@ -36,6 +36,8 @@ def classify(call, scope, resolve_path):
     """Map a call to (scope_key, reason) without inspecting command text."""
     if call.name == "apply_patch":
         return SCOPE_FILE_WRITE, "审阅并批准多文件补丁"
+    if call.name == "project_instructions":
+        return SCOPE_SENSITIVE, "读取适用于目标路径的项目指令"
     if call.name in FILE_TOOLS:
         target = resolve_path(call.arguments.get("path", "."))
         if not target.is_relative_to(scope.workspace):

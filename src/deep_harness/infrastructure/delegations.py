@@ -412,3 +412,13 @@ class DelegationLedger:
                 .order_by(s.delegations.c.id)
             )
             return [dict(row) for row in rows.mappings()]
+
+    async def admission_summary(self, claim):
+        async with self.store.engine.connect() as conn:
+            rows = await conn.execute(
+                select(s.delegations.c.id, s.delegations.c.kind, s.delegations.c.mode,
+                       s.delegations.c.status)
+                .where(s.delegations.c.admission_id == claim.admission.id)
+                .order_by(s.delegations.c.id)
+            )
+            return [dict(row) for row in rows.mappings()]

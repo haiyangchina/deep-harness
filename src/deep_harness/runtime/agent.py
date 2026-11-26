@@ -44,6 +44,10 @@ def filesystem_middleware(backend) -> FilesystemMiddleware:
 
 
 SUBAGENT_GUIDES: dict[str, str] = {
+    "review": (
+        "Review the supplied change set as a read-only code reviewer. Return concise findings "
+        "with file paths, line references and a concrete impact. Say when no issues were found."
+    ),
     "research": (
         "Research this bounded question using only the granted sources. "
         "State uncertainty clearly and cite paths or source identifiers."

@@ -1,6 +1,7 @@
 """Explicit shell commands with bounded output and owned process-tree cleanup."""
 
 import asyncio
+import codecs
 import os
 import shutil
 import signal
@@ -65,10 +66,17 @@ def shell_command(arguments, workspace_path):
     return [executable, *flags, command], cwd
 
 
-async def drain_output(stream):
+async def drain_output(stream, on_output=None, *, live=False):
     data = bytearray()
     total = 0
+    previews = 0
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     while chunk := await stream.read(number("streams.read_chunk_bytes")):
+        if on_output is not None and (live or (total < 4096 and previews < 8)):
+            preview = decoder.decode(chunk if live else chunk[: 4096 - total])
+            if preview:
+                await on_output(preview)
+                previews += 1
         total += len(chunk)
         data.extend(chunk[: max(0, number("shell.stream_limit_bytes") - len(data))])
     return data.decode("utf-8", errors="replace"), total > len(data)
@@ -98,9 +106,13 @@ async def stop_tree(process):
     await process.wait()
 
 
-async def bash(arguments: BashArgs, workspace_path):
+async def bash(
+    arguments: BashArgs, workspace_path, *, on_output=None, live=False, git_ceiling=None
+):
     argv, cwd = shell_command(arguments, workspace_path)
     environment = command_environment()
+    if git_ceiling is not None:
+        environment["GIT_CEILING_DIRECTORIES"] = str(git_ceiling)
     options = (
         {"creationflags": subprocess.CREATE_NO_WINDOW}
         if os.name == "nt"
@@ -115,7 +127,17 @@ async def bash(arguments: BashArgs, workspace_path):
         stderr=asyncio.subprocess.PIPE,
         **options,
     )
-    readers = asyncio.gather(drain_output(process.stdout), drain_output(process.stderr))
+    async def output(channel, text):
+        await on_output(channel, text)
+
+    readers = asyncio.gather(
+        drain_output(
+            process.stdout, (lambda text: output("stdout", text)) if on_output else None, live=live
+        ),
+        drain_output(
+            process.stderr, (lambda text: output("stderr", text)) if on_output else None, live=live
+        ),
+    )
     job = None
     try:
         if os.name == "nt":

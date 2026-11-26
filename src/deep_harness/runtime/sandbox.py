@@ -1,6 +1,7 @@
 """Disposable Docker containers owned by individual admissions."""
 
 import asyncio
+import os
 import re
 from uuid import uuid4
 
@@ -11,7 +12,7 @@ INITIALIZE = "set -eu; cp -R /source/. /task/; touch /tmp/harness-ready; exec sl
 EXECUTE = 'cd "/task/$1" || exit 2; exec /bin/sh -c "$2"'
 
 
-async def capture(*args, limit_seconds=10):
+async def capture(*args, limit_seconds=10, on_output=None):
     process = await asyncio.create_subprocess_exec(
         "docker",
         *args,
@@ -19,7 +20,19 @@ async def capture(*args, limit_seconds=10):
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    readers = asyncio.gather(drain_output(process.stdout), drain_output(process.stderr))
+    async def output(channel, text):
+        await on_output(channel, text)
+
+    readers = asyncio.gather(
+        drain_output(
+            process.stdout, (lambda text: output("stdout", text)) if on_output else None,
+            live=on_output is not None,
+        ),
+        drain_output(
+            process.stderr, (lambda text: output("stderr", text)) if on_output else None,
+            live=on_output is not None,
+        ),
+    )
     try:
         async with asyncio.timeout(limit_seconds):
             stdout, stderr = await asyncio.shield(readers)
@@ -39,6 +52,7 @@ class DockerExecutor:
         self.workspaces = {}
         self.lock = asyncio.Lock()
         self.image_id = None
+        self.managed_slots = asyncio.Semaphore(settings.max_workspaces)
 
     async def clean_orphans(self):
         if self.label is None:
@@ -170,6 +184,41 @@ class DockerExecutor:
     async def close(self):
         for run_id in tuple(self.workspaces):
             await self.finish(run_id)
+
+    async def run_managed(self, arguments, resolve, workspace, *, on_output=None):
+        """Run a command against the same task tree used by the host file gateway."""
+        async with self.managed_slots:
+            return await self._run_mounted(arguments, resolve, workspace, on_output)
+
+    async def _run_mounted(self, arguments, resolve, workspace, on_output):
+        self.validate(arguments, resolve)
+        if "," in str(workspace):
+            raise DomainError("command_cwd", "Workspace path is unsupported by the executor")
+        if self.image_id is None:
+            await self.check()
+        cwd = resolve(arguments.cwd).relative_to(workspace).as_posix()
+        name = f"deep-harness-{uuid4().hex}"
+        owner = f"{os.getuid()}:{os.getgid()}" if os.name != "nt" else "0:0"
+        argv = self.argv(name, workspace)
+        # Retain the existing resource and isolation options, replacing the source and task mounts.
+        flags = list(argv[4:argv.index("--mount")])
+        flags[flags.index("--user") + 1] = owner
+        try:
+            code, stdout, stderr = await capture(
+                "run", "--rm", "--init", *flags,
+                "--mount", f"type=bind,source={workspace},target=/task,bind-recursive=disabled",
+                "--tmpfs", "/tmp:rw,nodev,nosuid,noexec,size=16m",
+                "--entrypoint", "/bin/sh", self.image_id,
+                "-c", EXECUTE, "harness", cwd, arguments.command,
+                limit_seconds=arguments.timeout_seconds,
+                on_output=on_output,
+            )
+            return {
+                "exit_code": code, "stdout": stdout[0], "stderr": stderr[0],
+                "stdout_truncated": stdout[1], "stderr_truncated": stderr[1], "sandbox": True,
+            }
+        finally:
+            await capture("rm", "-f", name)
 
     async def run(self, arguments, resolve, workspace, *, run_id=None):
         self.validate(arguments, resolve)

@@ -1,9 +1,11 @@
 """Same-origin, login-free HTTP entry for a configured instance."""
 
+import asyncio
+import json
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 from urllib.parse import unquote
 
 from fastapi import APIRouter, FastAPI, Header, Query, Request, Response
@@ -13,12 +15,13 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from deep_harness.application.instance_config import is_loopback
 from deep_harness.domain.images import MAX_IMAGES
 from deep_harness.domain.models import DomainError, Harness
 from deep_harness.runtime.inference import usage_totals
 from deep_harness.transports.api import JobCommand, RequestModel
 from deep_harness.transports.events import stream_events
-from deep_harness.transports.operations import EffectDecision
+from deep_harness.transports.operations import DevelopmentCommand, EffectDecision, TaskControl
 
 WORKSPACE = "/workspaces/{workspace_id}"
 STATIC = Path(__file__).with_name("web_static")
@@ -32,6 +35,8 @@ NOT_FOUND = {
     "job_not_found",
     "workflow_not_found",
     "effect_not_found",
+    "diff_not_found",
+    "task_not_found",
 }
 
 
@@ -41,7 +46,14 @@ class WebSession(RequestModel):
     agent_id: str | None = Field(default=None, max_length=48)
     prompt: str = Field(default="Help with the current task.", min_length=1, max_length=16000)
     harness: Harness = "general"
-    tools: tuple[str, ...] = Field(default=(), max_length=64)
+    tools: tuple[str, ...] | None = Field(default=None, max_length=64)
+    verification_command: str | None = Field(default=None, min_length=1, max_length=4096)
+
+
+class WebProject(RequestModel):
+    path: str = Field(min_length=1, max_length=4096)
+    label: str = Field(default="", max_length=120)
+    mode: Literal["read_only", "sandbox"] = "read_only"
 
 
 class WebInput(RequestModel):
@@ -71,6 +83,8 @@ class WebWorkflow(RequestModel):
 
 
 def conflict(exc):
+    if exc.code == "project_registration_denied":
+        return 403
     if exc.code in NOT_FOUND:
         return 404
     if exc.code == "queue_full":
@@ -124,8 +138,26 @@ def create_web_api(instance, assets=STATIC):
     )
     public_origin = settings.public_origin.rstrip("/")
 
+    def local_projects(request):
+        return (
+            settings.local_projects
+            and request.client is not None
+            and is_loopback(request.client.host)
+        )
+
     @app.middleware("http")
     async def same_origin(request, call_next):
+        route = request.url.path.split("/")
+        if (
+            route[:4] == ["", "api", "v1", "workspaces"]
+            and len(route) > 4
+            and route[4] in instance.registered
+            and route[4] not in instance.settings.workspaces
+            and not local_projects(request)
+        ):
+            return JSONResponse(
+                {"code": "workspace_not_found", "message": "Workspace is not configured"}, 404
+            )
         if request.method not in {"GET", "HEAD", "OPTIONS"}:
             origin = request.headers.get("origin")
             fetch_site = request.headers.get("sec-fetch-site")
@@ -168,17 +200,43 @@ def create_web_api(instance, assets=STATIC):
 
     router = APIRouter(prefix="/api/v1")
 
+    def require_local(request):
+        if not local_projects(request):
+            raise DomainError("project_registration_denied", "请在本机 Web 工作台添加项目。")
+
     @router.get("/instance")
-    async def catalog():
-        return instance.public_catalog()
+    async def catalog(request: Request):
+        return {
+            **instance.public_catalog(),
+            "workspaces": available_workspaces(request),
+            "local_projects": local_projects(request),
+            "project_sandbox": instance.can_add_sandbox,
+        }
 
     @router.get("/models")
     async def models():
         return instance.models.list()
 
     @router.get("/workspaces")
-    async def workspaces():
-        return instance.public_catalog()["workspaces"]
+    async def workspaces(request: Request):
+        return available_workspaces(request)
+
+    def available_workspaces(request):
+        rows = instance.public_catalog()["workspaces"]
+        if local_projects(request):
+            return rows
+        return [row for row in rows if row["id"] in instance.settings.workspaces]
+
+    @router.get("/project-folders")
+    async def project_folders(request: Request, path: str = Query("", max_length=4096)):
+        require_local(request)
+        initial = instance.settings.workspaces[instance.settings.default_workspace].path.parent
+        return await asyncio.to_thread(instance.projects.browse, path, initial)
+
+    @router.post("/workspaces")
+    async def add_workspace(request: Request, body: WebProject):
+        require_local(request)
+        return await instance.add_project(body.path, body.label.strip(), body.mode)
 
     @router.get("/agents")
     async def agents():
@@ -247,6 +305,55 @@ def create_web_api(instance, assets=STATIC):
         result = run_payload(await service.store.get_admission(run_id, session_id))
         result["usage"] = await usage_totals(service.store, session_id, run_id)
         return result
+
+    @router.get(WORKSPACE + "/runs/{run_id}/diff")
+    async def run_diff(workspace_id: str, run_id: str):
+        service = await instance.application(workspace_id)
+        session_id = await service.store.run_session(run_id)
+        admission = await service.store.get_admission(run_id, session_id)
+        if admission.status == "completed":
+            try:
+                workspace = json.loads(admission.result)["execution_evidence"]["workspace"]
+                return Response(workspace["diff"], media_type="text/x-diff", headers={
+                    "Content-Disposition": 'attachment; filename="coding-task.diff"',
+                    "X-Diff-Partial": str(workspace["diff_truncated"]).lower(),
+                })
+            except (KeyError, TypeError, ValueError):
+                pass
+        raise DomainError("diff_not_found", "No saved coding diff is available")
+
+    @router.get(WORKSPACE + "/sessions/{session_id}/task-control")
+    async def task_status(workspace_id: str, session_id: str):
+        service = await instance.application(workspace_id)
+        return await service.task_control(session_id)
+
+    @router.get(WORKSPACE + "/sessions/{session_id}/bundle")
+    async def export_bundle(workspace_id: str, session_id: str):
+        service = await instance.application(workspace_id)
+        identifier, raw = await service.deliver(session_id, "export")
+        return Response(raw, media_type="application/json", headers={
+            "Content-Disposition": f'attachment; filename="changes-{identifier[:12]}.json"',
+        })
+
+    @router.post(WORKSPACE + "/sessions/{session_id}/task-control")
+    async def task_control(workspace_id: str, session_id: str, body: TaskControl):
+        service = await instance.application(workspace_id)
+        return await service.task_control(session_id, body.action)
+
+    @router.get(WORKSPACE + "/sessions/{session_id}/processes")
+    async def development_processes(workspace_id: str, session_id: str):
+        service = await instance.application(workspace_id)
+        return await service.development_processes(session_id)
+
+    @router.post(WORKSPACE + "/sessions/{session_id}/processes")
+    async def start_process(workspace_id: str, session_id: str, body: DevelopmentCommand):
+        service = await instance.application(workspace_id)
+        return await service.development_processes(session_id, start=body.model_dump())
+
+    @router.post(WORKSPACE + "/sessions/{session_id}/processes/{identifier}/stop")
+    async def stop_process(workspace_id: str, session_id: str, identifier: str):
+        service = await instance.application(workspace_id)
+        return await service.development_processes(session_id, stop=identifier)
 
     @router.get(WORKSPACE + "/runs/{run_id}/events")
     async def run_events(

@@ -1,4 +1,4 @@
-# deep-harness v1.1.5 架构与技术实现
+# deep-harness v1.1.6 架构与技术实现
 
 deep-harness 是可在本机及服务器运行的通用 Agent 宿主。CLI、Windows 桌面端和同源浏览器工作台共享 Python 应用服务。一次用户输入进入业务库成为一条 admission，随后才交给运行图。模型生成工具提议，宿主决定工具是否获授权、是否需要批准、能否派发，以及结果是否需要人工对账。
 
@@ -71,12 +71,20 @@ flowchart TB
 
 来源见 [Profile 组装](src/deep_harness/bootstrap.py)、[会话快照](src/deep_harness/application/session_runtime.py)、[业务存储](src/deep_harness/infrastructure/store.py)、[执行台账](src/deep_harness/infrastructure/executions.py)和[回执台账](src/deep_harness/infrastructure/receipts.py)。
 
+### 编码任务工作区
+
+编码任务复用会话 ID，在运行快照中冻结工作区模式与可选验收命令。Profile 仍绑定源项目。任务 checkout 由持久描述记录实际位置和 Git 基线，并用于所有轮次的工具执行。隔离任务目录位于 Profile 状态内，只有当前任务树可以通过工具网关访问。受管本地任务持有工作区租约，Docker 命令只挂载任务树。审批和外部回执仍归属于单次 admission。
+
+源项目交付由显式操作触发，使用任务基线生成累计变更集，逐文件校验目标哈希和模式。已有派发意图但没有完成回执时，核对会读取当前文件并报告匹配状态。撤销使用交付前保存的内容。固定验收命令缺少匹配回执时，由单独的 LangGraph 检查点执行验证步骤。任务工作区、交付记录与开发进程元数据均有独立持久路径，业务 schema 保持现有契约。
+
+交付图以操作和变更包摘要绑定检查点。Web 导出不可变清单与文件数据，本地导入对目标目录执行预检，批准后依旧由文件回执记录派发和结果。子任务的合并工具由宿主从台账取出补丁，批准的参数包含实际补丁内容。
+
 ## 3. Harness、模型与运行图
 
 | Harness | CLI / REST 默认执行路径 | 服务端派生核心工具 | 专业行为 |
 | --- | --- | --- | --- |
 | `general` | `standard` | 10 个完整核心工具 | 普通会话输出 |
-| `coding` | `deep` | 10 个完整核心工具 | Coding 引导和结构化报告，声明 coding 委派类型 |
+| `coding` | `deep` | 核心工具与编码专用工具 | 任务工作区、实现与只读调查和审查、验收和交付证据 |
 | `research` | `deep` | 7 个只读核心工具 | 研究引导和结构化报告，声明 research 委派类型 |
 | `research_web` | `deep` | 同一组 7 个只读核心工具 | 优先使用联网研究、补读和来源引用 |
 

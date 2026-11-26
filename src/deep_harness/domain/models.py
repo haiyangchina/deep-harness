@@ -6,6 +6,7 @@ from typing import Literal
 
 PermissionMode = Literal["ask", "auto", "full"]
 Harness = Literal["general", "coding", "research", "research_web"]
+WorkspaceMode = Literal["in_place", "worktree", "copy", "auto"]
 
 
 class DomainError(Exception):
@@ -25,6 +26,16 @@ class ProfileScope:
     server_mode: str | None = None
     protected_paths: tuple[Path, ...] = ()
     executor_revision: str | None = None
+    task_workspace: bool = False
+
+
+@dataclass(frozen=True)
+class TaskWorkspace:
+    task_id: str
+    mode: WorkspaceMode
+    source: Path
+    root: Path
+    baseline_commit: str | None = None
 
 
 @dataclass(frozen=True)

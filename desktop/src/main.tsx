@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client'
 import { useStore } from '@nanostores/react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Capabilities, CreateSession, Knowledge, Setup } from './components'
+import { BundleImport } from './bundle-import'
 import {
   $busy,
   $conversation,
@@ -60,13 +61,26 @@ const starters = [
     '请结合当前工作区中的文件研究以下问题，给出证据、结论与尚未验证的部分。研究问题：'
   ]
 ]
-type Page = 'jobs' | 'chat' | 'capabilities' | 'skills' | 'memories' | 'mcp/tools' | 'settings'
+type Page = 'jobs' | 'chat' | 'capabilities' | 'skills' | 'memories' | 'mcp/tools' | 'settings' | 'bundles'
 
 interface CodingReport {
   report_status: 'valid' | 'repaired' | 'unavailable'
   summary: string
   execution_evidence: {
     files: { path: string; sha256: string }[]
+    workspace?: {
+      status: 'observed' | 'partial' | 'unavailable'
+      files: { path: string; status: 'added' | 'modified' | 'deleted' }[]
+      diff: string
+      diff_truncated: boolean
+      isolated?: boolean
+    }
+    verification?: {
+      status: 'not_run' | 'passed' | 'failed' | 'stale' | 'unavailable'
+      receipt: { command: string; cwd: string; exit_code: number } | null
+    }
+    delegations?: { id: string; kind: string; mode: string; status: string }[]
+    plan?: { content: string; status: string }[]
     commands: {
       receipt_id: string
       command: string
@@ -74,6 +88,131 @@ interface CodingReport {
       purpose?: 'general' | 'reproduce' | 'verify'
     }[]
   }
+}
+
+const verificationLabels = {
+  not_run: '未运行验收命令', passed: '验收通过', failed: '验收失败',
+  stale: '验收已过期，工作区有变更', unavailable: '无法确认验收对应的工作区版本'
+}
+const fileChangeLabels = { added: '新增', modified: '修改', deleted: '删除' }
+
+type Delivery = {
+  revision?: string; status: string; diff: string; diff_truncated: boolean
+  change_set_id?: string; bundle_error?: string
+  files: { path: string; status: 'added' | 'modified' | 'deleted' }[]
+  delivery: { revision: string; status: string; observations?: Record<string, string[]> } | null
+}
+
+function TaskDelivery({ sessionId }: { sessionId: string }) {
+  const [review, setReview] = useState<Delivery | null>(null)
+  const busy = useStore($busy)
+  const route = `/sessions/${sessionId}/delivery`
+  const refresh = async () => setReview(await api<Delivery>(route))
+  const command = (action: 'apply' | 'undo' | 'discard' | 'reconcile', revision: string) => void perform(async () => {
+    await api(route, 'POST', { action, revision,
+      ...(action === 'apply' ? { change_set_id: review?.change_set_id } : {}) })
+    await refresh()
+  })
+  return <div className="delivery-panel">
+    <button disabled={busy} onClick={() => void perform(refresh)}>审查任务交付</button>
+    {review && <>
+      <ul>{review.files.map(file => <li key={file.path}>{fileChangeLabels[file.status]} <code>{file.path}</code></li>)}</ul>
+      {review.diff && <pre className="coding-diff">{review.diff}</pre>}
+      {review.diff_truncated && <p>文本差异仅显示可捕获部分。</p>}
+      {review.bundle_error && <p>当前变更无法封装，需要缩小交付范围。</p>}
+      {review.delivery?.observations && <ul>
+        {Object.entries(review.delivery.observations).map(([path, states]) => (
+          <li key={path}><code>{path}</code> · {states.map(value =>
+            value === 'before' ? '交付前' : '交付后').join('、') || '与两端都不匹配'}</li>
+        ))}
+      </ul>}
+      {review.delivery?.status === 'applied' ? (
+        <button disabled={busy} onClick={() => command('undo', review.delivery!.revision)}>撤销已应用变更</button>
+      ) : review.delivery && ['applying', 'undoing'].includes(review.delivery.status) ? (
+        <button disabled={busy} onClick={() => command('reconcile', review.delivery!.revision)}>核对交付</button>
+      ) : (!review.delivery || review.delivery.status === 'not_applied') &&
+          review.status === 'observed' && review.files.length > 0 && review.revision &&
+          review.change_set_id ? (
+        <button disabled={busy} onClick={() => command('apply', review.revision!)}>应用到项目</button>
+      ) : review.delivery && <p>交付状态 · {review.delivery.status}</p>}
+      {review.status === 'discarded' && <p>任务工作区已清理。</p>}
+      {review.status === 'observed' && review.revision && (
+        <button disabled={busy} onClick={() => {
+          if (window.confirm('清理任务工作区？未交付的改动将被丢弃。')) command('discard', review.revision!)
+        }}>清理工作区</button>
+      )}
+    </>}
+  </div>
+}
+
+type DevProcess = { id: string; command: string; status: string; stdout: string; stderr: string }
+
+function TaskPause({ sessionId }: { sessionId: string }) {
+  const [paused, setPaused] = useState<boolean | null>(null)
+  const busy = useStore($busy)
+  const route = `/sessions/${sessionId}/task-control`
+  useEffect(() => {
+    let active = true
+    void api<{ pause_requested: boolean }>(route).then(value => {
+      if (active) setPaused(value.pause_requested)
+    }).catch(() => {})
+    return () => { active = false }
+  }, [route])
+  if (paused === null) return null
+  return <button disabled={busy} onClick={() => void perform(async () => {
+    const value = await api<{ pause_requested: boolean }>(route, 'POST', {
+      action: paused ? 'resume' : 'pause'
+    })
+    setPaused(value.pause_requested)
+    await refreshConversation()
+  })}>{paused ? '继续任务' : '在安全边界暂停'}</button>
+}
+
+function DevelopmentProcesses({ sessionId }: { sessionId: string }) {
+  const busy = useStore($busy)
+  const [open, setOpen] = useState(false)
+  const [command, setCommand] = useState('')
+  const [pending, setPending] = useState<{ command: string; request_id: string } | null>(null)
+  const [rows, setRows] = useState<DevProcess[]>([])
+  const route = `/sessions/${sessionId}/processes`
+  const refresh = async () => setRows(await api<DevProcess[]>(route))
+  useEffect(() => {
+    if (!open) return
+    let active = true
+    const update = () => void api<DevProcess[]>(route).then(value => {
+      if (active) setRows(value)
+    }).catch(error => { if (active) report(error) })
+    update()
+    const timer = setInterval(update, 2000)
+    return () => { active = false; clearInterval(timer) }
+  }, [open, route])
+
+  return <details onToggle={event => setOpen(event.currentTarget.open)}>
+    <summary>开发进程</summary>
+    <form onSubmit={event => {
+      event.preventDefault()
+      void perform(async () => {
+        const request = pending ?? { command: command.trim(), request_id: crypto.randomUUID() }
+        setPending(request)
+        await api(route, 'POST', request)
+        setPending(null)
+        setCommand('')
+        await refresh()
+      })
+    }}>
+      <input aria-label="开发命令" placeholder="例如 npm run dev" value={command} disabled={busy || !!pending}
+        onChange={event => setCommand(event.target.value)} />
+      <button disabled={busy || !command.trim()}>{pending ? '核对启动结果' : '启动进程'}</button>
+    </form>
+    {rows.map(row => <details key={row.id}>
+      <summary>{row.command} · {row.status}</summary>
+      {(row.stdout || row.stderr) && <pre className="coding-diff">{row.stdout}{row.stderr}</pre>}
+      {row.status === 'running' && <button disabled={busy} onClick={() => void perform(async () => {
+        await api(`${route}/${row.id}/stop`, 'POST', {})
+        await refresh()
+      })}>停止进程</button>}
+    </details>)}
+  </details>
 }
 
 function readCodingReport(value?: string): CodingReport | null {
@@ -184,6 +323,12 @@ function Chat({ newSession, openModelSettings }: { newSession: () => void; openM
     .filter(e => e.payload.message_id === messageId)
     .map(e => String(e.payload.text ?? ''))
     .join('')
+  const commandEvents = conversation?.events.filter(e =>
+    e.type === 'coding.command_output' && String(e.payload.id).startsWith(`${latest?.id}:`)
+  ) ?? []
+  const lastCommand = commandEvents.at(-1)?.payload.id
+  const commandOutput = commandEvents.filter(e => e.payload.id === lastCommand)
+    .map(e => String(e.payload.content ?? '')).join('')
   useEffect(() => {
     if (conversation && follow.current) tail.current?.scrollIntoView({ block: 'end' })
   }, [conversation?.messages.length, deltas])
@@ -197,6 +342,9 @@ function Chat({ newSession, openModelSettings }: { newSession: () => void; openM
           </div>
           <span className="chip">
             {status?.session.harness ?? 'Ollama'}
+            {sessionId && status?.session.harness === 'coding' && (
+              <TaskPause key={sessionId} sessionId={sessionId} />
+            )}
           </span>
         </header>
         <div
@@ -286,10 +434,55 @@ function Chat({ newSession, openModelSettings }: { newSession: () => void; openM
               <div className="message-content">
                 <p>{codingReport.report_status === 'unavailable'
                   ? '执行已结束，报告生成失败。' : codingReport.summary}</p>
-                {codingReport.execution_evidence.files.length > 0 && (
+                {codingReport.execution_evidence.verification && (
+                  <p>
+                    {verificationLabels[codingReport.execution_evidence.verification.status]}
+                    {codingReport.execution_evidence.verification.receipt && (
+                      <> · <code>{codingReport.execution_evidence.verification.receipt.command}</code></>
+                    )}
+                  </p>
+                )}
+                {codingReport.execution_evidence.workspace && (
+                  <details>
+                    <summary>本轮工作区差异 · {codingReport.execution_evidence.workspace.files.length} 个文件</summary>
+                    {codingReport.execution_evidence.workspace.status !== 'observed' && (
+                      <p>工作区快照不完整。</p>
+                    )}
+                    <ul>{codingReport.execution_evidence.workspace.files.map(file => (
+                      <li key={file.path}>{fileChangeLabels[file.status]} <code>{file.path}</code></li>
+                    ))}</ul>
+                    {codingReport.execution_evidence.workspace.diff_truncated && <p>文本差异仅包含可捕获的部分。</p>}
+                    {codingReport.execution_evidence.workspace.diff && (
+                      <pre className="coding-diff">{codingReport.execution_evidence.workspace.diff}</pre>
+                    )}
+                  </details>
+                )}
+                {Boolean(codingReport.execution_evidence.delegations?.length) && (
+                  <details>
+                    <summary>子 Agent · {codingReport.execution_evidence.delegations?.length}</summary>
+                    <ul>{codingReport.execution_evidence.delegations?.map(child => (
+                      <li key={child.id}>{child.kind === 'coding' ? '实现' :
+                        child.kind === 'review' ? '审查' : '调查'} · {child.status}</li>
+                    ))}</ul>
+                  </details>
+                )}
+                {Boolean(codingReport.execution_evidence.plan?.length) && (
+                  <details><summary>任务计划</summary>
+                    <ul>{codingReport.execution_evidence.plan?.map((item, index) => (
+                      <li key={index}>{item.content} · {item.status}</li>
+                    ))}</ul>
+                  </details>
+                )}
+                {!codingReport.execution_evidence.workspace && codingReport.execution_evidence.files.length > 0 && (
                   <ul>{codingReport.execution_evidence.files.map(file => (
                     <li key={file.path}>已修改 <code>{file.path}</code></li>
                   ))}</ul>
+                )}
+                {codingReport.execution_evidence.workspace?.isolated && sessionId && (
+                  <>
+                    <TaskDelivery key={latest?.id} sessionId={sessionId} />
+                    <DevelopmentProcesses key={sessionId} sessionId={sessionId} />
+                  </>
                 )}
                 {codingReport.execution_evidence.commands.length > 0 && (
                   <ul>{codingReport.execution_evidence.commands.map(command => (
@@ -307,6 +500,12 @@ function Chat({ newSession, openModelSettings }: { newSession: () => void; openM
             <article className="message assistant">
               <div className="message-role">deep-harness · 生成中</div>
               <div className="message-content">{deltas}</div>
+            </article>
+          )}
+          {running && commandOutput && (
+            <article className="message assistant">
+              <div className="message-role">当前命令输出</div>
+              <pre className="coding-diff">{commandOutput}</pre>
             </article>
           )}
           {(paused?.result || (latest?.status !== 'completed' && latest?.result)) && (
@@ -377,12 +576,23 @@ function Chat({ newSession, openModelSettings }: { newSession: () => void; openM
 
 function App() {
   const runtime = useStore($runtime)
+  const busy = useStore($busy)
   const sessions = useStore($sessions)
   const sessionCursor = useStore($sessionCursor)
   const conversation = useStore($conversation)
   const error = useStore($error)
   const [page, setPage] = useState<Page>('chat')
   const [creating, setCreating] = useState(false)
+  const selectProject = (id: string | null) => void perform(async () => {
+    const next = await window.deepHarness.openProject(id)
+    const previous = $runtime.get()
+    if (previous && next.projectId === previous.projectId && next.ready === previous.ready) return
+    resetView()
+    $runtime.set(next)
+    setCreating(false)
+    setPage(next.ready ? 'chat' : 'settings')
+    if (next.ready) await loadSessions()
+  })
   useEffect(() => {
     void initialize().catch(report)
     const timer = setInterval(() => {
@@ -390,6 +600,7 @@ function App() {
         .info()
         .then(info => {
           const previous = $runtime.get()
+          if (previous?.projectId !== info.projectId) return
           if (previous?.ready !== info.ready || previous?.error !== info.error) {
             if (!info.ready) resetView()
             $runtime.set(info)
@@ -418,6 +629,19 @@ function App() {
             <small>AGENT WORKSPACE</small>
           </div>
         </div>
+        <div className="section-label">
+          项目 <button disabled={busy} onClick={() => selectProject(null)}>＋ 新增项目</button>
+        </div>
+        <nav className="project-list" aria-label="项目">
+          {runtime.projects?.map(project => (
+            <button key={project.id} title={project.workspace} disabled={busy}
+              aria-current={runtime.projectId === project.id ? 'true' : undefined}
+              className={runtime.projectId === project.id ? 'nav-active' : ''}
+              onClick={() => selectProject(project.id)}>
+              <span aria-hidden="true">▱</span>{project.name}
+            </button>
+          ))}
+        </nav>
         <button className="new-task" disabled={!ready} onClick={() => setCreating(true)}>
           ＋ 新建会话 <kbd>LOCAL</kbd>
         </button>
@@ -426,6 +650,7 @@ function App() {
             [
               ['chat', '◈', '工作台'],
               ['jobs', '◇', '长任务'],
+              ['bundles', '⇩', '导入变更包'],
               ['capabilities', '◎', '能力'],
               ['skills', '◫', '技能库'],
               ['memories', '◉', '记忆'],
@@ -490,7 +715,7 @@ function App() {
           </div>
         )}
         {!ready || page === 'settings' ? (
-          <Setup onClose={ready ? () => setPage('chat') : undefined} />
+          <Setup key={runtime.projectId || 'setup'} onClose={ready ? () => setPage('chat') : undefined} />
         ) : page === 'chat' ? (
           <Chat newSession={() => setCreating(true)} openModelSettings={() => setPage('settings')} />
         ) : page === 'jobs' ? (
@@ -498,6 +723,8 @@ function App() {
             setPage('chat')
             void openSession(id).catch(report)
           }} />
+        ) : page === 'bundles' ? (
+          <BundleImport key={runtime.projectId ?? runtime.settings.workspace} workspace={runtime.settings.workspace} />
         ) : page === 'capabilities' ? (
           <Capabilities />
         ) : (

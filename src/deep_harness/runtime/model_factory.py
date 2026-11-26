@@ -37,6 +37,7 @@ def open_model(
             **common,
             context_window_tokens=settings.context_window_tokens,
             reasoning=settings.reasoning,
+            keep_alive=settings.keep_alive,
         )
         model.vision = default_vision(settings)
         return model
@@ -136,11 +137,15 @@ class ModelCatalog:
 
     def revision(self, model_id):
         entry = self.entries[model_id]
+        # keep_alive is a residency/performance hint, not a semantic setting:
+        # it never changes model output, so it must not invalidate model
+        # receipts keyed by this revision when the retention value is tuned.
+        excluded = {"keep_alive"}
+        if entry.settings.vision is None:
+            excluded.add("vision")
         return fingerprint(
             {
-                "settings": entry.settings.model_dump(
-                    exclude={"vision"} if entry.settings.vision is None else None
-                ),
+                "settings": entry.settings.model_dump(exclude=excluded),
                 "capabilities": sorted(entry.capabilities),
             }
         )

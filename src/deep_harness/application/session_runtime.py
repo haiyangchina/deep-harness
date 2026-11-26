@@ -1,6 +1,7 @@
 """Session configuration and branching authority, independent of transport entry points."""
 
 from copy import deepcopy
+from itertools import product
 
 from deep_harness.application.capabilities import WEB_TOOLS
 from deep_harness.application.harness_spec import CONTEXT_POLICY
@@ -12,17 +13,27 @@ from deep_harness.infrastructure.policies import PolicyLedger
 from deep_harness.runtime.harnesses import harness_contract
 
 
-def preserve_image_tool_binding(binding, snapshot):
-    """Recognize the single optional delegation argument added to old sessions."""
+def preserve_tool_binding(binding, snapshot):
+    """Recognize compatible historical tool schemas without changing their fingerprints."""
     if not binding or binding["fingerprint"] == fingerprint(snapshot):
         return snapshot
-    legacy = deepcopy(snapshot)
-    for tool in legacy["tools"]:
-        if tool["name"] == "delegate_task":
-            tool["parameters"]["properties"].pop("share_images", None)
-            if binding["fingerprint"] == fingerprint(legacy):
-                return legacy
-            break
+    for old_images, old_patch, old_roles, old_isolation in product((False, True), repeat=4):
+        if not (old_images or old_patch or old_roles or old_isolation):
+            continue
+        legacy = deepcopy(snapshot)
+        for tool in legacy["tools"]:
+            if tool["name"] == "delegate_task":
+                properties = tool["parameters"]["properties"]
+                if old_images:
+                    properties.pop("share_images", None)
+                if old_roles:
+                    properties["kind"]["enum"] = ["research", "coding"]
+                if old_isolation:
+                    properties.pop("isolate", None)
+            if old_patch and tool["name"] == "apply_patch":
+                tool["parameters"]["properties"]["files"]["minItems"] = 2
+        if binding["fingerprint"] == fingerprint(legacy):
+            return legacy
     return snapshot
 
 
@@ -47,6 +58,7 @@ class SessionRuntime:
         knowledge=None,
         mcp_catalog=None,
         model_id=None,
+        coding_task=None,
     ):
         model = self.select_model(model_id, tools)
         result = {
@@ -65,6 +77,8 @@ class SessionRuntime:
         if self.scope.server_mode:
             result["server_mode"] = self.scope.server_mode
             result["executor_revision"] = self.scope.executor_revision
+        if coding_task is not None:
+            result["coding_task"] = coding_task
         if self.web_settings is not None and set(tools).intersection(WEB_TOOLS):
             result["web"] = {
                 key: value
@@ -137,9 +151,10 @@ class SessionRuntime:
             knowledge=knowledge,
             mcp_catalog=catalog,
             model_id=binding["snapshot"].get("model_id") if binding else None,
+            coding_task=binding["snapshot"].get("coding_task") if binding else None,
         )
         await self.policies.assert_matches(
-            session.id, preserve_image_tool_binding(binding, current)
+            session.id, preserve_tool_binding(binding, current)
         )
 
     async def status(self, session_id):
@@ -157,13 +172,14 @@ class SessionRuntime:
                 knowledge=knowledge,
                 mcp_catalog=catalog,
                 model_id=saved.get("model_id"),
+                coding_task=saved.get("coding_task"),
             )
         except DomainError as exc:
             if exc.code not in {"model_not_found", "model_secret_missing", "model_capability"}:
                 raise
             status["runtime"] = {"binding": binding, "compatible": False, "error": exc.code}
             return status
-        current = preserve_image_tool_binding(binding, current)
+        current = preserve_tool_binding(binding, current)
         status["runtime"] = {
             "binding": binding,
             "current_snapshot": current,

@@ -96,6 +96,65 @@ async def session(client, *, request_id="create", model_id="two", tools=()):
     return response.json()["id"]
 
 
+async def test_local_web_projects_browse_persist_and_keep_sessions_scoped(tmp_path):
+    source = tmp_path / "my project"
+    source.mkdir()
+    (source / "src").mkdir()
+    (source / ".ssh").mkdir()
+    state = tmp_path / "state"
+    project_api = "/api/v1/workspaces"
+    catalog_api = "/api/v1/instance"
+    app = create_web_api(instance(tmp_path), None)
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+        ) as client:
+            assert (await client.get(catalog_api)).json()["local_projects"]
+            folders = await client.get("/api/v1/project-folders", params={"path": str(source)})
+            assert folders.json()["directories"] == [{"name": "src", "path": str(source / "src")}]
+            rejected = await client.post(project_api, json={"path": str(state)})
+            assert rejected.status_code == 409
+            created = await client.post(
+                project_api, json={"path": str(source), "label": "我的项目"}
+            )
+            assert created.status_code == 200, created.text
+            row = created.json()
+            assert row["label"] == "我的项目" and row["mode"] == "read_only"
+            resubmitted = await client.post(project_api, json={"path": str(source)})
+            assert resubmitted.json()["id"] == row["id"]
+            project_sessions = f"{project_api}/{row['id']}/sessions"
+            new_session = await client.post(
+                project_sessions, json={"request_id": "project-session"}
+            )
+            assert new_session.status_code == 200, new_session.text
+            identifier = new_session.json()["id"]
+            assert (await client.get(f"{BASE}/sessions/{identifier}")).status_code == 404
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, client=("192.0.2.3", 4000)),
+            base_url="http://127.0.0.1",
+        ) as remote:
+            assert not (await remote.get(catalog_api)).json()["local_projects"]
+            assert (await remote.get("/api/v1/project-folders")).status_code == 403
+            assert (await remote.post(project_api, json={"path": str(source)})).status_code == 403
+            assert (await remote.get(project_sessions)).status_code == 404
+
+    restarted = create_web_api(instance(tmp_path), None)
+    async with restarted.router.lifespan_context(restarted):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=restarted), base_url="http://127.0.0.1"
+        ) as client:
+            assert row in (await client.get(catalog_api)).json()["workspaces"]
+            assert (await client.get(f"{project_sessions}/{identifier}")).status_code == 200
+
+    shared = create_web_api(instance(tmp_path, web={"host": "0.0.0.0"}), None)
+    async with shared.router.lifespan_context(shared):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=shared), base_url="http://127.0.0.1"
+        ) as client:
+            assert row not in (await client.get(catalog_api)).json()["workspaces"]
+            assert (await client.get(project_sessions)).status_code == 404
+
+
 async def test_web_sessions_bind_models_and_reconnect_after_detached_submit(tmp_path):
     host = instance(tmp_path)
     assets = tmp_path / "assets"
@@ -534,3 +593,105 @@ async def test_web_sandbox_approval_and_diff(tmp_path):
         assert "+changed" in download.text
         assert (workspace / "sample.txt").read_bytes() == b"original\n"
         assert not host.executor.workspaces
+
+
+@pytest.mark.skipif(os.environ.get("HARNESS_DOCKER_TEST") != "1", reason="explicit Docker smoke")
+async def test_web_managed_coding_edits_and_shell_share_persistent_copy(tmp_path):
+    from test_atomic_tools import ScriptModel
+
+    from deep_harness.runtime.models import LangChainModel
+
+    root = tmp_path / "reference"
+    config = settings(
+        tmp_path, workspaces={"reference": {"path": root, "mode": "sandbox"}},
+        sandbox={"image": "alpine:3.22"},
+    )
+    (root / "sample.txt").write_bytes(b"original\n")
+    command = "test \"$(cat sample.txt)\" = changed"
+    host = InstanceHost(
+        config, tmp_path / "state",
+        model_factory=lambda _: LangChainModel(ScriptModel(calls=[
+            {"name": "edit", "args": {
+                "path": "sample.txt", "old_text": "original", "new_text": "changed",
+            }},
+            {"name": "bash", "args": {"command": command, "purpose": "verify"}},
+        ])),
+    )
+    api = create_web_api(host, None)
+    async with (
+        api.router.lifespan_context(api),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=api), base_url="http://127.0.0.1"
+        ) as client,
+    ):
+        created = await client.post(f"{BASE}/sessions", json={
+            "request_id": "create", "harness": "coding", "verification_command": command,
+        })
+        assert created.status_code == 200, created.text
+        sid = created.json()["id"]
+        submitted = await client.post(f"{BASE}/sessions/{sid}/runs", json={
+            "submission_id": "run", "text": "change the sample and verify",
+        })
+        assert submitted.status_code == 202, submitted.text
+        app = await host.application("reference")
+        run_url = f"{BASE}/runs/{submitted.json()['run_id']}"
+        for tool in ("edit", "bash"):
+            await app.wait_idle()
+            state = (await client.get(f"{BASE}/sessions/{sid}")).json()
+            assert state["approvals"], state["latest_admission"]
+            approval = state["approvals"][0]
+            assert approval["proposal"]["tool_name"] == tool
+            decision = await client.post(
+                f"{run_url}/approvals/{approval['id']}/decision",
+                json={
+                    "decision": "approve", "generation": approval["generation"],
+                    "proposal_hash": approval["proposal_hash"],
+                },
+            )
+            assert decision.status_code == 200, decision.text
+        await app.wait_idle()
+        current = (await client.get(run_url)).json()
+        assert current["status"] == "completed", current
+        evidence = json.loads(current["result"])["execution_evidence"]
+        assert evidence["verification"]["status"] == "passed", evidence
+        assert "+changed" in (await client.get(run_url + "/diff")).text
+        assert (root / "sample.txt").read_bytes() == b"original\n"
+        exported = await client.get(f"{BASE}/sessions/{sid}/bundle")
+        assert exported.status_code == 200, exported.text
+        processes = f"{BASE}/sessions/{sid}/processes"
+        launched = await client.post(processes, json={
+            "request_id": "watch", "command": "cat sample.txt; sleep 30", "lifetime": 35,
+        })
+        assert launched.status_code == 200, launched.text
+        identifier = launched.json()["id"]
+        async with asyncio.timeout(12):
+            while True:
+                observed = (await client.get(processes)).json()[0]
+                if "changed" in observed["stdout"]:
+                    break
+                await asyncio.sleep(.1)
+        assert observed["status"] == "running"
+        stopped = await client.post(f"{processes}/{identifier}/stop", json={})
+        assert stopped.json()["status"] == "stopped"
+
+    from deep_harness.bootstrap import ProjectHost
+    from deep_harness.domain.models import DomainError
+
+    local = ProjectHost(tmp_path / "local-state", root)
+    try:
+        service = await local.application("default")
+        imported = await service.imported_bundle(raw=exported.content)
+        assert imported["verification"]["command"] == command
+        assert "+changed" in imported["diff"] and not imported["files"][0]["conflict"]
+        (root / "sample.txt").write_bytes(b"external edit\n")
+        with pytest.raises(DomainError, match="changed"):
+            await service.imported_bundle(identifier=imported["id"], action="apply")
+        (root / "sample.txt").write_bytes(b"original\n")
+        result = await service.imported_bundle(identifier=imported["id"], action="apply")
+        assert result["status"] == "applied"
+        assert (root / "sample.txt").read_bytes() == b"changed\n"
+        undone = await service.imported_bundle(identifier=imported["id"], action="undo")
+        assert undone["status"] == "undone"
+        assert (root / "sample.txt").read_bytes() == b"original\n"
+    finally:
+        await local.close()

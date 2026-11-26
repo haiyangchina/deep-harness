@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import { createRoot } from 'react-dom/client'
 import { api, HttpError, requestId, upload } from './api'
+import { AddProject, type Workspace } from './projects'
+import { WebProcesses } from './processes'
 import { appendImages, dropImages, ImagePicker, ImageStrip, pasteImages, stageImages } from '../image-input'
 import type { ImageDraft } from '../image-input'
 import './style.css'
@@ -8,12 +10,12 @@ import '../images.css'
 
 declare const __APP_VERSION__: string
 
-type Workspace = { id: string; mode: string }
 type Model = { id: string; label: string; provider: string; model: string; configured: boolean; capabilities: string[] }
-type Agent = { id: string; label: string; workflow: string | null }
+type Agent = { id: string; label: string; harness: string; workflow: string | null }
 type Catalog = {
   default_workspace: string; default_model: string
   workspaces: Workspace[]; models: Model[]; agents: Agent[]
+  local_projects: boolean; project_sandbox: boolean
 }
 type Session = { id: string; prompt: string }
 type Run = { id: string; generation: number; status: string; result: string | null }
@@ -39,7 +41,8 @@ type Job = {
 const labels: Record<string, string> = {
   queued: '排队', started: '运行中', waiting_approval: '等待审批', completed: '完成',
   unknown: '待对账', paused: '已暂停', cancelled: '已取消', blocked: '需要处理',
-  interrupted: '已中断', reconciled: '已对账', running: '运行中', tool: '工具'
+  interrupted: '已中断', reconciled: '已对账', running: '运行中', tool: '工具',
+  job_paused: '已暂停'
 }
 const stateText = (status: string) => labels[status] ?? status
 const short = (value: string) => value.replace(/\s+/g, ' ').slice(0, 48)
@@ -48,6 +51,8 @@ const rootPath = (workspace: string) => `/api/v1/workspaces/${encodeURIComponent
 function Workbench() {
   const [catalog, setCatalog] = useState<Catalog>()
   const [workspace, setWorkspace] = useState('')
+  const workspaceSelection = useRef('')
+  const [addingProject, setAddingProject] = useState(false)
   const [model, setModel] = useState('')
   const [agent, setAgent] = useState('')
   const [harness, setHarness] = useState('general')
@@ -70,6 +75,8 @@ function Workbench() {
   const [ready, setReady] = useState(false)
   const [useFiles, setUseFiles] = useState(true)
   const [useShell, setUseShell] = useState(false)
+  const [verifyCommand, setVerifyCommand] = useState('')
+  const [taskPaused, setTaskPaused] = useState<boolean | null>(null)
   const [evidence, setEvidence] = useState('')
   const [reviewed, setReviewed] = useState<Record<string, string>>({})
   const [lookup, setLookup] = useState<Record<string, unknown>>({})
@@ -98,11 +105,15 @@ function Workbench() {
   }, [session, sessionPath, submissionKey])
   const selectedAgent = catalog?.agents.find(row => row.id === agent)
   const sandbox = catalog?.workspaces.find(row => row.id === workspace)?.mode === 'sandbox'
+  const managedCoding = Boolean(sandbox && (selectedAgent?.harness ?? harness) === 'coding')
 
   useEffect(() => {
     void api<Catalog>('/api/v1/instance').then(data => {
       setCatalog(data)
-      setWorkspace(data.default_workspace)
+      const saved = localStorage.getItem('deep-harness-web:project')
+      const initial = data.workspaces.some(row => row.id === saved) ? saved! : data.default_workspace
+      workspaceSelection.current = initial
+      setWorkspace(initial)
       setModel(data.default_model)
     }).catch(exc => setError(exc.message))
   }, [])
@@ -112,13 +123,16 @@ function Workbench() {
     const [conversations, tasks] = await Promise.all([
       api<{ sessions: Session[] }>(`${base}/sessions`), api<Job[]>(`${base}/jobs`)
     ])
+    if (workspaceSelection.current !== workspace) return
     setSessions(conversations.sessions)
     setJobs(tasks)
   }, [base, workspace])
 
   useEffect(() => {
-    void refreshLists().catch(exc => setError(exc.message))
-  }, [refreshLists])
+    void refreshLists().catch(exc => {
+      if (workspaceSelection.current === workspace) setError(exc.message)
+    })
+  }, [refreshLists, workspace])
 
   useEffect(() => {
     if (!session) return
@@ -168,16 +182,28 @@ function Workbench() {
   }, [session, sessionPath, base])
 
   useEffect(() => {
+    setTaskPaused(null)
+    if (!session || !sandbox) return
+    let active = true
+    void api<{ pause_requested: boolean }>(`${sessionPath}/task-control`).then(value => {
+      if (active) setTaskPaused(value.pause_requested)
+    }).catch(() => {})
+    return () => { active = false }
+  }, [sandbox, session, sessionPath])
+
+  useEffect(() => {
     if (!job?.id) return
     let mounted = true
     const id = job.id
     const refresh = () => void api<Job>(`${base}/jobs/${id}`).then(value => {
-      if (mounted) setJob(value)
-    }).catch(exc => { if (mounted) setError(exc.message) })
+      if (mounted && workspaceSelection.current === workspace) setJob(value)
+    }).catch(exc => {
+      if (mounted && workspaceSelection.current === workspace) setError(exc.message)
+    })
     const timer = setInterval(refresh, 1600)
     refresh()
     return () => { mounted = false; clearInterval(timer) }
-  }, [base, job?.id])
+  }, [base, job?.id, workspace])
 
   function openSession(id: string) {
     setSession(id)
@@ -205,10 +231,11 @@ function Workbench() {
     if (!workspace || !model) return
     const created = await api<Session>(`${base}/sessions`, {
       request_id: requestId(), model_id: model, agent_id: agent || null, harness,
-      tools: agent ? [] : [
+      ...(managedCoding && verifyCommand.trim() ? { verification_command: verifyCommand.trim() } : {}),
+      ...(!agent && !managedCoding ? { tools: [
         ...(useFiles ? ['read', 'list_files', 'search_files'] : []),
         ...(sandbox && useShell && !harness.startsWith('research') ? ['bash'] : [])
-      ],
+      ] } : {}),
     })
     await refreshLists()
     openSession(created.id)
@@ -274,21 +301,46 @@ function Workbench() {
   }
 
   const active = status?.latest_admission
+  let change: { diff: string; diff_truncated: boolean } | undefined
+  if (active?.status === 'completed' && active.result) {
+    try { change = JSON.parse(active.result).execution_evidence?.workspace } catch { /* Plain reply. */ }
+  }
+  const selectProject = (id: string) => {
+    if (workspaceSelection.current === id) return
+    workspaceSelection.current = id
+    localStorage.setItem('deep-harness-web:project', id)
+    openSession('')
+    setWorkspace(id)
+    setSessions([])
+    setJobs([])
+    setJob(undefined)
+    setUseShell(false)
+    setVerifyCommand('')
+    setError('')
+  }
   const pending = status?.active_effects.filter(row => row.status === 'dispatched') ?? []
   const reconcileReady = !!evidence.trim() && pending.every(row => reviewed[row.id])
   return <div className="layout">
     <header className="top">
       <div className="brand"><span className="mark" aria-hidden="true">◈</span> deep-harness <small>v{__APP_VERSION__}</small></div>
       <span className="top-divider" />
-      <label className="workspace">工作目录
-        <select value={workspace} onChange={event => {
-          setWorkspace(event.target.value); openSession(''); setJob(undefined); setUseShell(false); setError('')
-        }}>
-          {catalog?.workspaces.map(row => <option key={row.id} value={row.id}>{row.id}</option>)}
+      <label className="workspace">项目
+        <select value={workspace} disabled={busy} onChange={event => selectProject(event.target.value)}>
+          {catalog?.workspaces.map(row => <option key={row.id} value={row.id}>{row.label || row.id}</option>)}
         </select>
       </label>
+      {catalog?.local_projects && (
+        <button type="button" disabled={busy} onClick={() => setAddingProject(true)}>＋ 新增项目</button>
+      )}
       <span className="connection"><i className={ready ? 'online' : ''} />{session ? (ready ? '实时连接' : '正在连接') : '本地实例'}</span>
     </header>
+    {addingProject && <AddProject sandbox={Boolean(catalog?.project_sandbox)}
+      onClose={() => setAddingProject(false)} onAdd={project => {
+        setCatalog(previous => previous && (previous.workspaces.some(row => row.id === project.id)
+          ? previous : { ...previous, workspaces: [...previous.workspaces, project] }))
+        selectProject(project.id)
+        setAddingProject(false)
+      }} />}
     <aside className="sidebar">
       <div className="switch">
         <button className={tab === 'sessions' ? 'selected' : ''} onClick={() => setTab('sessions')}>会话</button>
@@ -326,6 +378,12 @@ function Workbench() {
       </section> : session ? <>
         <div className="thread-head"><div><h1>会话</h1><small>{status?.model_id || '—'} · {status?.vision === false ? '仅文字' : '图文'} · {workspace}</small></div>
           {active && <span className="pill">{stateText(active.status)}</span>}
+          {taskPaused !== null && <button disabled={busy} onClick={() => void perform(async () => {
+            const value = await api<{ pause_requested: boolean }>(`${sessionPath}/task-control`, {
+              action: taskPaused ? 'resume' : 'pause'
+            })
+            setTaskPaused(value.pause_requested)
+          })}>{taskPaused ? '继续任务' : '暂停任务'}</button>}
           {active && ['queued', 'started', 'waiting_approval'].includes(active.status) &&
             <button disabled={busy} onClick={() => void perform(async () => {
               await api(`${base}/runs/${active.id}/cancel`, {})
@@ -352,6 +410,14 @@ function Workbench() {
             <div className="actions"><button className="primary" disabled={busy} onClick={() => void perform(() => decide(approval, 'approve'))}>批准</button>
               <button disabled={busy} onClick={() => void perform(() => decide(approval, 'deny'))}>拒绝</button></div>
           </article>)}
+          {change && <details className="artifacts">
+            <summary>工作区差异</summary>
+            {change.diff_truncated && <p>文本差异仅显示可捕获部分。</p>}
+            <pre>{change.diff}</pre>
+            <a href={`${base}/runs/${active!.id}/diff`}>下载 diff</a>
+            <a href={`${sessionPath}/bundle`}>下载任务变更包</a>
+          </details>}
+          {sandbox && taskPaused !== null && <WebProcesses key={sessionPath} sessionPath={sessionPath} />}
           {active?.status === 'unknown' && <article className="notice">
             <h2>执行结果待对账</h2>
             <p>{active.result}</p>
@@ -424,10 +490,14 @@ function Workbench() {
           <option value="research_web">联网研究</option>
           <option value="coding">编码</option>
         </select></label>}
-        {!agent && <div className="checks">
+        {!agent && !managedCoding && <div className="checks">
           <label><input type="checkbox" checked={useFiles} onChange={event => setUseFiles(event.target.checked)} /> 工作目录只读工具</label>
           {sandbox && !harness.startsWith('research') && <label><input type="checkbox" checked={useShell} onChange={event => setUseShell(event.target.checked)} /> 隔离命令执行</label>}
         </div>}
+        {managedCoding && <label>验收命令（可选）
+          <input value={verifyCommand} maxLength={4096} disabled={busy}
+            onChange={event => setVerifyCommand(event.target.value)} />
+        </label>}
         {selectedAgent?.workflow && <textarea aria-label="工作流目标" placeholder="工作流目标" value={input} onChange={event => setInput(event.target.value)} />}
         <div className="actions"><button className="primary" disabled={busy || !catalog} onClick={() => void perform(create)}>创建会话</button>
           {selectedAgent?.workflow && <button disabled={busy || !input.trim()} onClick={() => void perform(startJob)}>运行工作流</button>}</div>

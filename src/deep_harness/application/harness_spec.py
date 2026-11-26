@@ -24,7 +24,9 @@ class HarnessSpec:
 
 SPECS: dict[Harness, HarnessSpec] = {
     "general": HarnessSpec(key="general", read_only=False, subagents=(), report=False),
-    "coding": HarnessSpec(key="coding", read_only=False, subagents=("coding",), report=True),
+    "coding": HarnessSpec(
+        key="coding", read_only=False, subagents=("research", "coding", "review"), report=True
+    ),
     "research": HarnessSpec(key="research", read_only=True, subagents=("research",), report=True),
     "research_web": HarnessSpec(
         key="research_web", read_only=True, subagents=("research",), report=True

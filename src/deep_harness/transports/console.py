@@ -3,6 +3,7 @@
 import asyncio
 import json
 import shlex
+import sys
 from dataclasses import asdict
 from hashlib import sha256
 from pathlib import Path
@@ -12,6 +13,7 @@ from deep_harness.application.capabilities import derive_grants
 from deep_harness.application.workspace import PROJECT_PROMPT
 from deep_harness.domain.images import MAX_IMAGE_BYTES, MAX_IMAGES
 from deep_harness.domain.models import DomainError
+from deep_harness.infrastructure.change_bundles import MAX_BUNDLE_BYTES
 from deep_harness.runtime.inference import usage_totals
 from deep_harness.server_config import number
 
@@ -29,6 +31,8 @@ async def select_session(app, args):
             or args.mcp_tool
             or args.permission_mode
             or args.read_only
+            or args.workspace_mode
+            or args.verify_command
         ):
             raise DomainError("immutable_grants", "Existing session tool grants cannot be changed")
         session = await app.store.get_session(args.session, "operator")
@@ -42,7 +46,9 @@ async def select_session(app, args):
         or args.mcp_tool
     ):
         raise DomainError("immutable_grants", "--read-only cannot be combined with extra grants")
-    harness = args.harness or "general"
+    harness = args.harness or (
+        "coding" if not args.read_only and hasattr(app.model, "model") else "general"
+    )
     extensions = []
     if args.allow_patch:
         extensions.append("apply_patch")
@@ -63,6 +69,9 @@ async def select_session(app, args):
         harness=harness,
         permission_mode=args.permission_mode or "ask",
         full_access_acknowledged=args.acknowledge_full_access,
+        workspace_mode=(args.workspace_mode or "auto") if harness == "coding" and not args.read_only
+        else args.workspace_mode,
+        verification_command=args.verify_command,
     )
 
 
@@ -196,6 +205,64 @@ async def inspect_session(app, args):
     if args.messages:
         snapshot["messages"] = await app.store.history(args.session)
     display(snapshot)
+    return 0
+
+
+async def coding_diff(app, args):
+    await app.store.get_session(args.session, "operator")
+    admission = await app.store.get_admission(args.admission, args.session)
+    if admission.status == "completed":
+        try:
+            workspace = json.loads(admission.result)["execution_evidence"]["workspace"]
+        except (TypeError, ValueError, KeyError):
+            workspace = None
+        if workspace and workspace["status"] != "unavailable":
+            # A redirected Windows stdout must preserve LF even for a CRLF source diff.
+            sys.stdout.buffer.write(workspace["diff"].encode("utf-8"))
+            if workspace["status"] != "observed" or workspace["diff_truncated"]:
+                print("The saved worktree diff is partial.", file=sys.stderr)
+            return 0
+    raise DomainError("diff_unavailable", "This coding turn has no saved worktree diff")
+
+
+async def deliver(app, args):
+    display(await app.deliver(args.session, args.action, args.revision, args.change_set_id))
+    return 0
+
+
+async def change_bundle(app, args):
+    if args.action == "import":
+        try:
+            raw = await asyncio.to_thread(read_bundle_file, args.file_or_id)
+        except OSError as exc:
+            raise DomainError("bundle_invalid", "Cannot read the change package") from exc
+        result = await app.imported_bundle(raw=raw)
+    else:
+        action = None if args.action == "inspect" else args.action
+        result = await app.imported_bundle(identifier=args.file_or_id, action=action)
+    display(result)
+    return 0
+
+
+def read_bundle_file(name):
+    with Path(name).open("rb") as source:
+        return source.read(MAX_BUNDLE_BYTES + 1)
+
+
+async def development_process(app, args):
+    start = None
+    if args.process_command:
+        start = {
+            "command": args.process_command, "request_id": args.request_id,
+            "cwd": args.cwd, "lifetime": args.lifetime,
+        }
+    result = await app.development_processes(args.session, start=start, stop=args.stop)
+    if start:
+        while result["status"] == "running":
+            await asyncio.sleep(0.5)
+            rows = await app.development_processes(args.session)
+            result = next(row for row in rows if row["id"] == result["id"])
+    display(result)
     return 0
 
 
@@ -334,6 +401,10 @@ COMMANDS = {
     "permissions": permissions,
     "sessions": list_sessions,
     "inspect": inspect_session,
+    "diff": coding_diff,
+    "delivery": deliver,
+    "bundle": change_bundle,
+    "process": development_process,
     "history": history,
     "search": search,
     "skill-add": skill_add,

@@ -3,7 +3,7 @@
 import json
 
 COMMANDS = {"bash"}
-FILE_MUTATIONS = {"edit", "write", "apply_patch"}
+FILE_MUTATIONS = {"edit", "write", "apply_patch", "merge_delegations"}
 
 
 def coding_evidence(messages):
@@ -38,7 +38,9 @@ def coding_evidence(messages):
                 }
             )
             continue
-        changes = result.get("files", []) if name == "apply_patch" else [result]
+        changes = result.get("files", []) if name in {"apply_patch", "merge_delegations"} else [
+            result
+        ]
         for change in changes:
             if not isinstance(change.get("path"), str) or not change.get("sha256"):
                 continue

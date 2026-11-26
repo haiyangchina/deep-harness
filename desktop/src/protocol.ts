@@ -10,7 +10,10 @@ export interface RuntimeInfo {
   ready: boolean
   settings: Settings
   error?: string
+  projects?: DesktopProject[]
+  projectId?: string
 }
+export interface DesktopProject { id: string; name: string; workspace: string; profile: string }
 export interface ApiRequest {
   method: 'GET' | 'POST' | 'DELETE'
   path: string
@@ -21,6 +24,7 @@ export interface DesktopBridge {
   info(): Promise<RuntimeInfo>
   start(settings: Settings): Promise<RuntimeInfo>
   stop(): Promise<RuntimeInfo>
+  openProject(id: string | null): Promise<RuntimeInfo>
   choose(kind: 'python' | 'workspace' | 'stateDir' | 'configFile'): Promise<string | null>
   request<T = unknown>(request: ApiRequest): Promise<T>
 }

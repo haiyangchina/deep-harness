@@ -16,7 +16,7 @@ from deep_harness.application.capabilities import manifest
 from deep_harness.application.jobs import CreateJob, JobBudget
 from deep_harness.application.workspace import PROJECT_PROMPT
 from deep_harness.domain.images import MAX_IMAGES
-from deep_harness.domain.models import DomainError, Harness
+from deep_harness.domain.models import DomainError, Harness, WorkspaceMode
 from deep_harness.runtime.inference import usage_totals
 from deep_harness.server_config import number
 from deep_harness.transports.events import stream_events
@@ -36,6 +36,8 @@ class CreateSession(RequestModel):
     extensions: tuple[str, ...] = ()
     mcp_tools: tuple[str, ...] = ()
     risk_acknowledged: bool = False
+    workspace_mode: WorkspaceMode | None = None
+    verification_command: str | None = Field(default=None, min_length=1, max_length=4096)
 
 
 class ChangePermissions(RequestModel):
@@ -150,6 +152,8 @@ def create_api(host, token: str) -> FastAPI:
             extensions=body.extensions,
             mcp_tools=body.mcp_tools,
             full_access_acknowledged=body.risk_acknowledged,
+            workspace_mode=body.workspace_mode,
+            verification_command=body.verification_command,
         )
         return asdict(session)
 

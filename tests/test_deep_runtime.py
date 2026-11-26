@@ -318,7 +318,7 @@ async def test_coding_specialist_write_waits_for_approval_and_survives_restart(t
     try:
         app = await host.application("deep")
         session = await app.create_session(
-            "create", "frozen", ("delegate_task", "write"), engine="deep"
+            "create", "frozen", ("delegate_task", "write"), engine="deep", harness="coding"
         )
         admission = await app.submit(session.id, "send", "delegate write")
         await app.wait_idle()
@@ -335,6 +335,10 @@ async def test_coding_specialist_write_waits_for_approval_and_survives_restart(t
         completed = await app.store.get_admission(admission.id, session.id)
         assert completed.status == "completed"
         assert (tmp_path / "c.txt").read_text() == "from child"
+        evidence = json.loads(completed.result)["execution_evidence"]
+        assert evidence["delegations"][0]["status"] == "completed"
+        assert evidence["workspace"]["files"][0]["path"] == "c.txt"
+        assert "+from child" in evidence["workspace"]["diff"]
         assert [row["role"] for row in await app.store.history(session.id)] == [
             "user",
             "assistant",

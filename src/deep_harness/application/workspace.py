@@ -12,14 +12,19 @@ from pydantic import BaseModel, ConfigDict, Field
 from deep_harness.application.capabilities import CORE_TOOLS, READ_ONLY_CORE
 from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import DomainError
+from deep_harness.infrastructure.git_workspace import visible_git_paths
 from deep_harness.server_config import number, setting
 
 READ_TOOLS = READ_ONLY_CORE
 MUTATING_TOOLS = frozenset(set(CORE_TOOLS) - set(READ_ONLY_CORE)) | {
     "save_memory",
     "apply_patch",
+    "merge_delegations",
 }
-CODING_TOOLS = frozenset({*CORE_TOOLS, "apply_patch"})
+CODING_RESEARCH_TOOLS = frozenset({
+    "read", "list_files", "search_files", "project_instructions", "symbols", "code_navigation",
+})
+CODING_TOOLS = frozenset({*CORE_TOOLS, *CODING_RESEARCH_TOOLS, "apply_patch"})
 PROJECT_PROMPT = (
     "You are deep-harness, a careful coding and project analysis assistant. "
     "For project questions, inspect the configured workspace with list_files, then read "
@@ -61,12 +66,55 @@ class SearchFilesArgs(ListFilesArgs):
     cursor: str | None = Field(default=None, max_length=32768)
 
 
+class ProjectInstructionsArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    path: str = Field(min_length=1, max_length=4096)
+
+
+def project_instructions(arguments, workspace, workspace_path):
+    target = workspace_path(arguments.path)
+    if not target.is_relative_to(workspace):
+        raise DomainError("path_denied", "Project instructions require a workspace path")
+    directory = target if target.is_dir() else target.parent
+    parents = [directory]
+    while directory != workspace:
+        directory = directory.parent
+        parents.append(directory)
+    files = []
+    remaining = 24_000
+    incomplete = False
+    for parent in reversed(parents):
+        path = parent / "AGENTS.md"
+        if not path.is_file():
+            continue
+        name = path.relative_to(workspace).as_posix()
+        if workspace_path(name) != path or path.is_symlink():
+            raise DomainError(
+                "path_denied", "Project instruction files must stay in their directory"
+            )
+        with path.open("rb") as stream:
+            data = stream.read(remaining + 1)
+        if len(data) > remaining:
+            incomplete = True
+            break
+        try:
+            text = data.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise DomainError("text_encoding", "Project instructions must be UTF-8") from exc
+        files.append(
+            {"path": name, "scope": parent.relative_to(workspace).as_posix(), "text": text}
+        )
+        remaining -= len(data)
+    return {"files": files, "incomplete": incomplete}
+
+
 def workspace_files(arguments, workspace_path, candidate_path=None):
     root = workspace_path(arguments.path)
     candidate_path = candidate_path or workspace_path
     workspace = workspace_path(".")
     if not root.is_dir():
         raise DomainError("not_directory", "Choose a workspace directory")
+    git_files, git_dirs = git_visibility(root, workspace)
     visited = 0
     for directory, dirs, files in os.walk(root, followlinks=False):
         visited += 1
@@ -76,7 +124,10 @@ def workspace_files(arguments, workspace_path, candidate_path=None):
         allowed = []
         for name in sorted(dirs):
             child = Path(directory) / name
-            if name in SKIP_DIRECTORIES or child.is_symlink() or child.is_junction():
+            if (
+                name in SKIP_DIRECTORIES or child.is_symlink() or child.is_junction()
+                or (git_dirs is not None and child not in git_dirs)
+            ):
                 continue
             try:
                 candidate_path(display_path(child, workspace))
@@ -90,8 +141,10 @@ def workspace_files(arguments, workspace_path, candidate_path=None):
                 yield None
                 return
             file = Path(directory) / name
-            if file.is_symlink() or not fnmatch.fnmatch(
-                file.relative_to(root).as_posix(), arguments.pattern
+            if (
+                (git_files is not None and file not in git_files)
+                or file.is_symlink()
+                or not fnmatch.fnmatch(file.relative_to(root).as_posix(), arguments.pattern)
             ):
                 continue
             relative = display_path(file, workspace)
@@ -121,7 +174,17 @@ def list_files(arguments, workspace_path, candidate_path=None):
     return {"files": paths, "truncated": False}
 
 
-def search_entries(directory, prefix, after, candidate_path, workspace):
+def git_visibility(root, boundary):
+    files = visible_git_paths(root, boundary=boundary) if root.is_relative_to(boundary) else None
+    if files is None:
+        return None, None
+    directories = {
+        parent for file in files for parent in file.parents if parent.is_relative_to(root)
+    }
+    return files, directories
+
+
+def search_entries(directory, prefix, after, candidate_path, workspace, visibility):
     try:
         with os.scandir(directory) as stream:
             entries = sorted(stream, key=lambda entry: entry.name)
@@ -139,6 +202,9 @@ def search_entries(directory, prefix, after, candidate_path, workspace):
         is_directory = entry.is_dir(follow_symlinks=False)
         if is_directory and (entry.name in SKIP_DIRECTORIES or path.is_junction()):
             continue
+        visible = visibility[1 if is_directory else 0]
+        if visible is not None and path not in visible:
+            continue
         relative = display_path(path, workspace)
         try:
             candidate_path(relative)
@@ -146,7 +212,7 @@ def search_entries(directory, prefix, after, candidate_path, workspace):
             continue
         yield position, relative, is_directory
         if is_directory:
-            yield from search_entries(path, position, after, candidate_path, workspace)
+            yield from search_entries(path, position, after, candidate_path, workspace, visibility)
 
 
 def search_files(arguments, workspace_path, candidate_path=None):
@@ -188,7 +254,10 @@ def search_files(arguments, workspace_path, candidate_path=None):
         }
 
     workspace = workspace_path(".")
-    for current, path, directory in search_entries(root, (), position, candidate_path, workspace):
+    entries = search_entries(
+        root, (), position, candidate_path, workspace, git_visibility(root, workspace)
+    )
+    for current, path, directory in entries:
         # Ancestor directories are visited only to reach the continuation point.
         if current < position:
             continue

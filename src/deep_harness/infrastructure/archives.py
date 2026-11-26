@@ -50,6 +50,11 @@ def create_archive(scope, destination):
             files[name] = staging / name
         for path in scope.home.rglob("*"):
             relative = path.relative_to(scope.home)
+            if (
+                len(relative.parts) >= 3 and relative.parts[0] == "coding-tasks"
+                and relative.parts[2] == "tree"
+            ):
+                continue
             if path.is_symlink():
                 raise DomainError("archive_symlink", "Profile archives refuse symbolic links")
             if not path.is_file() or relative.parts[0] == "backups":

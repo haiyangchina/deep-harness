@@ -1,6 +1,7 @@
 """Operator-owned configuration for one browser-accessible Harness instance."""
 
 import re
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
@@ -13,6 +14,13 @@ from deep_harness.server_config import number
 
 Identifier = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$")]
 Capability = Literal["text", "streaming", "tool_calls", "structured_output", "vision"]
+
+
+def is_loopback(value):
+    try:
+        return value == "localhost" or ip_address(value).is_loopback
+    except ValueError:
+        return False
 
 
 class Settings(BaseModel):
@@ -40,6 +48,10 @@ class WebSettings(Settings):
     port: int = Field(default=8765, ge=1, le=65535)
     trusted_hosts: tuple[str, ...] = ("127.0.0.1", "localhost")
     public_origin: str = "http://127.0.0.1:8765"
+
+    @property
+    def local_projects(self):
+        return is_loopback(self.host) and is_loopback(urlsplit(self.public_origin).hostname or "")
 
     @model_validator(mode="after")
     def validate_boundary(self):

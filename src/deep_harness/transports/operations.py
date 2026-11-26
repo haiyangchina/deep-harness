@@ -1,12 +1,14 @@
 """Authenticated lifecycle, reconciliation and backup operations."""
 
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends
+from fastapi import Path as ApiPath
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, ConfigDict, Field
 
+from deep_harness.infrastructure.change_bundles import MAX_BUNDLE_BYTES
 from deep_harness.server_config import number
 
 
@@ -32,6 +34,31 @@ class ArchivePath(Request):
     path: str = Field(min_length=1, max_length=number("archives.path_max_length"))
 
 
+class DeliveryCommand(Request):
+    action: Literal["apply", "undo", "discard", "reconcile"]
+    revision: str = Field(pattern=r"^[a-f0-9]{64}$")
+    change_set_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+
+
+class BundleInput(Request):
+    package: str = Field(min_length=1, max_length=MAX_BUNDLE_BYTES)
+
+
+class BundleAction(Request):
+    action: Literal["apply", "undo", "reconcile"]
+
+
+class TaskControl(Request):
+    action: Literal["pause", "resume"]
+
+
+class DevelopmentCommand(Request):
+    request_id: str = Field(min_length=1, max_length=128)
+    command: str = Field(min_length=1, max_length=number("shell.command_max_length"))
+    cwd: str = Field(default=".", min_length=1, max_length=4096)
+    lifetime: float = Field(default=3600, ge=1, le=86400)
+
+
 class SkillDocument(Request):
     document: str = Field(min_length=1, max_length=number("skills.document_max_length"))
 
@@ -46,6 +73,59 @@ class CandidateDecision(Request):
 
 def operations_router(host, authenticate):
     router = APIRouter(dependencies=[Depends(authenticate)])
+
+    @router.get("/profiles/{profile_id}/sessions/{session_id}/delivery")
+    async def preview_delivery(profile_id: str, session_id: str):
+        app = await host.application(profile_id)
+        return await app.deliver(session_id)
+
+    @router.get("/profiles/{profile_id}/sessions/{session_id}/task-control")
+    async def task_state(profile_id: str, session_id: str):
+        app = await host.application(profile_id)
+        return await app.task_control(session_id)
+
+    @router.post("/profiles/{profile_id}/sessions/{session_id}/task-control")
+    async def task_command(profile_id: str, session_id: str, body: TaskControl):
+        app = await host.application(profile_id)
+        return await app.task_control(session_id, body.action)
+
+    @router.post("/profiles/{profile_id}/sessions/{session_id}/delivery")
+    async def deliver(profile_id: str, session_id: str, body: DeliveryCommand):
+        app = await host.application(profile_id)
+        return await app.deliver(session_id, body.action, body.revision, body.change_set_id)
+
+    @router.post("/profiles/{profile_id}/bundles")
+    async def import_bundle(profile_id: str, body: BundleInput):
+        app = await host.application(profile_id)
+        return await app.imported_bundle(raw=body.package.encode("utf-8"))
+
+    @router.get("/profiles/{profile_id}/bundles/{identifier}")
+    async def inspect_bundle(profile_id: str, identifier: str):
+        app = await host.application(profile_id)
+        return await app.imported_bundle(identifier=identifier)
+
+    @router.post("/profiles/{profile_id}/bundles/{identifier}")
+    async def apply_bundle(profile_id: str, identifier: str, body: BundleAction):
+        app = await host.application(profile_id)
+        return await app.imported_bundle(identifier=identifier, action=body.action)
+
+    @router.get("/profiles/{profile_id}/sessions/{session_id}/processes")
+    async def processes(profile_id: str, session_id: str):
+        app = await host.application(profile_id)
+        return await app.development_processes(session_id)
+
+    @router.post("/profiles/{profile_id}/sessions/{session_id}/processes")
+    async def start_process(profile_id: str, session_id: str, body: DevelopmentCommand):
+        app = await host.application(profile_id)
+        return await app.development_processes(session_id, start=body.model_dump())
+
+    @router.post("/profiles/{profile_id}/sessions/{session_id}/processes/{process_id}/stop")
+    async def stop_process(
+        profile_id: str, session_id: str,
+        process_id: Annotated[str, ApiPath(pattern=r"^[a-f0-9]{64}$")],
+    ):
+        app = await host.application(profile_id)
+        return await app.development_processes(session_id, stop=process_id)
 
     @router.post("/profiles/{profile_id}/sessions/{session_id}/admissions/{admission_id}/cancel")
     async def cancel(profile_id: str, session_id: str, admission_id: str):

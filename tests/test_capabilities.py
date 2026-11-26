@@ -77,14 +77,17 @@ def test_workspace_constants_are_derived():
     assert not set(WEB_TOOLS) & MUTATING_TOOLS
     assert set(READ_TOOLS) == set(READ_ONLY_CORE)
     assert {"write", "edit", "bash", "apply_patch"} <= MUTATING_TOOLS
-    assert set(CORE_TOOLS) | {"apply_patch"} == set(CODING_TOOLS)
+    assert set(CORE_TOOLS) | {
+        "apply_patch", "project_instructions", "symbols", "code_navigation",
+    } == set(CODING_TOOLS)
 
 
 @pytest.mark.parametrize(
     "harness,expected",
     [
         ("general", CORE_TOOLS),
-        ("coding", CORE_TOOLS),
+        ("coding", (*CORE_TOOLS, "apply_patch", "project_instructions", "symbols",
+                    "delegate_task", "check_delegation", "merge_delegations", "code_navigation")),
         ("research", READ_ONLY_CORE),
         ("research_web", READ_ONLY_CORE),
     ],

@@ -1,7 +1,11 @@
 """Regression coverage for coding tool boundaries and durable completion."""
 
+import asyncio
 import hashlib
 import json
+import shutil
+import subprocess
+import sys
 
 import pytest
 from sqlalchemy import update
@@ -232,5 +236,107 @@ async def test_job_accepts_final_verifier_after_failed_baseline_and_write(tmp_pa
         verification = result["stages"][0]["verification"]
         assert verification["exit_code"] == 0
         assert verification["files"][0]["path"] == "result.txt"
+    finally:
+        await host.close()
+
+
+@pytest.mark.parametrize("last_edit,expected", [(False, "passed"), (True, "stale")])
+async def test_coding_diff_includes_shell_and_binds_verification_to_worktree(
+    tmp_path, last_edit, expected
+):
+    if shutil.which("git") is None:
+        pytest.skip("Git is required for the dirty-worktree fixture")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    await asyncio.to_thread(subprocess.run, ["git", "init", "-q", str(workspace)], check=True)
+    (workspace / ".gitignore").write_text("*.generated\n", encoding="utf-8")
+    (workspace / "existing.txt").write_bytes(b"operator's dirty worktree\n")
+    (workspace / "remove.txt").write_bytes(b"remove this\n")
+    await asyncio.to_thread(
+        subprocess.run,
+        ["git", "-C", str(workspace), "add", "existing.txt", "remove.txt"],
+        check=True,
+    )
+    (workspace / "existing.txt").write_bytes(b"new operator edits not staged\n")
+    calls = [
+        {"name": "apply_patch", "args": {"files": [{
+            "path": "remove.txt",
+            "expected_sha256": hashlib.sha256(b"remove this\n").hexdigest(),
+            "diff": "--- a/remove.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-remove this\n",
+        }]}},
+        {"name": "bash", "args": {
+            "command": "echo changed > shell.txt\necho ignored > cache.generated",
+        }},
+        {"name": "bash", "args": {"command": "echo verified", "purpose": "verify"}},
+    ]
+    if last_edit:
+        calls.append({"name": "write", "args": {"path": "late.txt", "content": "late"}})
+    host = ProjectHost(
+        tmp_path / "state", workspace, lambda _: LangChainModel(ScriptModel(calls=calls))
+    )
+    try:
+        app = await host.application("one")
+        session = await app.create_session(
+            "create", "Code", engine="deep", harness="coding",
+            permission_mode="full", full_access_acknowledged=True,
+        )
+        admission = await app.submit(session.id, "run", "Make the change")
+        await app.wait_idle()
+        done = await app.store.get_admission(admission.id, session.id)
+        assert done.status == "completed"
+        evidence = json.loads(done.result)["execution_evidence"]
+        changes = {row["path"]: row["status"] for row in evidence["workspace"]["files"]}
+        assert changes == {
+            "remove.txt": "deleted", "shell.txt": "added",
+            **({"late.txt": "added"} if last_edit else {}),
+        }
+        assert "-remove this" in evidence["workspace"]["diff"]
+        assert evidence["verification"]["status"] == expected
+        events = await app.store.event_history(session.id, run_id=admission.id)
+        assert any(
+            row["type"] == "coding.command_output" and "verified" in row["payload"]["content"]
+            for row in events
+        )
+        assert (workspace / "existing.txt").read_bytes() == b"new operator edits not staged\n"
+    finally:
+        await host.close()
+    if not last_edit:
+        result = await asyncio.to_thread(
+            subprocess.run,
+            [
+                sys.executable, "-m", "deep_harness.cli",
+                "--provider", "diagnostic",
+                "--state-dir", str(tmp_path / "state"),
+                "--workspace", str(workspace), "--profile", "one",
+                "diff", session.id, admission.id,
+            ],
+            capture_output=True,
+            check=True,
+        )
+        assert b"-remove this" in result.stdout
+
+
+async def test_project_instructions_wait_for_approval_and_follow_ancestor_order(tmp_path):
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "AGENTS.md").write_text("root guidance", encoding="utf-8")
+    (tmp_path / "pkg" / "AGENTS.md").write_text("package guidance", encoding="utf-8")
+    calls = [{"name": "project_instructions", "args": {"path": "pkg/new.py"}}]
+    host = ProjectHost(
+        tmp_path / "state", tmp_path, lambda _: LangChainModel(ScriptModel(calls=calls))
+    )
+    try:
+        app = await host.application("one")
+        session = await app.create_session("create", "Code", engine="deep", harness="coding")
+        admission = await app.submit(session.id, "run", "Read the project guides")
+        await app.wait_idle()
+        pending = (await app.sessions.status(session.id))["approvals"][0]
+        assert pending["proposal"]["scope_key"] == "sensitive:path"
+        await app.approve(session.id, pending["id"], pending["generation"], "approve")
+        await app.wait_idle()
+        history = await app.store.history(session.id, admission_id=admission.id)
+        evidence = json.loads(next(row["content"] for row in history if row["role"] == "tool"))
+        assert [(item["scope"], item["text"]) for item in evidence["files"]] == [
+            (".", "root guidance"), ("pkg", "package guidance"),
+        ]
     finally:
         await host.close()

@@ -27,6 +27,11 @@ class ModelSettings(BaseModel):
     # an empty final answer while the provider still bills output tokens. Keep
     # reasoning off by default; set `reasoning = true` in [model] to opt in.
     reasoning: bool = False
+    # Ollama unloads an idle model after ~5 minutes, so each later request pays
+    # a multi-second reload. ChatOllama forwards keep_alive to /api/chat; keep
+    # the local model resident between turns. Accepts durations like "30m" or
+    # -1 (keep forever). Performance-only: excluded from the model revision.
+    keep_alive: int | str | None = None
 
 
 class ExecutionSettings(BaseModel):

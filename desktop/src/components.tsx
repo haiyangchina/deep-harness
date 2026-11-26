@@ -25,7 +25,7 @@ export function Setup({ onClose }: { onClose?: () => void }) {
       <p className="muted">本机运行，直接使用。默认 Ollama · qwen3.5:9b，无需桌面账号。</p>
       {runtime?.ready && (
         <p className="notice">
-          当前配置已绑定运行中的后端。更换工作区请使用新 Profile 或状态目录。
+          当前配置已绑定运行中的后端。可在侧边栏选择项目或新增项目。
           <br />
           <button
             type="button"
@@ -137,6 +137,8 @@ interface CreateRequest {
   extensions?: string[]
   permission_mode: PermissionMode
   risk_acknowledged?: boolean
+  workspace_mode?: string
+  verification_command?: string
 }
 
 export function CreateSession({ close }: { close: () => void }) {
@@ -144,7 +146,9 @@ export function CreateSession({ close }: { close: () => void }) {
     const raw = localStorage.getItem(storageKey('create'))
     return raw ? JSON.parse(raw) : null
   })
-  const [harness, setHarness] = useState(saved?.harness ?? 'general')
+  const [harness, setHarness] = useState(saved?.harness ?? 'coding')
+  const [workspaceMode, setWorkspaceMode] = useState(saved?.workspace_mode ?? 'auto')
+  const [verification, setVerification] = useState(saved?.verification_command ?? '')
   const [permissionMode, setPermissionMode] = useState<PermissionMode>(saved ? saved.permission_mode : 'ask')
   const [extensions, setExtensions] = useState<string[]>(saved?.extensions ?? [])
   const [showExtensions, setShowExtensions] = useState(Boolean(saved?.extensions?.length))
@@ -161,6 +165,7 @@ export function CreateSession({ close }: { close: () => void }) {
   ] as const
   const visibleExtensions = extensionOptions.filter(
     ([tool]) =>
+      !(harness === 'coding' && (tool === 'apply_patch' || tool === 'delegate_task')) &&
       !((harness === 'research' || harness === 'research_web') && (tool === 'save_memory' || tool === 'apply_patch'))
   )
   return (
@@ -186,6 +191,23 @@ export function CreateSession({ close }: { close: () => void }) {
             <option value="research_web">联网深度研究</option>
           </select>
         </label>
+        {harness === 'coding' && (
+          <>
+            <label className="field">任务工作区
+              <select value={workspaceMode} onChange={event => setWorkspaceMode(event.target.value)}
+                disabled={busy || Boolean(saved)}>
+                <option value="auto">自动隔离</option>
+                <option value="worktree">Git 工作树（从当前提交）</option>
+                <option value="copy">隔离副本（带入当前文件）</option>
+                <option value="in_place">原地修改项目</option>
+              </select>
+            </label>
+            <label className="field">验收命令（可选）
+              <input value={verification} maxLength={4096}
+                disabled={busy || Boolean(saved)} onChange={event => setVerification(event.target.value)} />
+            </label>
+          </>
+        )}
         <p className="muted small">单一执行内核由任务类型自动派生，无需选择引擎。选择 Agent 如何申请批准，批准模式可在空闲时切换，内置能力默认启用。</p>
         <PermissionPicker value={permissionMode} direction="down" disabled={busy || Boolean(saved)} onChange={setPermissionMode} />
         <p className="muted small">内置能力默认授予，无需勾选；除完全访问外，文件操作、终端命令与访问互联网逐次确认。</p>
@@ -228,6 +250,8 @@ export function CreateSession({ close }: { close: () => void }) {
                   request_id: requestId,
                   harness,
                   permission_mode: permissionMode,
+                  ...(harness === 'coding' ? { workspace_mode: workspaceMode,
+                    ...(verification.trim() ? { verification_command: verification.trim() } : {}) } : {}),
                   extensions: extensions.filter(tool =>
                     visibleExtensions.some(([name]) => name === tool)
                   )

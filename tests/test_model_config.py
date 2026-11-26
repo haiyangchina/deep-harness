@@ -51,6 +51,36 @@ def test_reasoning_defaults_off_and_is_explicitly_opt_in(tmp_path):
     assert load_model_settings(path).reasoning is True
 
 
+def test_ollama_keep_alive_defaults_and_overrides(tmp_path):
+    from deep_harness.runtime.models import ollama_model
+
+    assert load_model_settings().keep_alive == "30m"
+    model = ollama_model(model="test", base_url="http://127.0.0.1:11434")
+    assert model.model.keep_alive == "30m"
+    path = tmp_path / "model.toml"
+    path.write_text('[model]\nkeep_alive = "-1"\n', encoding="utf-8")
+    assert load_model_settings(path).keep_alive == "-1"
+    custom = ollama_model(
+        model="test", base_url="http://127.0.0.1:11434", keep_alive=600
+    )
+    assert custom.model.keep_alive == 600
+
+
+def test_keep_alive_does_not_change_model_revision(tmp_path):
+    from deep_harness.runtime.model_factory import CatalogEntry, ModelCatalog
+
+    def catalog(settings):
+        entry = CatalogEntry(
+            label="local", settings=settings, secret_env=None, capabilities=frozenset()
+        )
+        return ModelCatalog({"local": entry}, "local")
+
+    baseline = catalog(load_model_settings()).revision("local")
+    path = tmp_path / "model.toml"
+    path.write_text('[model]\nkeep_alive = "2h"\n', encoding="utf-8")
+    assert catalog(load_model_settings(path)).revision("local") == baseline
+
+
 async def test_offline_diagnostic_remains_an_explicit_opt_in(tmp_path):
     host = build_host(arguments(tmp_path, "--provider", "diagnostic"))
     try:

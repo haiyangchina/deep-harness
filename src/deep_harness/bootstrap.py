@@ -1,6 +1,7 @@
 """Composition root: one owner per profile, persistent checkpoints, request-independent work."""
 
 import asyncio
+import json
 import logging
 import time
 from contextlib import AsyncExitStack, nullcontext
@@ -18,18 +19,26 @@ from deep_harness.application.capabilities import (
 )
 from deep_harness.application.config import ExecutionSettings
 from deep_harness.application.curation import CurationService, auto_curation_enabled
+from deep_harness.application.development_processes import DevelopmentProcesses
 from deep_harness.application.jobs import JobService
 from deep_harness.application.lifecycle import drain_tasks, mutation
 from deep_harness.application.scopes import ProfileResolver
 from deep_harness.application.session_runtime import SessionRuntime
 from deep_harness.application.tools import TOOL_ARGUMENTS
-from deep_harness.application.workspace import CODING_TOOLS, MUTATING_TOOLS, READ_TOOLS
+from deep_harness.application.workspace import (
+    CODING_RESEARCH_TOOLS,
+    CODING_TOOLS,
+    MUTATING_TOOLS,
+    READ_TOOLS,
+)
 from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.images import MAX_IMAGES
 from deep_harness.domain.models import DomainError
 from deep_harness.infrastructure.archives import create_archive, restore_archive
 from deep_harness.infrastructure.artifacts import ArtifactStore
+from deep_harness.infrastructure.change_bundles import BundleStore
 from deep_harness.infrastructure.delegations import DelegationLedger
+from deep_harness.infrastructure.delivery import ImportedDelivery, TaskDelivery
 from deep_harness.infrastructure.executions import ExecutionLedger
 from deep_harness.infrastructure.knowledge import KnowledgeStore, render_prompt
 from deep_harness.infrastructure.leases import acquire_lease
@@ -37,9 +46,11 @@ from deep_harness.infrastructure.permissions import change_permissions
 from deep_harness.infrastructure.receipts import ReceiptLedger
 from deep_harness.infrastructure.reconciliation import reconcile
 from deep_harness.infrastructure.store import BusinessStore
+from deep_harness.infrastructure.task_workspaces import TaskWorkspaces, finish_io, workspace_lease
 from deep_harness.infrastructure.web import WebClient
 from deep_harness.infrastructure.web.settings import WebSettings
 from deep_harness.runtime.deep import HarnessRuntime
+from deep_harness.runtime.delivery_graph import dispatch_delivery
 from deep_harness.runtime.mcp import McpRegistry
 from deep_harness.runtime.models import DiagnosticModel
 from deep_harness.runtime.standard import StandardRuntime
@@ -70,6 +81,8 @@ class ProfileApplication:
         upload_limit=None,
     ):
         self.scope = scope
+        self.workspaces = TaskWorkspaces(scope)
+        self.development = DevelopmentProcesses()
         self.model = model
         self.models = models
         self.run_slots = run_slots
@@ -153,6 +166,7 @@ class ProfileApplication:
             await self.jobs.ledger.pause_running()
         await drain_tasks(self.tasks | self.mutations, grace_seconds)
         await drain_tasks(self.tasks, 0)
+        await self.development.close()
         await self.resources.aclose()
         self.closed = True
 
@@ -169,7 +183,16 @@ class ProfileApplication:
         mcp_tools: tuple[str, ...] = (),
         full_access_acknowledged: bool = False,
         model_id: str | None = None,
+        workspace_mode=None,
+        verification_command=None,
     ):
+        managed_sandbox = self.scope.server_mode == "sandbox" and workspace_mode == "copy"
+        if (workspace_mode or verification_command) and (
+            harness != "coding" or (self.scope.server_mode and not managed_sandbox)
+        ):
+            raise DomainError("workspace_mode", "Workspace mode is unavailable for this task")
+        if workspace_mode not in {None, "auto", "worktree", "copy", "in_place"}:
+            raise DomainError("workspace_mode", "Unknown coding workspace mode")
         if permission_mode not in {"ask", "auto", "full"}:
             raise DomainError("permission_mode", "Unknown permission mode")
         if permission_mode == "full" and not full_access_acknowledged:
@@ -185,7 +208,8 @@ class ProfileApplication:
             raise DomainError("unknown_harness", "Specialized harness requires Deep engine")
         if tools is None:
             tools = derive_grants(harness, extensions, mcp_tools)
-        if engine != "deep" and set(tools) & {"delegate_task", "check_delegation"}:
+        delegation_tools = {"delegate_task", "check_delegation", "merge_delegations"}
+        if engine != "deep" and set(tools) & delegation_tools:
             raise DomainError("tool_denied", "Delegation is available only in Deep sessions")
         if harness in READ_ONLY_HARNESSES and set(tools) & MUTATING_TOOLS:
             raise DomainError("tool_denied", "Research harness cannot receive mutating tools")
@@ -195,7 +219,9 @@ class ProfileApplication:
         frozen_knowledge = knowledge if any(knowledge.values()) else None
         frozen_tools = tuple(sorted(set(tools)))
         if self.scope.server_mode:
-            denied = {"write", "edit", "apply_patch", "save_memory", "delegate_task"}
+            denied = {"save_memory"}
+            if not managed_sandbox:
+                denied.update({"write", "edit", "apply_patch", *delegation_tools})
             if self.scope.server_mode != "sandbox":
                 denied.add("bash")
             if set(frozen_tools) & denied or permission_mode != "ask":
@@ -209,6 +235,9 @@ class ProfileApplication:
             "knowledge": frozen_knowledge,
             "mcp_catalog": mcp_catalog,
             "model_id": model_id,
+            "coding_task": {"mode": workspace_mode or "in_place",
+                            "verification_command": verification_command}
+            if workspace_mode or verification_command else None,
         }
         return await self.store.create_session(
             principal="operator",
@@ -336,18 +365,30 @@ class ProfileApplication:
             if kind == "coding"
             else {*READ_TOOLS, *(name for name in session.tools if name.startswith("mcp__"))}
         )
+        coding_research = session.harness == "coding" and kind == "research"
+        if coding_research:
+            allowed = CODING_RESEARCH_TOOLS
+        child_harness = "general" if coding_research else kind
+        prompt = session.prompt
+        if coding_research:
+            prompt += (
+                "\nInvestigate the assigned code question using read-only tools. "
+                "Return concise findings with paths."
+            )
         tools = tuple(sorted(allowed.intersection(session.tools)))
         parent = await self.sessions.policies.get(session.id)
+        coding_task = parent["snapshot"].get("coding_task") if parent else None
         snapshot = self.sessions.snapshot(
-            tools, engine="deep", harness=kind, mcp_catalog=mcp_bindings,
+            tools, engine="deep", harness=child_harness, mcp_catalog=mcp_bindings,
             model_id=parent["snapshot"].get("model_id") if parent else None,
+            coding_task={**coding_task, "owner": session.id} if coding_task else None,
         )
         handle = await self.delegations.spawn_background(
             claim,
             delegation["id"],
-            prompt=session.prompt,
+            prompt=prompt,
             tools=tools,
-            harness=kind,
+            harness=child_harness,
             permission_mode=session.permission_mode,
             snapshot=snapshot,
             task=call.arguments["task"],
@@ -401,12 +442,14 @@ class ProfileApplication:
         job_id=None,
         model_id=None,
         workflow_step=None,
+        execution_scope=None,
+        coding_task=None,
     ):
         runtime_type = HarnessRuntime if session.engine == "deep" else StandardRuntime
         kwargs = dict(
             session=session,
             claim=claim,
-            scope=self.scope,
+            scope=execution_scope or self.scope,
             model=self.sessions.select_model(model_id, session.tools),
             store=self.store,
             executions=self.executions,
@@ -424,6 +467,16 @@ class ProfileApplication:
             kwargs["model"] = WorkflowModel(workflow_step)
         if runtime_type is HarnessRuntime and stage_limits is None:
             kwargs["background_launcher"] = self.launch_background
+        if runtime_type is HarnessRuntime and coding_task and coding_task["verification_command"]:
+            kwargs["verification_command"] = coding_task["verification_command"]
+        if (
+            runtime_type is HarnessRuntime and coding_task
+            and not coding_task.get("owner") and stage_limits is None
+        ):
+            async def pause_requested():
+                return self.workspaces.paused(coding_task.get("owner", session.id))
+
+            kwargs["pause_probe"] = pause_requested
         if stage_limits is not None:
             kwargs["model_lock"] = self.jobs.model_lock
             kwargs["pause_probe"] = lambda: self.jobs.ledger.paused(job_id)
@@ -448,6 +501,22 @@ class ProfileApplication:
                     return
 
     async def drain_next(self, session):
+        # A claim left in `started` by an interrupted execution would block this
+        # session forever, because `started` is in BLOCKING. Recover orphans
+        # before every claim attempt, excluding the tasks that are live right
+        # now. This complements the one-shot recovery performed at startup.
+        recovered = await self.executions.recover_stale_active(
+            set(self.active), session_id=session.id
+        )
+        for row in recovered:
+            logger.warning(
+                "Recovered orphaned admission %s in session %s as %s",
+                row["admission_id"],
+                row["session_id"],
+                row["status"],
+            )
+        if self.workspaces.paused(session.id):
+            return None
         paused = await self.executions.paused_job_admission(session.id)
         ready = await self.receipts.decided_waiting(session.id) if paused is None else ()
         if paused is not None:
@@ -472,6 +541,7 @@ class ProfileApplication:
             await self.delegations.settle_background(session.id, "running", None)
             binding = await self.sessions.policies.get(session.id)
             mcp_bindings = binding["snapshot"].get("mcp_bindings") if binding else None
+            coding_task = binding["snapshot"].get("coding_task") if binding else None
             stage = await self.jobs.ledger.owner(session.id)
             limits = ExecutionSettings.model_validate(stage["limits"]) if stage else self.limits
             spent = await self.executions.active_seconds(claim.admission.id)
@@ -483,16 +553,27 @@ class ProfileApplication:
             if remaining <= 0:
                 raise DomainError("budget_exhausted", "Cumulative active execution time exhausted")
             async with asyncio.timeout(remaining):
-                runtime = self.runtime(
-                    session,
-                    claim,
-                    mcp_bindings,
-                    stage_limits=limits if stage else None,
-                    job_id=stage["job_id"] if stage else None,
-                    model_id=binding["snapshot"].get("model_id") if binding else None,
-                    workflow_step=stage["definition"].get("step") if stage else None,
-                )
-                result = await runtime.run(resume=resume)
+                task_scope = self.scope
+                if coding_task:
+                    async with workspace_lease(self.scope.workspace):
+                        task = await finish_io(
+                            self.workspaces.open, coding_task.get("owner", session.id),
+                            coding_task["mode"],
+                        )
+                    task_scope = self.workspaces.scope_for(task)
+                async with workspace_lease(task_scope.workspace) if coding_task else nullcontext():
+                    runtime = self.runtime(
+                        session,
+                        claim,
+                        mcp_bindings,
+                        stage_limits=limits if stage else None,
+                        job_id=stage["job_id"] if stage else None,
+                        model_id=binding["snapshot"].get("model_id") if binding else None,
+                        workflow_step=stage["definition"].get("step") if stage else None,
+                        execution_scope=task_scope,
+                        coding_task=coding_task,
+                    )
+                    result = await runtime.run(resume=resume)
         except asyncio.CancelledError:
             await self.executions.settle(claim, "unknown", elapsed=clock() - started)
             await self.delegations.settle_background(session.id, "unknown", None)
@@ -521,6 +602,10 @@ class ProfileApplication:
                     "model_connection_failed",
                     "model_request_failed",
                     "sandbox_state_lost",
+                    "workspace_lost",
+                    "workspace_busy",
+                    "workspace_git",
+                    "workspace_incomplete",
                     "artifact_not_found",
                     "image_corrupt",
                 }
@@ -639,6 +724,118 @@ class ProfileApplication:
         return await self.sessions.status(session_id)
 
     @mutation
+    async def task_control(self, session_id, action=None):
+        session = await self.store.get_session(session_id, "operator")
+        binding = await self.sessions.policies.get(session.id)
+        task = binding["snapshot"].get("coding_task") if binding else None
+        if not task or task.get("owner"):
+            raise DomainError("task_not_found", "The session does not own a managed coding task")
+        if action is not None:
+            async with self.control:
+                self.workspaces.set_pause(session.id, action == "pause")
+            if action == "resume":
+                self.schedule(session.id)
+        return {"pause_requested": self.workspaces.paused(session.id)}
+
+    @mutation
+    async def development_processes(
+        self, session_id, *, start=None, stop=None,
+    ):
+        async with self.locks.setdefault(session_id, asyncio.Lock()):
+            session = await self.store.get_session(session_id, "operator")
+            binding = await self.sessions.policies.get(session.id)
+            task = binding["snapshot"].get("coding_task") if binding else None
+            if session.harness != "coding" or not task or task.get("owner"):
+                raise DomainError("process_denied", "This session does not own a task workspace")
+            if self.scope.server_mode and (
+                not self.executor or task["mode"] != "copy" or "bash" not in session.tools
+            ):
+                raise DomainError("process_denied", "Web processes require sandbox command access")
+            home = self.workspaces.home(session_id) / "processes"
+            if stop is not None:
+                return await self.development.stop(home, stop)
+            if start is None:
+                return await asyncio.to_thread(self.development.list, home)
+            workspace = await finish_io(self.workspaces.open, session_id, task["mode"])
+            return await self.development.start(
+                home, workspace.root, **start, executor=self.executor
+            )
+
+    @mutation
+    async def deliver(self, session_id, action=None, revision=None, change_set_id=None):
+        if self.scope.server_mode and action != "export":
+            raise DomainError("delivery_denied", "Server workspaces cannot write back to the host")
+        async with self.locks.setdefault(session_id, asyncio.Lock()):
+            session = await self.store.get_session(session_id, "operator")
+            binding = await self.sessions.policies.get(session.id)
+            task = binding["snapshot"].get("coding_task") if binding else None
+            if not task or task["mode"] == "in_place" or not (
+                self.workspaces.home(session.id) / "workspace.json"
+            ).exists():
+                raise DomainError("delivery_not_found", "This session has no isolated workspace")
+            allow_discarded = action in {None, "undo", "reconcile"}
+            workspace = await finish_io(
+                self.workspaces.open, session.id, task["mode"], allow_discarded
+            )
+            delivery = TaskDelivery(self.workspaces, workspace)
+            async with workspace_lease(workspace.root):
+                status = await self.store.session_status(session.id, "operator")
+                latest = status["latest_admission"]
+                verification = None
+                if latest and latest.status == "completed" and latest.result:
+                    try:
+                        verification = json.loads(latest.result)["execution_evidence"][
+                            "verification"
+                        ]["receipt"]
+                    except (KeyError, TypeError, ValueError):
+                        pass
+                bundles = BundleStore(delivery.home / "changesets")
+                if action is None:
+                    return await finish_io(delivery.preview, bundles, verification)
+                if status["active_admissions"]:
+                    raise DomainError("delivery_conflict", "Resolve unfinished task activity first")
+                if action == "export":
+                    identifier, raw = await finish_io(delivery.freeze, verification)
+                    await finish_io(bundles.save, raw)
+                    return identifier, raw
+                processes = await asyncio.to_thread(
+                    self.development.list, self.workspaces.home(session_id) / "processes"
+                )
+                if any(row["status"] in {"running", "unknown"} for row in processes):
+                    raise DomainError("delivery_conflict", "Resolve development processes first")
+                async with workspace_lease(workspace.source):
+                    try:
+                        bundle = (
+                            await finish_io(bundles.get, change_set_id) if change_set_id else None
+                        )
+                        return await dispatch_delivery(
+                            self.saver, session.id, delivery, action, revision, bundle
+                        )
+                    except OSError as exc:
+                        raise DomainError(
+                            "delivery_conflict", "A delivery file is inaccessible"
+                        ) from exc
+
+    @mutation
+    async def imported_bundle(self, *, raw=None, identifier=None, action=None):
+        if self.scope.server_mode:
+            raise DomainError("delivery_denied", "Web packages are applied from a local project")
+        store = BundleStore(self.scope.home / "imports")
+        async with workspace_lease(self.scope.workspace):
+            bundle = await finish_io(store.save, raw) if raw is not None else await finish_io(
+                store.get, identifier
+            )
+            delivery = ImportedDelivery(self.workspaces, store, bundle)
+            if action is None:
+                return await finish_io(delivery.preview)
+            try:
+                return await dispatch_delivery(
+                    self.saver, bundle["id"], delivery, action, bundle["manifest"]["revision"],
+                )
+            except OSError as exc:
+                raise DomainError("delivery_conflict", "An imported path is inaccessible") from exc
+
+    @mutation
     async def fork_session(self, session_id, request_id):
         async with self.locks.setdefault(session_id, asyncio.Lock()):
             session = await self.store.get_session(session_id, "operator")
@@ -655,6 +852,7 @@ class ProfileApplication:
                     knowledge=knowledge,
                     mcp_catalog=catalog,
                     model_id=bound["snapshot"].get("model_id") if bound else None,
+                    coding_task=bound["snapshot"].get("coding_task") if bound else None,
                 ),
             )
 
@@ -667,6 +865,12 @@ class ProfileApplication:
             task.cancel()
             await asyncio.wait({task}, timeout=number("lifecycle.cancel_wait_seconds"))
             return await self.store.get_admission(admission_id, session_id)
+        if admission.status == "started":
+            # Orphaned claim: no live task owns it, so cancel_pending would
+            # reject it as "execution_busy". Recover first so the operator can
+            # clear the stranded input instead of being permanently blocked.
+            await self.executions.recover_stale_active(set(self.active), session_id=session_id)
+            admission = await self.store.get_admission(admission_id, session_id)
         result = await self.executions.cancel_pending(session_id, admission_id)
         await self.finish_sandbox(admission_id)
         if result.status == "cancelled":

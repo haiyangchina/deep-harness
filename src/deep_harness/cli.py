@@ -42,6 +42,8 @@ def parser():
     )
     chat.add_argument("--session", help="Continue an existing session")
     chat.add_argument("--harness", choices=list(HARNESSES))
+    chat.add_argument("--workspace-mode", choices=["auto", "worktree", "copy", "in_place"])
+    chat.add_argument("--verify-command")
     chat.add_argument("--permission-mode", choices=["ask", "auto", "full"])
     chat.add_argument(
         "--acknowledge-full-access",
@@ -67,6 +69,8 @@ def parser():
     repl = commands.add_parser("repl")
     repl.add_argument("--session")
     repl.add_argument("--harness", choices=list(HARNESSES))
+    repl.add_argument("--workspace-mode", choices=["auto", "worktree", "copy", "in_place"])
+    repl.add_argument("--verify-command")
     repl.add_argument("--permission-mode", choices=["ask", "auto", "full"])
     repl.add_argument(
         "--acknowledge-full-access",
@@ -89,6 +93,25 @@ def parser():
     inspect = commands.add_parser("inspect")
     inspect.add_argument("session")
     inspect.add_argument("--messages", action="store_true")
+    diff = commands.add_parser("diff", help="Print the observed worktree diff for a coding turn")
+    diff.add_argument("session")
+    diff.add_argument("admission")
+    delivery = commands.add_parser("delivery", help="Review, apply or undo an isolated task")
+    delivery.add_argument("session")
+    delivery.add_argument("--action", choices=["apply", "undo", "discard", "reconcile"])
+    delivery.add_argument("--revision")
+    delivery.add_argument("--change-set-id")
+    bundle = commands.add_parser("bundle", help="Import, review or apply a change package")
+    bundle.add_argument("file_or_id")
+    bundle.add_argument("--action", choices=["import", "inspect", "apply", "undo", "reconcile"],
+                        default="import")
+    process = commands.add_parser("process", help="Manage local coding development processes")
+    process.add_argument("session")
+    process.add_argument("--command", dest="process_command")
+    process.add_argument("--request-id")
+    process.add_argument("--cwd", default=".")
+    process.add_argument("--lifetime", type=float, default=3600)
+    process.add_argument("--stop")
     permissions = commands.add_parser("permissions")
     permissions.add_argument("session")
     permissions.add_argument("--mode", required=True, choices=["ask", "auto", "full"])
@@ -215,6 +238,13 @@ def main():
     args = command_line.parse_args()
     if args.command == "chat" and (not args.text.strip() and not args.image):
         command_line.error("chat requires text or --image")
+    if args.command == "delivery" and bool(args.action) != bool(args.revision):
+        command_line.error("delivery requires both --action and --revision to write files")
+    if args.command == "process" and (
+        (args.process_command is not None and (not args.request_id or args.stop))
+        or not 1 <= args.lifetime <= 86400
+    ):
+        command_line.error("starting a process requires --command and --request-id")
     if args.command == "web":
         from deep_harness.transports.web_launcher import serve_web
 
@@ -253,31 +283,7 @@ def main():
         if args.check_model and evidence["model_readiness"]["status"] != "ready":
             raise SystemExit(1)
         return
-    if args.command in {
-        "chat",
-        "repl",
-        "sessions",
-        "inspect",
-        "history",
-        "search",
-        "skill-add",
-        "skill-list",
-        "skill-disable",
-        "memory-add",
-        "memory-list",
-        "mcp-list",
-        "memory-search",
-        "memory-forget",
-        "curate",
-        "curation-list",
-        "curation-decide",
-        "delegations",
-        "delegation-steer",
-        "delegation-stop",
-        "usage",
-        "approve",
-        "fork",
-    }:
+    if args.command != "serve":
         from deep_harness.transports.console import run_console
 
         try:
