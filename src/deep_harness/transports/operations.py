@@ -132,6 +132,18 @@ def operations_router(host, authenticate):
         app = await host.application(profile_id)
         return jsonable_encoder(await app.cancel(session_id, admission_id))
 
+    @router.post("/profiles/{profile_id}/sessions/{session_id}/admissions/{admission_id}/retry-workspace")
+    async def retry_workspace(profile_id: str, session_id: str, admission_id: str):
+        app = await host.application(profile_id)
+        return jsonable_encoder(await app.retry_workspace(session_id, admission_id))
+
+    @router.post(
+        "/profiles/{profile_id}/sessions/{session_id}/admissions/{admission_id}/retry-summary"
+    )
+    async def retry_summary(profile_id: str, session_id: str, admission_id: str):
+        app = await host.application(profile_id)
+        return jsonable_encoder(await app.retry_summary(session_id, admission_id))
+
     @router.post(
         "/profiles/{profile_id}/sessions/{session_id}/admissions/{admission_id}/resolution"
     )

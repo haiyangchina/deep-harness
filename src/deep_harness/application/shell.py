@@ -1,11 +1,14 @@
 """Explicit shell commands with bounded output and owned process-tree cleanup."""
 
 import asyncio
+import base64
 import codecs
+import ctypes
 import os
 import shutil
 import signal
 import subprocess
+from contextlib import suppress
 from pathlib import Path
 from typing import Literal
 
@@ -56,30 +59,73 @@ def shell_command(arguments, workspace_path):
         else ["--noprofile", "--norc", "-c"]
     )
     command = arguments.command
+    payload = None
     if kind == "powershell":
+        # Use stdin so encoding does not expand the command beyond the OS argv limit.
+        payload = base64.b64encode(command.encode("utf-8"))
+        # Parse user syntax only after the console can emit UTF-8 diagnostics.
         command = (
             "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()\n"
+            "$OutputEncoding = [Console]::OutputEncoding\n"
             "$ErrorActionPreference = 'Stop'\n"
-            + command
-            + "\nif (-not $?) { exit 1 }; exit $LASTEXITCODE"
+            "$commandBytes = [Convert]::FromBase64String([Console]::In.ReadToEnd())\n"
+            ". ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString($commandBytes)))\n"
+            "if (-not $?) { exit 1 }; exit $LASTEXITCODE"
         )
-    return [executable, *flags, command], cwd
+    return [executable, *flags, command], cwd, payload
 
 
-async def drain_output(stream, on_output=None, *, live=False):
+def windows_output_encodings():
+    if os.name != "nt":
+        return ()
+    kernel = ctypes.windll.kernel32
+    codepages = dict.fromkeys((kernel.GetOEMCP(), kernel.GetACP()))
+    return tuple(f"cp{page}" for page in codepages if page and page != 65001)
+
+
+def decode_output(data, decoder, fallback_encodings, *, final=False):
+    pending = decoder.getstate()[0]
+    try:
+        return decoder.decode(data, final=final), decoder
+    except UnicodeDecodeError:
+        # Keep any bytes buffered at a pipe boundary when switching encodings.
+        data = pending + data
+    for encoding in fallback_encodings:
+        try:
+            candidate = codecs.getincrementaldecoder(encoding)(errors="strict")
+            return candidate.decode(data, final=final), candidate
+        except (LookupError, UnicodeDecodeError):
+            continue
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    return decoder.decode(data, final=final), decoder
+
+
+async def drain_output(stream, on_output=None, *, live=False, fallback_encodings=()):
     data = bytearray()
     total = 0
     previews = 0
-    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    utf8 = codecs.getincrementaldecoder("utf-8")
+    errors = "strict" if fallback_encodings else "replace"
+    decoder = utf8(errors=errors)
     while chunk := await stream.read(number("streams.read_chunk_bytes")):
         if on_output is not None and (live or (total < 4096 and previews < 8)):
-            preview = decoder.decode(chunk if live else chunk[: 4096 - total])
+            preview, decoder = decode_output(
+                chunk if live else chunk[: 4096 - total], decoder, fallback_encodings
+            )
             if preview:
                 await on_output(preview)
                 previews += 1
         total += len(chunk)
         data.extend(chunk[: max(0, number("shell.stream_limit_bytes") - len(data))])
-    return data.decode("utf-8", errors="replace"), total > len(data)
+    if on_output is not None and (live or (total <= 4096 and previews < 8)):
+        tail, _ = decode_output(b"", decoder, fallback_encodings, final=True)
+        if tail:
+            await on_output(tail)
+    truncated = total > len(data)
+    output, _ = decode_output(
+        bytes(data), utf8(errors=errors), fallback_encodings, final=not truncated
+    )
+    return output, truncated
 
 
 async def stop_tree(process):
@@ -109,7 +155,7 @@ async def stop_tree(process):
 async def bash(
     arguments: BashArgs, workspace_path, *, on_output=None, live=False, git_ceiling=None
 ):
-    argv, cwd = shell_command(arguments, workspace_path)
+    argv, cwd, payload = shell_command(arguments, workspace_path)
     environment = command_environment()
     if git_ceiling is not None:
         environment["GIT_CEILING_DIRECTORIES"] = str(git_ceiling)
@@ -122,7 +168,7 @@ async def bash(
         *argv,
         cwd=cwd,
         env=environment,
-        stdin=asyncio.subprocess.DEVNULL,
+        stdin=asyncio.subprocess.DEVNULL if payload is None else asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         **options,
@@ -130,12 +176,19 @@ async def bash(
     async def output(channel, text):
         await on_output(channel, text)
 
+    fallback_encodings = windows_output_encodings()
     readers = asyncio.gather(
         drain_output(
-            process.stdout, (lambda text: output("stdout", text)) if on_output else None, live=live
+            process.stdout,
+            (lambda text: output("stdout", text)) if on_output else None,
+            live=live,
+            fallback_encodings=fallback_encodings,
         ),
         drain_output(
-            process.stderr, (lambda text: output("stderr", text)) if on_output else None, live=live
+            process.stderr,
+            (lambda text: output("stderr", text)) if on_output else None,
+            live=live,
+            fallback_encodings=fallback_encodings,
         ),
     )
     job = None
@@ -143,6 +196,13 @@ async def bash(
         if os.name == "nt":
             job = WindowsJob(process.pid)
         async with asyncio.timeout(arguments.timeout_seconds):
+            if payload is not None:
+                try:
+                    with suppress(BrokenPipeError, ConnectionResetError):
+                        process.stdin.write(payload)
+                        await process.stdin.drain()
+                finally:
+                    process.stdin.close()
             stdout, stderr = await asyncio.shield(readers)
             code = await process.wait()
     finally:

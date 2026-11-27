@@ -11,13 +11,20 @@ from deepagents.middleware import FilesystemMiddleware
 from langchain.tools import ToolRuntime
 from langchain_core.messages import AIMessage
 from langchain_core.tools import StructuredTool
+from langgraph.errors import GraphRecursionError
+from langgraph.graph import END
 from langgraph.types import interrupt
 from pydantic import ValidationError
 from sqlalchemy import select
 
-from deep_harness.application.coding_evidence import coding_evidence
+from deep_harness.application.coding_evidence import (
+    coding_evidence,
+    is_observed_reference,
+    project_facts,
+    reading_evidence,
+)
 from deep_harness.application.harness_spec import spec_for
-from deep_harness.application.tools import ToolGateway, tool_definitions
+from deep_harness.application.tools import LOCAL_READS, ToolGateway, tool_definitions
 from deep_harness.application.workspace import CODING_RESEARCH_TOOLS, CODING_TOOLS, READ_TOOLS
 from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import DomainError, ToolCall
@@ -26,7 +33,7 @@ from deep_harness.infrastructure.branches import BranchLedger
 from deep_harness.infrastructure.coding_workspace import CodingWorkspace
 from deep_harness.infrastructure.delegations import DelegationLedger
 from deep_harness.infrastructure.delivery import TaskDelivery
-from deep_harness.infrastructure.task_workspaces import TaskWorkspaces, finish_io
+from deep_harness.infrastructure.task_workspaces import TaskWorkspaces
 from deep_harness.runtime.agent import (
     filesystem_middleware,
     register_profile,
@@ -41,7 +48,11 @@ from deep_harness.runtime.approval_checkpoint import (
     resume_command,
 )
 from deep_harness.runtime.coding_verification import verify_coding_task
-from deep_harness.runtime.guard import HarnessGuardMiddleware
+from deep_harness.runtime.guard import (
+    HarnessGuardMiddleware,
+    finalization_messages,
+    finalization_timeout,
+)
 from deep_harness.runtime.harnesses import HarnessReport, parse_report
 from deep_harness.runtime.images import user_message
 from deep_harness.runtime.inference import normalized_usage, usage_totals
@@ -100,6 +111,8 @@ class HarnessRuntime:
         self.mcp = mcp
         self.coding_workspace = coding_workspace
         self.verification_command = verification_command
+        self.deadline = None
+        self.legacy_tool_specs = None
         if self.coding_workspace is None and session.harness == "coding" and (
             not scope.server_mode or scope.task_workspace
         ):
@@ -151,6 +164,21 @@ class HarnessRuntime:
                 "merge their registered patches using merge_delegations when granted. "
                 "Use background only for independent research that may finish after this turn."
             )
+        if session.harness == "coding" and "read_files" in session.tools:
+            prompt += (
+                " For an overview, use list_files with recursive=false, then read_files "
+                "to inspect manifests and entry_candidates in the same batch. Summarize as "
+                "soon as the evidence answers the question. Cite actually inspected paths "
+                "and lines. Use native file tools for exploration and reserve the terminal "
+                "for build, test, or explicitly requested shell commands. "
+                "Leave credentials out of project overviews."
+            )
+        if session.harness == "coding" and "search_files" in session.tools:
+            prompt += (
+                " Start source text searches and code location with search_files. "
+                "Narrow the query or scope when needed, then use read_files to verify matches. "
+                "Use shell search only if the user explicitly requests a shell command."
+            )
         self.graph = create_deep_agent(
             model=model.model,
             tools=[self._tool(spec) for spec in self.tool_specs],
@@ -166,7 +194,8 @@ class HarnessRuntime:
         )
         self.config = {
             "configurable": {"thread_id": session.id},
-            "recursion_limit": 2 * limits.max_model_calls + 4,
+            # A model iteration can include several middleware/tool supersteps.
+            "recursion_limit": 8 * limits.max_model_calls + 32,
         }
 
     @staticmethod
@@ -264,11 +293,12 @@ class HarnessRuntime:
                     )
                     async with (
                         self.writer_lock if writer else nullcontext(),
-                        self.tool_lock,
+                        self.tool_lock if original not in LOCAL_READS else nullcontext(),
                     ):
                         operation = await self._merge_call(call) if original == (
                             "merge_delegations"
                         ) else call
+                        await self.gateway.check_repeated_command(operation)
                         required = self.gateway.approval_reason(operation) is not None
                         if required and not await self._approval(operation):
                             result = "Tool denied by user."
@@ -374,7 +404,7 @@ class HarnessRuntime:
         if call.arguments.get("isolate"):
             manager = TaskWorkspaces(self.scope)
             async with self.writer_lock:
-                task = await finish_io(manager.open, delegation["id"], "copy")
+                task = await manager.prepare(delegation["id"], "copy")
             isolated = TaskDelivery(manager, task)
             child_scope = manager.scope_for(task)
         guide = specialist_guide(kind)
@@ -545,6 +575,15 @@ class HarnessRuntime:
             return None
         digest = fingerprint({"prompt": prompt, "messages": messages})
         key = f"{self.claim.admission.id}:coding:report:{digest[:32]}"
+        # Bound the shared-semaphore wait too; report repair is optional, so a
+        # stuck model slot must degrade to "no repair" rather than hang the run.
+        try:
+            async with asyncio.timeout(self.request_timeout):
+                return await self._repair_report_locked(prompt, messages, digest, key)
+        except TimeoutError:
+            return None
+
+    async def _repair_report_locked(self, prompt, messages, digest, key):
         async with self.model_lock:
             saved = await self.receipts.model_result(key, digest)
             if saved is None:
@@ -575,7 +614,7 @@ class HarnessRuntime:
             return None
         return saved.get("content")
 
-    async def _coding_report(self, answer):
+    async def _coding_report(self, answer, *, receipts_only=False):
         messages = await self.store.history(self.session.id, admission_id=self.claim.admission.id)
         files, commands, last_write = coding_evidence(messages)
         evidence = {
@@ -593,10 +632,12 @@ class HarnessRuntime:
                 for command in commands
             ],
         }
+        evidence["reads"] = reading_evidence(messages)
         evidence["delegations"] = await self.delegations.admission_summary(self.claim)
         state = await self.graph.aget_state(self.config)
         evidence["plan"] = state.values.get("todos", [])
-        if self.coding_workspace is not None:
+        workspace = None
+        if self.coding_workspace is not None and not receipts_only:
             workspace = await asyncio.to_thread(self.coding_workspace.finish)
             evidence["workspace"] = {**workspace, "isolated": self.scope.task_workspace}
             verifier = await self.receipts.latest_verification(
@@ -639,12 +680,22 @@ class HarnessRuntime:
                     limitations=[],
                 ).model_dump()
                 report_status = "unavailable"
+        if evidence["reads"]:
+            report["evidence"] = [
+                row for row in report["evidence"]
+                if is_observed_reference(row["source"], evidence["reads"])
+            ]
+            if not report["evidence"] and report_status != "unavailable":
+                report["evidence"] = [
+                    {"source": row["path"], "observation": "File read during this run."}
+                    for row in evidence["reads"][:6]
+                ]
         report["tests"] = [
             f"{row['command']} (exit {row['exit_code']}, receipt {row['receipt_id']})"
             for row in evidence["commands"]
             if row["purpose"] in {"reproduce", "verify"} and type(row["exit_code"]) is int
         ][-number("harness_report.tests_max_length") :]
-        if self.coding_workspace is not None and workspace["status"] == "observed":
+        if workspace is not None and workspace["status"] == "observed":
             report["changes"] = [
                 f"{row['status']}: {row['path']}" for row in workspace["files"]
             ][:number("harness_report.changes_max_length")]
@@ -657,14 +708,92 @@ class HarnessRuntime:
             ensure_ascii=False,
         )
 
+    async def partial_coding_result(self, reason):
+        if await self.receipts.has_dispatched_effects(self.claim):
+            raise DomainError(
+                "unknown_effect", "A dispatched operation still requires confirmation"
+            )
+        messages = await self.store.history(self.session.id, admission_id=self.claim.admission.id)
+        files, commands, _ = coding_evidence(messages)
+        reads = reading_evidence(messages)
+        if not (reads or files or commands):
+            return {
+                "status": "interrupted",
+                "result": f"Execution stopped [{reason}]. No confirmed coding evidence collected.",
+            }
+        explanation = {
+            "coding_finalization_timeout": "模型汇总超时，以下是已确认的项目事实。",
+            "coding_finalization_tool_request": "汇总请求返回了工具调用，未执行该调用。",
+        }.get(reason, "未生成完整答复。")
+        lines = [f"部分结果 [{reason}]。{explanation}"]
+        lines.extend(project_facts(messages))
+        lines.extend(f"- 已读取 `{row['path']}`" for row in reads[:12])
+        lines.extend(f"- 已修改 `{row['path']}`" for row in files[:12])
+        lines.extend(
+            f"- 命令回执 {row['receipt_id']}，退出码 {row['exit_code']}"
+            for row in commands[:8]
+        )
+        return {"status": "interrupted", "result": "\n".join(lines)}
+
+    async def retry_summary(self):
+        admission = self.claim.admission
+        rows = await self.store.history(self.session.id, admission_id=admission.id)
+        names = {
+            call["id"]: call["name"]
+            for row in rows for call in row.get("tool_calls", [])
+        }
+        messages = [to_langchain(row) for row in rows]
+        for row, message in zip(rows, messages, strict=True):
+            if row["role"] == "tool":
+                message.name = names.get(row.get("tool_call_id"))
+        system, note = finalization_messages(messages, admission.id)
+        prompt = system.content
+        inputs = [{"role": "user", "content": note.content}]
+        digest = fingerprint({"prompt": prompt, "messages": inputs, "retry": True})
+        key = f"{admission.id}:summary:retry:{digest[:24]}"
+        response = await self.receipts.model_result(key, digest)
+        if response is None:
+            try:
+                async with asyncio.timeout(finalization_timeout(self.request_timeout)):
+                    async with self.model_lock:
+                        async with self.store.transaction() as conn:
+                            await self.executions.assert_claim(conn, self.claim)
+                            await self.store.append_event(
+                                conn, self.session.id, "model.started",
+                                {"id": key, "admission_id": admission.id, "phase": "finalizing"},
+                            )
+                        settings = (
+                            {"num_predict": number("harness_report.finalization_output_tokens")}
+                            if self.model.identity.get("provider") == "ollama" else None
+                        )
+                        response = await self.model.complete(
+                            prompt, inputs, (), model_settings=settings,
+                        )
+            except TimeoutError:
+                return await self.partial_coding_result("coding_finalization_timeout")
+            except DomainError:
+                return await self.partial_coding_result("coding_finalization")
+            if response.get("tool_calls"):
+                return await self.partial_coding_result("coding_finalization_tool_request")
+            try:
+                parse_report(response.get("content"))
+            except DomainError:
+                return await self.partial_coding_result("coding_finalization")
+            response.update(id=key, usage=normalized_usage(response, prompt, inputs))
+            await self.receipts.save_model(self.claim, key, digest, response)
+        answer = response["content"]
+        updated = await self.graph.aupdate_state(
+            self.config, {"messages": [AIMessage(content=answer, id=key)]}, as_node="model",
+        )
+        if (await self.graph.aget_state(updated)).next:
+            await self.graph.aupdate_state(updated, None, as_node=END)
+        report = await self._coding_report(answer, receipts_only=True)
+        return {"status": "completed", "result": report}
+
     async def run(self, *, resume=False):
         checkpoint = await self.graph.aget_state(self.config)
         history = checkpoint.values.get("messages", [])
         admission_message_id = f"{self.claim.admission.id}:user"
-        if self.coding_workspace is not None and not any(
-            message.id == admission_message_id for message in history
-        ):
-            await asyncio.to_thread(self.coding_workspace.begin)
         if (
             self.session.harness == "coding"
             and not checkpoint.next
@@ -693,7 +822,20 @@ class HarnessRuntime:
                         to_langchain(await user_message(self)),
                     ]
                 }
-            result = await self.graph.ainvoke(value, config=self.config, durability="sync")
+            try:
+                result = await self.graph.ainvoke(value, config=self.config, durability="sync")
+            except GraphRecursionError:
+                if self.session.harness != "coding":
+                    raise
+                return await self.partial_coding_result("graph_step_limit")
+            except DomainError as exc:
+                if self.session.harness != "coding" or exc.code not in {
+                    "budget_exhausted", "coding_finalization_timeout",
+                    "coding_finalization_tool_request", "coding_read_tool_denied",
+                    "context_budget_exhausted",
+                }:
+                    raise
+                return await self.partial_coding_result(exc.code)
             if result.get("__interrupt__"):
                 return interrupt_outcome(result["__interrupt__"], self.claim.admission.generation)
             answer = result["messages"][-1].content

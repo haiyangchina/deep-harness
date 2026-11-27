@@ -147,7 +147,7 @@ export function CreateSession({ close }: { close: () => void }) {
     return raw ? JSON.parse(raw) : null
   })
   const [harness, setHarness] = useState(saved?.harness ?? 'coding')
-  const [workspaceMode, setWorkspaceMode] = useState(saved?.workspace_mode ?? 'auto')
+  const [workspaceMode, setWorkspaceMode] = useState(saved?.workspace_mode ?? 'in_place')
   const [verification, setVerification] = useState(saved?.verification_command ?? '')
   const [permissionMode, setPermissionMode] = useState<PermissionMode>(saved ? saved.permission_mode : 'ask')
   const [extensions, setExtensions] = useState<string[]>(saved?.extensions ?? [])
@@ -196,12 +196,13 @@ export function CreateSession({ close }: { close: () => void }) {
             <label className="field">任务工作区
               <select value={workspaceMode} onChange={event => setWorkspaceMode(event.target.value)}
                 disabled={busy || Boolean(saved)}>
-                <option value="auto">自动隔离</option>
+                <option value="in_place">当前项目</option>
+                <option value="auto">自动选择隔离方式</option>
                 <option value="worktree">Git 工作树（从当前提交）</option>
                 <option value="copy">隔离副本（带入当前文件）</option>
-                <option value="in_place">原地修改项目</option>
               </select>
             </label>
+            {workspaceMode === 'worktree' && <p className="muted small">工作树从当前 Git 提交创建，未提交改动留在当前项目。</p>}
             <label className="field">验收命令（可选）
               <input value={verification} maxLength={4096}
                 disabled={busy || Boolean(saved)} onChange={event => setVerification(event.target.value)} />

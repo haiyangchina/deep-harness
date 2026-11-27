@@ -7,6 +7,7 @@ const bridge: DesktopBridge = {
   stop: () => ipcRenderer.invoke('deep-harness:stop'),
   openProject: id => ipcRenderer.invoke('deep-harness:project', id),
   choose: kind => ipcRenderer.invoke('deep-harness:choose', kind),
-  request: request => ipcRenderer.invoke('deep-harness:request', request)
+  request: request => ipcRenderer.invoke('deep-harness:request', request),
+  openLink: href => ipcRenderer.invoke('deep-harness:open-link', href)
 }
 contextBridge.exposeInMainWorld('deepHarness', bridge)

@@ -125,9 +125,14 @@ class LangChainModel:
             self.model, self.request_timeout, identity=self.identity, tool_specs=definitions
         )
 
-    async def complete(self, prompt: str, messages: list[dict], tools: tuple[str, ...]) -> dict:
-        definitions = self.tool_specs if self.tool_specs is not None else tool_definitions(tools)
-        bound = self.model.bind_tools(definitions) if definitions else self.model
+    async def complete(
+        self, prompt: str, messages: list[dict], tools: tuple[str, ...], *, model_settings=None,
+    ) -> dict:
+        definitions = (
+            self.tool_specs if tools and self.tool_specs is not None else tool_definitions(tools)
+        )
+        model = self.model.model_copy(update=model_settings) if model_settings else self.model
+        bound = model.bind_tools(definitions) if definitions else model
         with tracing_context(enabled=False), model_errors():
             response = await bound.ainvoke(
                 [SystemMessage(content=prompt), *(to_langchain(row) for row in messages)]

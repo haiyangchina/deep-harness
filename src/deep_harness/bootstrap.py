@@ -17,6 +17,7 @@ from deep_harness.application.capabilities import (
     READ_ONLY_HARNESSES,
     derive_grants,
 )
+from deep_harness.application.coding_evidence import coding_evidence, reading_evidence
 from deep_harness.application.config import ExecutionSettings
 from deep_harness.application.curation import CurationService, auto_curation_enabled
 from deep_harness.application.development_processes import DevelopmentProcesses
@@ -116,6 +117,7 @@ class ProfileApplication:
         self.maintenance = False
         self.mutations: set[asyncio.Task] = set()
         self.active: dict[str, asyncio.Task] = {}
+        self.preparing: dict[str, asyncio.Task] = {}
 
     async def start(self):
         lease = await acquire_lease(self.scope)
@@ -235,9 +237,12 @@ class ProfileApplication:
             "knowledge": frozen_knowledge,
             "mcp_catalog": mcp_catalog,
             "model_id": model_id,
-            "coding_task": {"mode": workspace_mode or "in_place",
-                            "verification_command": verification_command}
-            if workspace_mode or verification_command else None,
+            "coding_task": (
+                {"mode": workspace_mode or "in_place", "verification_command": verification_command}
+                if workspace_mode or verification_command
+                or (harness == "coding" and not self.scope.server_mode)
+                else None
+            ),
         }
         return await self.store.create_session(
             principal="operator",
@@ -428,7 +433,7 @@ class ProfileApplication:
                         task.cancel()
                         await asyncio.gather(task, return_exceptions=True)
                 elif admission.status in {"queued", "waiting_approval"}:
-                    await self.executions.cancel_pending(child_id, admission.id)
+                    await self.cancel_pending_admission(child_id, admission.id)
             await self.delegations.reconcile_background()
         return await self.get_delegation(session_id, delegation_id)
 
@@ -493,10 +498,7 @@ class ProfileApplication:
                 logger.warning("Session %s paused: %s", session.id, exc.code)
                 return
             while not self.closing:
-                async with self.run_slots or nullcontext():
-                    if self.closing:
-                        return
-                    status = await self.drain_next(session)
+                status = await self.drain_next(session)
                 if status != "completed":
                     return
 
@@ -519,20 +521,68 @@ class ProfileApplication:
             return None
         paused = await self.executions.paused_job_admission(session.id)
         ready = await self.receipts.decided_waiting(session.id) if paused is None else ()
-        if paused is not None:
-            claim = await self.executions.resume(paused, session.id, self.owner, job_paused=True)
-        elif ready:
-            pending = ready[0]
-            claim = await self.executions.resume(
-                pending["admission_id"], session.id, self.owner,
-                expected_generation=pending["generation"],
-            )
-        else:
-            claim = await self.executions.claim(session.id, self.owner)
-        if claim is not None:
-            return await self.execute(session, claim, resume=bool(ready) or paused is not None)
+        task_scope = self.scope
+        candidate = None
+        if paused is None and not ready:
+            candidate = await self.executions.queued_candidate(session.id)
+            if candidate is None:
+                return None
+            binding = await self.sessions.policies.get(session.id)
+            coding_task = binding["snapshot"].get("coding_task") if binding else None
+            if coding_task and coding_task["mode"] != "in_place":
+                task_scope = await self.prepare_admission(candidate, coding_task)
+                if task_scope is None:
+                    return None
+        async with self.run_slots or nullcontext():
+            if self.closing or self.workspaces.paused(session.id):
+                return None
+            if paused is not None:
+                claim = await self.executions.resume(
+                    paused, session.id, self.owner, job_paused=True,
+                )
+            elif ready:
+                pending = ready[0]
+                claim = await self.executions.resume(
+                    pending["admission_id"], session.id, self.owner,
+                    expected_generation=pending["generation"],
+                )
+            else:
+                claim = await self.executions.claim(
+                    session.id, self.owner, expected_admission=candidate.id,
+                )
+            if claim is not None:
+                return await self.execute(
+                    session, claim, resume=bool(ready) or paused is not None, task_scope=task_scope,
+                )
 
-    async def execute(self, session, claim, *, resume=False):
+    async def prepare_admission(self, admission, coding_task):
+        operation = asyncio.create_task(self.workspaces.prepare(
+            coding_task.get("owner", admission.session_id), coding_task["mode"],
+            progress=lambda phase, **detail: self.executions.workspace_phase(
+                admission, phase, **detail,
+            ),
+        ))
+        self.preparing[admission.id] = operation
+        try:
+            return self.workspaces.scope_for(await operation)
+        except asyncio.CancelledError:
+            if asyncio.current_task().cancelling():
+                raise
+            return None  # The operator cancelled the still-queued admission.
+        except Exception as exc:
+            code = exc.code if isinstance(exc, DomainError) else "workspace_unknown"
+            if code == "workspace_unknown":
+                logger.warning("Workspace preparation stopped for %s (%s)", admission.id,
+                               type(exc).__name__)
+            status = "unknown" if code == "workspace_unknown" else "interrupted"
+            result = f"Workspace preparation stopped [{code}]"
+            if await self.executions.finish_workspace_preflight(admission, status, result, code):
+                await self.delegations.settle_background(admission.session_id, status, result)
+            return None
+        finally:
+            self.preparing.pop(admission.id, None)
+
+    async def execute(self, session, claim, *, resume=False, task_scope=None):
         self.active[claim.admission.id] = asyncio.current_task()
         clock = asyncio.get_running_loop().time
         started = clock()
@@ -552,16 +602,17 @@ class ProfileApplication:
                     remaining = min(remaining, deadline - time.time())
             if remaining <= 0:
                 raise DomainError("budget_exhausted", "Cumulative active execution time exhausted")
-            async with asyncio.timeout(remaining):
-                task_scope = self.scope
-                if coding_task:
-                    async with workspace_lease(self.scope.workspace):
+            runtime = None
+            deadline = asyncio.timeout(remaining)
+            try:
+                async with deadline:
+                    task_scope = task_scope or self.scope
+                    if resume and coding_task and coding_task["mode"] != "in_place":
                         task = await finish_io(
                             self.workspaces.open, coding_task.get("owner", session.id),
                             coding_task["mode"],
                         )
-                    task_scope = self.workspaces.scope_for(task)
-                async with workspace_lease(task_scope.workspace) if coding_task else nullcontext():
+                        task_scope = self.workspaces.scope_for(task)
                     runtime = self.runtime(
                         session,
                         claim,
@@ -573,7 +624,15 @@ class ProfileApplication:
                         execution_scope=task_scope,
                         coding_task=coding_task,
                     )
+                    if session.engine == "deep":
+                        runtime.deadline = clock() + remaining
+                        if binding and binding["snapshot"]["tools"] != runtime.tool_specs:
+                            runtime.legacy_tool_specs = binding["snapshot"]["tools"]
                     result = await runtime.run(resume=resume)
+            except TimeoutError:
+                if not deadline.expired() or runtime is None or session.harness != "coding":
+                    raise
+                result = await runtime.partial_coding_result("execution_wall_limit")
         except asyncio.CancelledError:
             await self.executions.settle(claim, "unknown", elapsed=clock() - started)
             await self.delegations.settle_background(session.id, "unknown", None)
@@ -756,10 +815,11 @@ class ProfileApplication:
                 return await self.development.stop(home, stop)
             if start is None:
                 return await asyncio.to_thread(self.development.list, home)
-            workspace = await finish_io(self.workspaces.open, session_id, task["mode"])
-            return await self.development.start(
-                home, workspace.root, **start, executor=self.executor
-            )
+            workspace = await self.workspaces.prepare(session_id, task["mode"])
+            async with workspace_lease(workspace.root):
+                return await self.development.start(
+                    home, workspace.root, **start, executor=self.executor
+                )
 
     @mutation
     async def deliver(self, session_id, action=None, revision=None, change_set_id=None):
@@ -871,11 +931,83 @@ class ProfileApplication:
             # clear the stranded input instead of being permanently blocked.
             await self.executions.recover_stale_active(set(self.active), session_id=session_id)
             admission = await self.store.get_admission(admission_id, session_id)
-        result = await self.executions.cancel_pending(session_id, admission_id)
+        result = await self.cancel_pending_admission(session_id, admission_id)
         await self.finish_sandbox(admission_id)
         if result.status == "cancelled":
             self.schedule(session_id)
         return result
+
+    async def cancel_pending_admission(self, session_id, admission_id):
+        result = await self.executions.cancel_pending(session_id, admission_id)
+        preparing = self.preparing.get(admission_id)
+        if result.status == "cancelled" and preparing is not None:
+            preparing.cancel()
+            await asyncio.wait({preparing}, timeout=number("lifecycle.cancel_wait_seconds"))
+        return result
+
+    @mutation
+    async def retry_workspace(self, session_id, admission_id):
+        await self.store.get_session(session_id, "operator")
+        await self.executions.retry_workspace(session_id, admission_id)
+        self.schedule(session_id)
+        return await self.store.get_admission(admission_id, session_id)
+
+    @mutation
+    async def retry_summary(self, session_id, admission_id):
+        async with self.locks.setdefault(session_id, asyncio.Lock()):
+            session = await self.store.get_session(session_id, "operator")
+            admission = await self.store.get_admission(admission_id, session_id)
+            if session.harness != "coding" or admission.status != "interrupted" or not (
+                admission.result or ""
+            ).startswith((
+                "部分结果 [coding_finalization]",
+                "部分结果 [coding_finalization_timeout]",
+                "部分结果 [coding_finalization_tool_request]",
+            )):
+                raise DomainError("summary_retry_denied", "No safe summary-only retry is available")
+            if await self.jobs.ledger.owner(session_id):
+                raise DomainError("summary_retry_denied", "Resume this input from the job controls")
+            history = await self.store.history(session_id, admission_id=admission_id)
+            files, commands, _ = coding_evidence(history)
+            if not (reading_evidence(history) or files or commands):
+                raise DomainError("summary_retry_denied", "No confirmed evidence can be summarized")
+            await self.sessions.validate(session)
+            binding = await self.sessions.policies.get(session_id)
+            snapshot = binding["snapshot"] if binding else {}
+            claim = await self.executions.claim_summary_retry(admission, self.owner)
+            task = asyncio.create_task(self.run_summary_retry(session, claim, snapshot))
+            self.active[admission_id] = task
+            self.track(task)
+            return claim.admission
+
+    async def run_summary_retry(self, session, claim, snapshot):
+        clock = asyncio.get_running_loop().time
+        started = clock()
+        try:
+            async with self.locks.setdefault(session.id, asyncio.Lock()):
+                async with self.run_slots or nullcontext():
+                    runtime = self.runtime(
+                        session, claim, snapshot.get("mcp_bindings"),
+                        model_id=snapshot.get("model_id"), coding_task=snapshot.get("coding_task"),
+                    )
+                    result = await runtime.retry_summary()
+                await self.executions.settle(
+                    claim, result["status"], result["result"], elapsed=clock() - started,
+                )
+                if result["status"] == "completed":
+                    self.schedule(session.id)
+        except asyncio.CancelledError:
+            await self.executions.settle(
+                claim, "interrupted", claim.admission.result, elapsed=clock() - started,
+            )
+            raise
+        except Exception as exc:
+            logger.warning("Summary retry stopped [%s]", type(exc).__name__)
+            await self.executions.settle(
+                claim, "interrupted", claim.admission.result, elapsed=clock() - started,
+            )
+        finally:
+            self.active.pop(claim.admission.id, None)
 
     @mutation
     async def backup(self, destination):

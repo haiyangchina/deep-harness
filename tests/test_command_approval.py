@@ -1,15 +1,19 @@
 """Every local command follows the same approval policy; no command is privileged."""
 
+import asyncio
 import json
+import os
+from pathlib import Path
 
 import pytest
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
+from test_atomic_tools import ScriptModel
 
 from deep_harness.application.capabilities import CORE_TOOLS, WEB_TOOLS
 from deep_harness.application.permissions import approval_reason
-from deep_harness.application.shell import BashArgs, bash
+from deep_harness.application.shell import BashArgs, bash, drain_output
 from deep_harness.application.tools import TOOL_ARGUMENTS, ToolGateway, tool_definitions
 from deep_harness.application.workspace import PROJECT_PROMPT
 from deep_harness.bootstrap import ProjectHost
@@ -94,6 +98,60 @@ async def test_real_shell_command_returns_stdout_text(tmp_path):
     assert "harness-stdout" in result["stdout"]
 
 
+@pytest.mark.parametrize("encoding", ["utf-8", "cp936"])
+async def test_shell_pipe_decodes_split_chinese_output(encoding):
+    reader = asyncio.StreamReader()
+    payload = "中文输出\n".encode(encoding)
+    previews = []
+
+    async def preview(value):
+        previews.append(value)
+
+    task = asyncio.create_task(drain_output(
+        reader, preview, live=True, fallback_encodings=("cp936",)
+    ))
+    for byte in payload:
+        reader.feed_data(bytes([byte]))
+        await asyncio.sleep(0)
+    reader.feed_eof()
+    assert await task == ("中文输出\n", False)
+    assert "".join(previews) == "中文输出\n"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Requires Windows PowerShell 5.1")
+@pytest.mark.parametrize(
+    ("command", "exit_code", "stdout", "error"),
+    [
+        ("Write-Output '中文' # " + "汉" * 30000, 0, "中文", False),
+        ("[Console]::Error.WriteLine('中文'); exit 7", 7, "", True),
+        ("Write-Output '中文' || Write-Output '备用'", 1, "", True),
+    ],
+    ids=["long-unicode-command", "stderr-and-exit-code", "parse-error"],
+)
+async def test_windows_powershell_output_is_utf8(
+    tmp_path, monkeypatch, command, exit_code, stdout, error,
+):
+    executable = Path(os.environ["SystemRoot"]) / (
+        "System32/WindowsPowerShell/v1.0/powershell.exe"
+    )
+    if not executable.is_file():
+        pytest.skip("Windows PowerShell 5.1 is unavailable")
+    monkeypatch.setattr(
+        "deep_harness.application.shell.shutil.which",
+        lambda name: str(executable) if name == "powershell" else None,
+    )
+    result = await bash(
+        BashArgs(command=command, shell="powershell", timeout_seconds=15),
+        lambda path: tmp_path / path,
+    )
+    assert result["exit_code"] == exit_code, result["stderr"]
+    assert result["stdout"].strip() == stdout
+    assert bool(result["stderr"]) == error
+    if error:
+        assert "中文" in result["stderr"]
+        assert "\ufffd" not in result["stderr"]
+
+
 class OneCommandChat(BaseChatModel):
     command: str = COMMAND
 
@@ -154,5 +212,51 @@ async def test_agent_command_follows_approval_mode(tmp_path, mode, monkeypatch):
             await app.wait_idle()
         assert (await app.store.get_admission(admission.id, session.id)).status == "completed"
         assert dispatched == [COMMAND]
+    finally:
+        await host.close()
+
+
+@pytest.mark.parametrize("engine", ["standard", "deep"])
+async def test_failed_command_does_not_open_duplicate_approval(tmp_path, monkeypatch, engine):
+    dispatched = []
+    corrected = "echo corrected"
+
+    async def fake_bash(arguments, path):
+        dispatched.append(arguments.command)
+        if arguments.command == corrected:
+            return {"exit_code": 0, "stdout": "corrected", "stderr": ""}
+        return {"exit_code": 1, "stdout": "", "stderr": "ParseException"}
+
+    monkeypatch.setattr("deep_harness.application.tools.bash", fake_bash)
+    host = ProjectHost(
+        tmp_path / "state",
+        tmp_path,
+        lambda scope: LangChainModel(ScriptModel(calls=[
+            {"name": "bash", "args": {"command": COMMAND}},
+            {"name": "read", "args": {"path": "notes.txt"}},
+            {"name": "bash", "args": {"command": COMMAND}},
+            {"name": "bash", "args": {"command": corrected}},
+        ])),
+    )
+    (tmp_path / "notes.txt").write_text("text", encoding="utf-8")
+    try:
+        app = await host.application("one")
+        session = await app.create_session(
+            "create", "Use bash", ("bash", "read"), engine=engine, permission_mode="auto",
+        )
+        admission = await app.submit(session.id, "send", "执行命令")
+        for command in (COMMAND, corrected):
+            await app.wait_idle()
+            pending = await app.store.get_admission(admission.id, session.id)
+            assert pending.status == "waiting_approval", pending.result
+            approvals = (await app.sessions.status(session.id))["approvals"]
+            assert len(approvals) == 1
+            assert approvals[0]["proposal"]["arguments"]["command"] == command
+            await app.approve(session.id, approvals[0]["id"], pending.generation, "approve")
+        await app.wait_idle()
+        done = await app.store.get_admission(admission.id, session.id)
+        assert done.status == "completed", done.result
+        assert "command_already_failed" in done.result
+        assert dispatched == [COMMAND, corrected]
     finally:
         await host.close()

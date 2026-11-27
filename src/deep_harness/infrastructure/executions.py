@@ -3,7 +3,7 @@
 import time
 from dataclasses import replace
 
-from sqlalchemy import delete, insert, select, update
+from sqlalchemy import delete, func, insert, select, update
 
 from deep_harness.domain.models import DomainError, ExecutionClaim
 from deep_harness.infrastructure import schema as s
@@ -66,46 +66,153 @@ class ExecutionLedger:
             row.status == "running" and (row.deadline is None or row.deadline > time.time())
         )
 
-    async def claim(self, session_id: str, owner: str) -> ExecutionClaim | None:
-        async with self.store.transaction() as conn:
-            if not await self._job_allows_claim(conn, session_id):
-                return None
-            stopped = (
-                await conn.execute(
-                    select(s.delegations.c.id).where(
-                        s.delegations.c.child_session_id == session_id,
-                        s.delegations.c.stop_requested == 1,
-                    )
+    async def _queued_candidate(self, conn, session_id):
+        if not await self._job_allows_claim(conn, session_id):
+            return None
+        stopped = (
+            await conn.execute(
+                select(s.delegations.c.id).where(
+                    s.delegations.c.child_session_id == session_id,
+                    s.delegations.c.stop_requested == 1,
                 )
-            ).first()
-            if stopped:
-                return None
-            blocked = (
-                await conn.execute(
-                    select(s.admissions.c.id).where(
-                        s.admissions.c.session_id == session_id,
-                        s.admissions.c.status.in_(BLOCKING),
-                    )
-                )
-            ).first()
-            if blocked:
-                return None
-            row = (
-                (
-                    await conn.execute(
-                        select(s.admissions)
-                        .where(
-                            s.admissions.c.session_id == session_id,
-                            s.admissions.c.status == "queued",
-                        )
-                        .order_by(s.admissions.c.ordinal)
-                        .limit(1)
-                    )
-                )
-                .mappings()
-                .first()
             )
-            if row is None:
+        ).first()
+        if stopped:
+            return None
+        blocked = (
+            await conn.execute(
+                select(s.admissions.c.id).where(
+                    s.admissions.c.session_id == session_id,
+                    s.admissions.c.status.in_(BLOCKING),
+                )
+            )
+        ).first()
+        if blocked:
+            return None
+        return (
+            (
+                await conn.execute(
+                    select(s.admissions)
+                    .where(
+                        s.admissions.c.session_id == session_id,
+                        s.admissions.c.status == "queued",
+                    )
+                    .order_by(s.admissions.c.ordinal)
+                    .limit(1)
+                )
+            )
+            .mappings()
+            .first()
+        )
+
+    async def queued_candidate(self, session_id):
+        async with self.store.engine.connect() as conn:
+            row = await self._queued_candidate(conn, session_id)
+            return admission_from(row) if row is not None else None
+
+    async def finish_workspace_preflight(self, admission, status, result, code):
+        async with self.store.transaction() as conn:
+            changed = await conn.execute(
+                update(s.admissions)
+                .where(
+                    s.admissions.c.id == admission.id,
+                    s.admissions.c.status == "queued",
+                    s.admissions.c.generation == admission.generation,
+                )
+                .values(status=status, result=result)
+            )
+            if changed.rowcount:
+                await self.store.append_event(
+                    conn, admission.session_id, f"execution.{status}",
+                    {"admission_id": admission.id, "code": code, "result": result},
+                )
+            return bool(changed.rowcount)
+
+    async def workspace_phase(self, admission, phase, **detail):
+        async with self.store.transaction() as conn:
+            queued = await conn.scalar(
+                select(s.admissions.c.id).where(
+                    s.admissions.c.id == admission.id,
+                    s.admissions.c.status == "queued",
+                    s.admissions.c.generation == admission.generation,
+                )
+            )
+            if queued is None:
+                raise DomainError("workspace_preflight_stale", "Input is no longer queued")
+            await self.store.append_event(
+                conn, admission.session_id, f"workspace.{phase}",
+                {"admission_id": admission.id, "phase": phase, **detail},
+            )
+
+    async def retry_workspace(self, session_id, admission_id):
+        allowed = ("workspace_busy", "workspace_timeout")
+        async with self.store.transaction() as conn:
+            changed = await conn.execute(
+                update(s.admissions)
+                .where(
+                    s.admissions.c.id == admission_id,
+                    s.admissions.c.session_id == session_id,
+                    s.admissions.c.generation == 0,
+                    s.admissions.c.status == "interrupted",
+                    s.admissions.c.result.in_(
+                        [f"Workspace preparation stopped [{code}]" for code in allowed]
+                    ),
+                )
+                .values(status="queued", result=None)
+            )
+            if not changed.rowcount:
+                raise DomainError(
+                    "workspace_retry_denied", "Workspace preparation cannot be retried"
+                )
+            await self.store.append_event(
+                conn, session_id, "workspace.retry", {"admission_id": admission_id},
+            )
+
+    async def claim_summary_retry(self, admission, owner):
+        async with self.store.transaction() as conn:
+            pending_effect = await conn.scalar(
+                select(s.effects.c.id).where(
+                    s.effects.c.admission_id == admission.id, s.effects.c.status == "dispatched",
+                ).limit(1)
+            )
+            began_finalizing = await conn.scalar(
+                select(s.events.c.seq).where(
+                    s.events.c.session_id == admission.session_id,
+                    s.events.c.type == "model.started",
+                    s.events.c.payload["phase"].as_string() == "finalizing",
+                    s.events.c.payload["id"].as_string().startswith(admission.id + ":",
+                                                                   autoescape=True),
+                ).limit(1)
+            )
+            if pending_effect is not None or began_finalizing is None:
+                raise DomainError("summary_retry_denied", "No safe summary-only retry is available")
+            changed = await conn.execute(
+                update(s.admissions)
+                .where(
+                    s.admissions.c.id == admission.id,
+                    s.admissions.c.session_id == admission.session_id,
+                    s.admissions.c.status == "interrupted",
+                    s.admissions.c.generation == admission.generation,
+                )
+                .values(status="started", generation=admission.generation + 1, owner=owner)
+            )
+            if not changed.rowcount:
+                raise DomainError("summary_retry_denied", "The input state changed")
+            claim = ExecutionClaim(
+                replace(admission, generation=admission.generation + 1, status="started"), owner,
+            )
+            await self.store.append_event(
+                conn, admission.session_id, "summary.retry_started",
+                {"admission_id": admission.id, "generation": claim.admission.generation},
+            )
+            return claim
+
+    async def claim(
+        self, session_id: str, owner: str, *, expected_admission=None,
+    ) -> ExecutionClaim | None:
+        async with self.store.transaction() as conn:
+            row = await self._queued_candidate(conn, session_id)
+            if row is None or (expected_admission is not None and row["id"] != expected_admission):
                 return None
             admission = replace(
                 admission_from(row),
@@ -134,6 +241,14 @@ class ExecutionLedger:
         ).first()
         if row is None:
             raise DomainError("lease_lost", "Execution no longer owns this admission")
+
+    async def tool_count(self, admission_id):
+        async with self.store.engine.connect() as conn:
+            return await conn.scalar(
+                select(func.count()).select_from(s.tool_attempts).where(
+                    s.tool_attempts.c.admission_id == admission_id,
+                )
+            )
 
     async def reserve_tools(self, claim, call_ids, limit):
         ids = set(call_ids)
@@ -325,6 +440,16 @@ class ExecutionLedger:
             is not None
         )
 
+    async def _has_summary_retry(self, conn, admission):
+        return await conn.scalar(
+            select(s.events.c.seq).where(
+                s.events.c.session_id == admission.session_id,
+                s.events.c.type == "summary.retry_started",
+                s.events.c.payload["admission_id"].as_string() == admission.id,
+                s.events.c.payload["generation"].as_integer() == admission.generation,
+            ).limit(1)
+        ) is not None
+
     async def recover(self) -> list[str]:
         """Recover only work that completed its graph and has no outstanding effect."""
         async with self.store.transaction() as conn:
@@ -352,7 +477,10 @@ class ExecutionLedger:
                 report_only = pending_effect is None and await self._has_report_checkpoint(
                     conn, admission
                 )
-                status = "queued" if report_only else "unknown"
+                if pending_effect is None and await self._has_summary_retry(conn, admission):
+                    status = "interrupted"
+                else:
+                    status = "queued" if report_only else "unknown"
                 await conn.execute(
                     update(s.admissions)
                     .where(s.admissions.c.id == admission.id)
@@ -418,8 +546,11 @@ class ExecutionLedger:
                     conn, admission
                 )
                 untouched = pending_effect is None and model_receipt is None
-                status = "queued" if (untouched or report_only) else "unknown"
-                reason = "untouched" if untouched else ("report" if report_only else "effect")
+                if pending_effect is None and await self._has_summary_retry(conn, admission):
+                    status, reason = "interrupted", "summary_retry"
+                else:
+                    status = "queued" if (untouched or report_only) else "unknown"
+                    reason = "untouched" if untouched else ("report" if report_only else "effect")
                 await conn.execute(
                     update(s.admissions)
                     .where(s.admissions.c.id == admission.id)

@@ -18,6 +18,7 @@ from deep_harness.application.capabilities import (
     reusable,
 )
 from deep_harness.application.workspace import MUTATING_TOOLS
+from deep_harness.domain.models import DomainError
 
 SENSITIVE_PARTS = {".git", ".ssh", ".aws", ".azure", ".kube", ".gnupg"}
 SENSITIVE_NAMES = {"agents.md", "claude.md", ".env", ".npmrc", ".netrc", "credentials"}
@@ -34,6 +35,19 @@ def sensitive_path(target):
 
 def classify(call, scope, resolve_path):
     """Map a call to (scope_key, reason) without inspecting command text."""
+    if call.name == "read_files":
+        targets = []
+        for row in call.arguments["files"]:
+            try:
+                targets.append(resolve_path(row["path"]))
+            except DomainError as exc:
+                if exc.code != "path_denied":
+                    raise
+        if any(not target.is_relative_to(scope.workspace) for target in targets):
+            return SCOPE_OUTSIDE, "批量读取包含工作区外的文件"
+        if any(sensitive_path(target) for target in targets):
+            return SCOPE_SENSITIVE, "批量读取包含敏感路径"
+        return SCOPE_FILE_READ, None
     if call.name == "apply_patch":
         return SCOPE_FILE_WRITE, "审阅并批准多文件补丁"
     if call.name == "project_instructions":

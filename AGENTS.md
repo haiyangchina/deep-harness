@@ -20,7 +20,7 @@ requirements, and update the manifest and lock; do not ask again for routine add
 
 ## 版本号规则
 
-当前生效版本为 **v1.1.6**。
+当前生效版本为 **v1.1.7**。
 只有用户明确要求修改版本号时才改版本。
 日常功能修复与其他项目修改沿用当前版本号。
 

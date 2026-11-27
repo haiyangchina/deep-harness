@@ -58,7 +58,7 @@ def text_content(data: bytes) -> str:
         raise DomainError("text_encoding", "File must contain valid UTF-8 text") from exc
 
 
-def read(arguments: ReadArgs, workspace_path, candidate_path=None):
+def read(arguments: ReadArgs, workspace_path, candidate_path=None, *, output_chars=OUTPUT_CHARS):
     target = workspace_path(arguments.path)
     candidate_path = candidate_path or workspace_path
     if target.is_dir():
@@ -92,7 +92,7 @@ def read(arguments: ReadArgs, workspace_path, candidate_path=None):
         }
     data = read_bytes(target)
     lines = text_content(data).splitlines(keepends=True)
-    remaining = OUTPUT_CHARS
+    remaining = output_chars
     parts = []
     line_index = arguments.offset - 1
     column = arguments.column
@@ -178,8 +178,7 @@ def replace_text(text: str, old: str, new: str) -> str:
     return text[:start] + new + text[end:]
 
 
-def mutate(arguments: WriteArgs | EditArgs, workspace_path):
-    target = workspace_path(arguments.path)
+def mutation_data(arguments: WriteArgs | EditArgs, target: Path) -> bytes:
     current = read_bytes(target) if target.exists() else None
     digest = hashlib.sha256(current).hexdigest() if current is not None else None
     if arguments.expected_sha256 is not None and arguments.expected_sha256 != digest:
@@ -194,6 +193,12 @@ def mutate(arguments: WriteArgs | EditArgs, workspace_path):
         if current is not None and arguments.expected_sha256 is None:
             raise DomainError("file_conflict", "Overwriting requires the SHA-256 from read")
         data = arguments.content.encode("utf-8")
+    return data
+
+
+def mutate(arguments: WriteArgs | EditArgs, workspace_path):
+    target = workspace_path(arguments.path)
+    data = mutation_data(arguments, target)
     atomic_write(target, data)
     return {
         "path": arguments.path,

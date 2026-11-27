@@ -37,7 +37,7 @@ def test_policy_table_is_exhaustive(mode):
         assert policy_for("full", key) == "exempt"
         assert policy_for("ask", key) == "per_call"
     assert reusable("auto", "file_write:workspace") is True
-    assert reusable("auto", "terminal:workspace") is True
+    assert reusable("auto", "terminal:workspace") is False
     assert reusable("ask", "file_write:workspace") is False
     assert reusable("full", "file_write:workspace") is False
 
@@ -114,7 +114,7 @@ async def test_scope_grant_lifecycle_is_scoped_and_revocable(tmp_path):
                     admission_id="adm-1",
                     proposal_hash="digest",
                     proposal={
-                        "scope_key": "terminal:workspace",
+                        "scope_key": "file_write:workspace",
                         "reusable": True,
                         "permission_revision": session.permission_revision,
                     },
@@ -122,28 +122,28 @@ async def test_scope_grant_lifecycle_is_scoped_and_revocable(tmp_path):
                 )
             )
         assert await app.receipts.scope_granted(
-            claim, "terminal:workspace", session.permission_revision, "adm-1:call-2"
+            claim, "file_write:workspace", session.permission_revision, "adm-1:call-2"
         )
         # A different scope, a changed mode revision and another admission never reuse.
         assert not await app.receipts.scope_granted(
             claim, "internet:external", session.permission_revision, "adm-1:call-2"
         )
         assert not await app.receipts.scope_granted(
-            claim, "terminal:workspace", session.permission_revision + 1, "adm-1:call-2"
+            claim, "file_write:workspace", session.permission_revision + 1, "adm-1:call-2"
         )
         other = SimpleNamespace(
             admission=SimpleNamespace(id="adm-2", session_id=session.id)
         )
         assert not await app.receipts.scope_granted(
-            other, "terminal:workspace", session.permission_revision
+            other, "file_write:workspace", session.permission_revision
         )
         # The operator can withdraw reuse for the current admission.
         await app.receipts.revoke_reuse(session.id, "adm-1")
         assert not await app.receipts.scope_granted(
-            claim, "terminal:workspace", session.permission_revision, "adm-1:call-2"
+            claim, "file_write:workspace", session.permission_revision, "adm-1:call-2"
         )
         assert await app.receipts.scope_granted(
-            other, "terminal:workspace", session.permission_revision
+            other, "file_write:workspace", session.permission_revision
         ) is False
     finally:
         await host.close()

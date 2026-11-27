@@ -120,6 +120,7 @@ EXTENSION_TOOLS: tuple[str, ...] = (
 )
 CODING_SESSION_TOOLS = (
     "apply_patch", "delegate_task", "check_delegation", "project_instructions", "symbols",
+    "read_files",
     "merge_delegations", "code_navigation",
 )
 CAPABILITY_VERSION = 2
@@ -180,9 +181,9 @@ ACCESS_SCOPES: tuple[AccessScope, ...] = (
 
 # Only these scopes may reuse one approval inside a single admission. Border
 # crossings never reuse an approval in any non-full mode.
-REUSABLE_SCOPES: frozenset[str] = frozenset({SCOPE_FILE_WRITE, SCOPE_TERMINAL})
+REUSABLE_SCOPES: frozenset[str] = frozenset({SCOPE_FILE_WRITE})
 ALWAYS_PER_CALL: frozenset[str] = frozenset(
-    {SCOPE_OUTSIDE, SCOPE_SENSITIVE, SCOPE_INTERNET, SCOPE_PERSISTENT}
+    {SCOPE_TERMINAL, SCOPE_OUTSIDE, SCOPE_SENSITIVE, SCOPE_INTERNET, SCOPE_PERSISTENT}
 )
 READ_ONLY_SCOPES: frozenset[str] = frozenset({SCOPE_FILE_READ})
 
@@ -194,7 +195,6 @@ PERMISSION_POLICY: dict[str, dict[str, str]] = {
         "*": "per_call",
         SCOPE_FILE_READ: "exempt",
         SCOPE_FILE_WRITE: "per_round",
-        SCOPE_TERMINAL: "per_round",
     },
     "full": {"*": "exempt"},
 }
@@ -210,7 +210,7 @@ PERMISSION_MODES: tuple[PermissionModeSpec, ...] = (
     PermissionModeSpec(
         key="auto",
         label="帮我批准",
-        description="同一轮任务内同类操作只问一次；工作区外与互联网仍逐次确认。",
+        description="同一轮的普通文件写入可以复用批准。终端、工作区外与互联网逐次确认。",
         approval="同一轮每类一次",
         requires_acknowledgement=False,
     ),

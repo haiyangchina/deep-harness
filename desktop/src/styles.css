@@ -572,6 +572,67 @@ nav button span {
   overflow-wrap: anywhere;
   font-size: 13px;
 }
+.markdown-flow {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.markdown-flow > :first-child { margin-top: 0; }
+.markdown-flow > :last-child { margin-bottom: 0; }
+.markdown-flow :is(h1, h2, h3, h4, h5, h6) {
+  margin: 1.25em 0 .45em;
+  line-height: 1.4;
+  letter-spacing: normal;
+  font-weight: 650;
+}
+.markdown-flow h1 { font-size: 1.55em; }
+.markdown-flow h2 { font-size: 1.35em; }
+.markdown-flow h3 { font-size: 1.15em; }
+.markdown-flow :is(h4, h5, h6) { font-size: 1em; }
+.markdown-flow :is(p, ul, ol, blockquote, pre, .markdown-table) {
+  margin: 0 0 .85em;
+}
+.markdown-flow :is(ul, ol) { padding-left: 1.65em; }
+.markdown-flow li + li { margin-top: .24em; }
+.markdown-flow li > :last-child { margin-bottom: 0; }
+.markdown-flow a { color: var(--accent); text-underline-offset: .2em; }
+.markdown-flow a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.markdown-flow blockquote {
+  border-left: 2px solid #536047;
+  padding-left: 1em;
+  color: #aeb9c7;
+}
+.markdown-flow :not(pre) > code, .report-body li > code {
+  background: #222a33;
+  color: #d9e7c9;
+  border-radius: 4px;
+  padding: .12em .38em;
+}
+.markdown-flow pre, .raw-tool-output {
+  max-width: 100%;
+  overflow: auto;
+  background: #13191f;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px 14px;
+  line-height: 1.6;
+  white-space: pre;
+  overflow-wrap: normal;
+}
+.markdown-flow :is(code, pre), .raw-tool-output {
+  font-family: Consolas, 'Cascadia Mono', monospace;
+  font-size: .92em;
+}
+.markdown-table { overflow-x: auto; }
+.markdown-table table { min-width: 100%; border-collapse: collapse; }
+.markdown-table :is(th, td) { padding: 6px 10px; border: 1px solid var(--line); }
+.markdown-table th { background: #222a33; text-align: left; }
+.markdown-flow hr { border: 0; border-top: 1px solid var(--line); margin: 1.3em 0; }
+.report-body > section { margin-top: 1.15em; white-space: normal; }
+.report-body section h3 { margin-bottom: .35em; }
+.report-body section ul { margin: 0; padding-left: 1.65em; }
+.report-body section li + li { margin-top: .35em; }
+.report-body li > code + .markdown-flow { margin-top: .15em; }
 .message.tool .message-content {
   font-size: 11px;
   color: #9aa6b5;

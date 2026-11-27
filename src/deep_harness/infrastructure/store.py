@@ -261,7 +261,14 @@ class BusinessStore:
                             "runtime_unbound",
                             "Session has no runtime binding",
                         )
-                    if binding != fingerprint(runtime_snapshot):
+                    equivalent = {fingerprint(runtime_snapshot)}
+                    if runtime_snapshot.get("coding_task") == {
+                        "mode": "in_place", "verification_command": None,
+                    }:
+                        old_snapshot = dict(runtime_snapshot)
+                        del old_snapshot["coding_task"]
+                        equivalent.add(fingerprint(old_snapshot))
+                    if binding not in equivalent:
                         raise DomainError(
                             "idempotency_conflict", "Creation runtime parameters changed"
                         )

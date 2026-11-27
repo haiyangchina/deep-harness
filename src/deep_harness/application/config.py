@@ -66,6 +66,14 @@ class ExecutionSettings(BaseModel):
     wall_seconds: float = Field(
         default=number("execution.wall_seconds"), ge=1, le=number("execution.wall_seconds_max")
     )
+    # Ceiling for a single tool await. Without this, one stuck tool call can
+    # hang the whole admission until the global wall budget expires, with no
+    # progress events emitted in between. Kept below wall_seconds on purpose.
+    tool_execution_timeout_seconds: float = Field(
+        default=number("execution.tool_execution_timeout_seconds"),
+        ge=number("execution.tool_execution_timeout_seconds_min"),
+        le=number("execution.tool_execution_timeout_seconds_max"),
+    )
 
     @model_validator(mode="after")
     def context_reserve(self):

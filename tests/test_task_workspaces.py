@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from time import perf_counter
 
 import pytest
@@ -13,8 +14,10 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from test_atomic_tools import ScriptModel
 
 from deep_harness.application.symbols import SymbolArgs, symbols
+from deep_harness.application.tools import ToolGateway
 from deep_harness.bootstrap import ProjectHost
-from deep_harness.domain.models import DomainError
+from deep_harness.domain.models import DomainError, ProfileScope
+from deep_harness.infrastructure import task_workspaces
 from deep_harness.runtime.inference import usage_totals
 from deep_harness.runtime.models import LangChainModel
 
@@ -355,3 +358,172 @@ async def test_operator_verifier_runs_when_agent_omits_it(tmp_path):
         assert evidence["receipt"]["exit_code"] == 0
     finally:
         await host.close()
+
+async def test_stalled_isolation_does_not_block_default_coding_and_can_be_cancelled(
+    tmp_path, monkeypatch,
+):
+    if not shutil.which("git"):
+        pytest.skip("Git is required for the unborn repository fixture")
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "source.txt").write_text("visible project contents", encoding="utf-8")
+    await asyncio.to_thread(subprocess.run, ["git", "init", "-q", str(project)], check=True)
+    worker = None
+    worker_started = asyncio.Event()
+    launch = asyncio.create_subprocess_exec
+
+    async def stall_build(*argv, **options):
+        nonlocal worker
+        if argv[-1] == "deep_harness.infrastructure.workspace_worker":
+            # Exercise the real subprocess, Windows job, cancellation and lock lifetimes.
+            worker = await launch(
+                sys.executable, "-c",
+                "import sys, time; sys.stdin.read(); time.sleep(60)", **options,
+            )
+            worker_started.set()
+            return worker
+        return await launch(*argv, **options)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", stall_build)
+    model = ScriptModel(calls=[{"name": "read", "args": {"path": "source.txt"}}])
+    host = ProjectHost(tmp_path / "state", project, lambda _: LangChainModel(model))
+    try:
+        app = await host.application("default")
+        isolate = await app.create_session(
+            "isolate", "Use project tools", ("read",), engine="deep", harness="coding",
+            workspace_mode="auto",
+        )
+        local = await app.create_session(
+            "local", "Use project tools", ("read",), engine="deep", harness="coding",
+        )
+        queued = await app.submit(isolate.id, "first", "Summarize the project")
+        await asyncio.wait_for(worker_started.wait(), timeout=10)
+        waiting = await app.store.get_admission(queued.id, isolate.id)
+        assert waiting.status == "queued"
+        assert waiting.generation == 0
+        assert await app.executions.active_seconds(waiting.id) == 0
+
+        summary = await app.submit(local.id, "second", "Summarize the project")
+        if task := app.drains.get(local.id):
+            await asyncio.wait_for(asyncio.shield(task), timeout=10)
+        saved = await app.store.get_admission(summary.id, local.id)
+        assert saved.status == "completed", saved.result
+        assert not app.workspaces.home(local.id).exists()
+        assert not (app.scope.home / "coding-workspaces").exists()
+
+        async with asyncio.timeout(10):
+            assert (await app.cancel(isolate.id, queued.id)).status == "cancelled"
+            await app.wait_idle()
+        assert worker.returncode is not None
+        async with task_workspaces.workspace_lease(project, wait_seconds=0.1):
+            pass
+    finally:
+        await host.close()
+
+
+async def test_busy_prepare_retries_without_stealing_or_replaying_a_claim(tmp_path, monkeypatch):
+    if not shutil.which("git"):
+        pytest.skip("Git is required for the unborn repository fixture")
+    project = tmp_path / "project"
+    project.mkdir()
+    await asyncio.to_thread(subprocess.run, ["git", "init", "-q", str(project)], check=True)
+    lease = task_workspaces.workspace_lease
+
+    def immediate_lease(root):
+        return lease(root, wait_seconds=0.05)
+
+    monkeypatch.setattr(task_workspaces, "workspace_lease", immediate_lease)
+    host = ProjectHost(
+        tmp_path / "state", project, lambda _: LangChainModel(ScriptModel(calls=[])),
+    )
+    try:
+        app = await host.application("default")
+        session = await app.create_session(
+            "create", "Use project tools", ("read",), engine="deep", harness="coding",
+            workspace_mode="auto",
+        )
+        async with lease(project):
+            queued = await app.submit(session.id, "send", "Summarize")
+            await app.wait_idle()
+        paused = await app.store.get_admission(queued.id, session.id)
+        assert paused.status == "interrupted"
+        assert paused.result == "Workspace preparation stopped [workspace_busy]"
+        assert paused.generation == 0
+        assert await app.executions.active_seconds(paused.id) == 0
+        await app.retry_workspace(session.id, queued.id)
+        await app.wait_idle()
+        completed = await app.store.get_admission(queued.id, session.id)
+        assert completed.status == "completed", completed.result
+        assert completed.generation == 1
+        marker = app.workspaces.home(session.id) / "workspace.json"
+        assert json.loads(marker.read_bytes())["mode"] == "copy"
+        with pytest.raises(DomainError, match="cannot be retried"):
+            await app.retry_workspace(session.id, queued.id)
+    finally:
+        await host.close()
+
+async def test_default_coding_write_waits_on_the_cross_profile_project_lease(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir()
+    reached_write = asyncio.Event()
+    progress = ToolGateway._progress
+
+    async def track_waiting(gateway, kind, effect_id, tool, **payload):
+        await progress(gateway, kind, effect_id, tool, **payload)
+        if kind == "workspace.waiting" and tool == "write":
+            reached_write.set()
+
+    monkeypatch.setattr(ToolGateway, "_progress", track_waiting)
+    model = ScriptModel(calls=[{"name": "write", "args": {"path": "new.txt", "content": "ok"}}])
+    host = ProjectHost(tmp_path / "state", project, lambda _: LangChainModel(model))
+    try:
+        first = await host.application("first")
+        second = await host.application("second")
+        session = await second.create_session(
+            "create", "Use project tools", ("write",), engine="deep", harness="coding",
+            permission_mode="full", full_access_acknowledged=True,
+        )
+        async with task_workspaces.workspace_lease(first.scope.workspace):
+            admission = await second.submit(session.id, "write", "Modify the project")
+            await asyncio.wait_for(reached_write.wait(), timeout=10)
+            assert not (project / "new.txt").exists()
+            events = await second.store.event_history(session.id, run_id=admission.id)
+            assert not any(event["type"] == "tool.started" for event in events)
+        await second.wait_idle()
+        saved = await second.store.get_admission(admission.id, session.id)
+        assert saved.status == "completed", saved.result
+        assert (project / "new.txt").read_text(encoding="utf-8") == "ok"
+    finally:
+        await host.close()
+
+async def test_workspace_worker_timeout_reaps_process_before_retry(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir()
+    state = tmp_path / "state"
+    manager = task_workspaces.TaskWorkspaces(ProfileScope("test", state, project, state))
+    launch = asyncio.create_subprocess_exec
+    worker = None
+
+    async def stall_once(*argv, **options):
+        nonlocal worker
+        if worker is None and argv[-1] == "deep_harness.infrastructure.workspace_worker":
+            worker = await launch(
+                sys.executable, "-c", "import sys, time; sys.stdin.read(); time.sleep(60)",
+                **options,
+            )
+            return worker
+        return await launch(*argv, **options)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(asyncio, "create_subprocess_exec", stall_once)
+        patch.setattr(task_workspaces, "PREPARATION_TIMEOUT_SECONDS", 0.2)
+        async with asyncio.timeout(10):
+            with pytest.raises(DomainError) as raised:
+                await manager.prepare("test", "copy")
+        assert raised.value.code == "workspace_timeout"
+        assert worker.returncode is not None
+
+    async with task_workspaces.workspace_lease(project, wait_seconds=0.1):
+        pass
+    task = await manager.prepare("test", "copy")
+    assert task.mode == "copy" and manager.state("test") == "ready"

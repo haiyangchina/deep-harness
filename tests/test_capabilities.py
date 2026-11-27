@@ -49,7 +49,7 @@ def test_manifest_describes_four_core_capabilities():
     assert set(policy["matrix"]) == {"ask", "auto", "full"}
     assert policy["matrix"]["ask"]["file_write:workspace"] == "per_call"
     assert policy["matrix"]["auto"]["file_write:workspace"] == "per_round"
-    assert policy["matrix"]["auto"]["terminal:workspace"] == "per_round"
+    assert policy["matrix"]["auto"]["terminal:workspace"] == "per_call"
     assert policy["matrix"]["auto"]["internet:external"] == "per_call"
     assert policy["matrix"]["full"]["file_write:workspace"] == "exempt"
     assert policy["matrix"]["full"]["file_read:workspace"] == "exempt"
@@ -78,7 +78,7 @@ def test_workspace_constants_are_derived():
     assert set(READ_TOOLS) == set(READ_ONLY_CORE)
     assert {"write", "edit", "bash", "apply_patch"} <= MUTATING_TOOLS
     assert set(CORE_TOOLS) | {
-        "apply_patch", "project_instructions", "symbols", "code_navigation",
+        "apply_patch", "project_instructions", "symbols", "code_navigation", "read_files",
     } == set(CODING_TOOLS)
 
 
@@ -87,7 +87,8 @@ def test_workspace_constants_are_derived():
     [
         ("general", CORE_TOOLS),
         ("coding", (*CORE_TOOLS, "apply_patch", "project_instructions", "symbols",
-                    "delegate_task", "check_delegation", "merge_delegations", "code_navigation")),
+                    "delegate_task", "check_delegation", "merge_delegations", "code_navigation",
+                    "read_files")),
         ("research", READ_ONLY_CORE),
         ("research_web", READ_ONLY_CORE),
     ],

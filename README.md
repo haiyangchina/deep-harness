@@ -38,7 +38,7 @@ deep-harness --help
 
 本地 CLI 的模型会话和桌面新会话默认采用 `coding`。新建本地编码会话时自动授予补丁、项目指令和子 Agent 工具。调查与审查子 Agent 使用只读仓库工具。承担修改的子 Agent 同步执行并继承父任务的审批、预算和工作区。模型在验收命令上设置 `purpose=verify`，宿主记录退出码和命令执行前后所观察到的文件版本。桌面可逐文件查看本轮差异，CLI 的 `diff` 可输出保存的文本差异。
 
-本地新建编码任务默认隔离。Git 仓库根目录有提交时使用独立的 detached worktree，其他目录使用隔离副本。可在桌面新建会话时选择模式，或在 CLI 使用 `--workspace-mode worktree|copy|in_place`。选 `copy` 可带入当前工作目录中可观测的未提交改动。可用 `--verify-command "命令"` 指定验收命令。只有该命令在任务根目录执行并与当前版本匹配，才会得到通过状态。
+本地新建编码任务默认使用当前项目目录，分析和修改可在同一会话完成。并行开发时可在桌面新建会话选择隔离方式，或使用 `--workspace-mode worktree|copy|auto`。Git 工作树从已有提交创建，当前未提交改动留在源目录。项目副本带入工作区中可观测的未提交改动。`auto` 在仓库根目录有可用提交时选择 worktree，否则使用项目副本。可用 `--verify-command "命令"` 指定验收命令。只有该命令在任务根目录执行并与当前版本匹配，才会得到通过状态。
 
 在桌面报告中打开「审查任务交付」，或用 CLI 的 `delivery SESSION_ID` 预览整个任务的变更。应用、撤销和清理时，CLI 需要提供 `--action apply|undo|discard --revision REVISION`。源文件变化时交付会停在冲突。未知的交付结果可以用 `--action reconcile` 核对。工作区清理后仍可按交付回执撤销已应用的变更。
 

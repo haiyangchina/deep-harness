@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
 import { readFile, writeFile, mkdir, realpath, rename, rm } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import path from 'node:path'
@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url'
 import type { DesktopProject, Settings } from '../src/protocol'
 import { LocalRuntime } from './runtime'
 import { validateSettings } from './settings'
+import { webLink } from '../src/web-link'
 
 const newRuntime = () => new LocalRuntime({
   electron: process.execPath,
@@ -92,6 +93,11 @@ async function boot() {
   const handlers: Record<string, (value: any) => unknown> = {
     info,
     request: value => runtime.request(value),
+    'open-link': value => {
+      const href = webLink(value)
+      if (!href) throw new Error('Unsupported link')
+      return shell.openExternal(href)
+    },
     stop: async () => {
       const result = await dialog.showMessageBox(window, {
         type: 'question',

@@ -194,6 +194,7 @@ class StandardRuntime:
                 continue
             try:
                 self.gateway.validate(call)
+                await self.gateway.check_repeated_command(call)
                 approval_required = self.gateway.approval_reason(call) is not None
                 approved = not approval_required or await self._approval(call)
                 content = "Tool denied by user."

@@ -112,6 +112,15 @@ execution:
   summary_characters_max: 4000
   wall_seconds: 600
   wall_seconds_max: 3600
+  # Per-tool await ceiling. A single tool call that hangs must fail within this
+  # bound instead of consuming the whole wall budget with no progress events.
+  # Bound only the execution, after the effect is durably dispatched; a timeout
+  # is therefore an unknown_effect requiring reconciliation, never a retry.
+  # Kept above the 120s max of a single bash command so bash can report its own
+  # precise timeout; this ceiling targets tools that hang with no internal bound.
+  tool_execution_timeout_seconds: 150
+  tool_execution_timeout_seconds_min: 1
+  tool_execution_timeout_seconds_max: 600
   min_context_reserve_chars: 1024
   delta_batch_chars: 128
   approval_replay_limit: 16
@@ -226,6 +235,8 @@ harness_evidence:
   source_max_length: 1000
   observation_max_length: 4000
 harness_report:
+  finalization_timeout_seconds: 45
+  finalization_output_tokens: 640
   repair_input_chars: 8000
   repair_timeout_seconds: 20
   summary_max_length: 8000

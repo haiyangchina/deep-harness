@@ -69,8 +69,7 @@ async def select_session(app, args):
         harness=harness,
         permission_mode=args.permission_mode or "ask",
         full_access_acknowledged=args.acknowledge_full_access,
-        workspace_mode=(args.workspace_mode or "auto") if harness == "coding" and not args.read_only
-        else args.workspace_mode,
+        workspace_mode=args.workspace_mode,
         verification_command=args.verify_command,
     )
 

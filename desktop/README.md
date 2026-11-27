@@ -125,7 +125,7 @@ context_window_tokens = 32768
 npm run dist:win
 ```
 
-生成 `release/deep-harness-1.1.6-x64.exe`（portable 目标）。这是桌面壳的便携包，
+生成 `release/deep-harness-1.1.7-x64.exe`（portable 目标）。这是桌面壳的便携包，
 **不包含 Conda、Python 依赖和 Ollama 模型**。目标 Windows 机器仍须先安装 deep-harness
 独立环境；启动后选择其 Python 路径即可。打包配置已提供，不等于已完成签名/干净机器安装验收。
 尚未提供自动安装 Python/模型的一体化安装器与自动更新。

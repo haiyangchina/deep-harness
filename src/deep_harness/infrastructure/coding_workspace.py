@@ -184,14 +184,15 @@ class CodingWorkspace:
         if self.final.exists():
             return json.loads(self.final.read_bytes())
         result = self.current_changes()
-        atomic_write(self.final, json.dumps(result).encode())
+        if result["status"] != "unavailable":
+            atomic_write(self.final, json.dumps(result).encode())
         return result
 
     def current_changes(self):
         baseline = self.read_baseline()
-        final = capture(
-            self.scope, include_text=True, previous_paths=baseline["files"] if baseline else ()
-        )
+        if baseline is None:
+            return {**changes_between(None, None), "revision": None}
+        final = capture(self.scope, include_text=True, previous_paths=baseline["files"])
         result = changes_between(baseline, final)
         result["revision"] = final["digest"] if final["complete"] else None
         return result

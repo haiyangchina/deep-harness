@@ -27,6 +27,7 @@ import type { Admission } from './protocol'
 import { TaskComposer } from './task-composer'
 import { TaskInspector } from './task-inspector'
 import { webResultStatus } from './web-result'
+import { Markdown, readReportText, type ReportText } from './markdown'
 import { appendImages, ImageStrip, stageImages } from './image-input'
 import type { ImageDraft } from './image-input'
 import './styles.css'
@@ -63,9 +64,8 @@ const starters = [
 ]
 type Page = 'jobs' | 'chat' | 'capabilities' | 'skills' | 'memories' | 'mcp/tools' | 'settings' | 'bundles'
 
-interface CodingReport {
+interface CodingReport extends ReportText {
   report_status: 'valid' | 'repaired' | 'unavailable'
-  summary: string
   execution_evidence: {
     files: { path: string; sha256: string }[]
     workspace?: {
@@ -218,12 +218,43 @@ function DevelopmentProcesses({ sessionId }: { sessionId: string }) {
 function readCodingReport(value?: string): CodingReport | null {
   try {
     const parsed = JSON.parse(value ?? '') as CodingReport
-    if (parsed?.report_status && Array.isArray(parsed.execution_evidence?.files) &&
-        Array.isArray(parsed.execution_evidence?.commands)) return parsed
+    const body = readReportText(parsed)
+    if (body && parsed.report_status && Array.isArray(parsed.execution_evidence?.files) &&
+        Array.isArray(parsed.execution_evidence?.commands)) return { ...parsed, ...body }
   } catch {
     return null
   }
   return null
+}
+
+function openMarkdownLink(href: string) {
+  void window.deepHarness.openLink(href).catch(report)
+}
+
+function ReplyMarkdown({ text }: { text: string }) {
+  return <Markdown text={text} openLink={openMarkdownLink} />
+}
+
+function ReportBody({ body, showActions = false }: { body: ReportText; showActions?: boolean }) {
+  const sections = [
+    ...(showActions ? [['改动', body.changes], ['验证', body.tests]] as const : []),
+    ['限制与未验证事项', body.limitations] as const
+  ]
+  return <div className="report-body">
+    <ReplyMarkdown text={body.summary} />
+    {body.evidence.length > 0 && <section>
+      <h3>代码依据</h3>
+      <ul>{body.evidence.map((entry, index) => (
+        <li key={index}><code>{entry.source}</code><ReplyMarkdown text={entry.observation} /></li>
+      ))}</ul>
+    </section>}
+    {sections.filter(([, items]) => items.length > 0).map(([title, items]) => (
+      <section key={title}>
+        <h3>{title}</h3>
+        <ul>{items.map((item, index) => <li key={index}><ReplyMarkdown text={item} /></li>)}</ul>
+      </section>
+    ))}
+  </div>
 }
 
 function Chat({ newSession, openModelSettings }: { newSession: () => void; openModelSettings: () => void }) {
@@ -272,6 +303,24 @@ function Chat({ newSession, openModelSettings }: { newSession: () => void; openM
   const interrupted = status?.active_admissions.find(a => a.status === 'interrupted')
   const paused = uncertain || interrupted
   const queuedCount = status?.active_admissions.filter(a => a.status === 'queued').length ?? 0
+  const workspaceEvent = latest && conversation?.events.findLast(event =>
+    event.payload.admission_id === latest.id &&
+    (event.type.startsWith('workspace.') || event.type.startsWith('tool.') ||
+      event.type === 'model.started' || event.type === 'message.committed'))
+  const workspacePhase = workspaceEvent?.type
+  const workspaceWaiting = (latest?.status === 'queued' || latest?.status === 'started') &&
+    workspacePhase === 'workspace.waiting'
+  const workspacePreparing = latest?.status === 'queued' &&
+    (workspacePhase === 'workspace.preparing' || workspacePhase === 'workspace.baseline')
+  const retryWorkspace = interrupted?.generation === 0 &&
+    /^Workspace preparation stopped \[(workspace_busy|workspace_timeout)\]$/.test(interrupted.result ?? '')
+  const retrySummary = status?.session.harness === 'coding' && !status?.job_id &&
+    /^部分结果 \[(coding_finalization|coding_finalization_timeout|coding_finalization_tool_request)\]/.test(interrupted?.result ?? '')
+  const workspaceAction = (admissionId: string, action: 'cancel' | 'retry-workspace' | 'retry-summary') =>
+    void perform(async () => {
+      await api(`/sessions/${sessionId}/admissions/${admissionId}/${action}`, 'POST')
+      await refreshConversation()
+    })
   const send = () =>
     void perform(async () => {
       if (paused) return
@@ -399,21 +448,27 @@ function Chat({ newSession, openModelSettings }: { newSession: () => void; openM
           )}
           {conversation?.messages
             .filter(message => message.image_ids?.length || (message.content !== '' && message.content !== null))
-            .map((message, index) => (
-              <article className={`message ${message.role}`} key={message.id || index}>
+            .map((message, index) => {
+              const reportText = message.role === 'assistant' ? readReportText(message.content) : null
+              if (reportText && codingReport && latest && message.id.startsWith(`${latest.id}:`)) {
+                return null
+              }
+              return <article className={`message ${message.role}`} key={message.id || index}>
                 <div className="message-role">
                   {message.role === 'user' ? '你' : message.role === 'assistant' ? 'deep-harness' : message.role}
                 </div>
                 {message.role === 'tool' ? (
                   <details>
                     <summary>{webResultStatus(message.content) ?? '工具执行结果'} · 展开查看</summary>
-                    <div className="message-content">
+                    <pre className="message-content raw-tool-output">
                       {typeof message.content === 'string' ? message.content : JSON.stringify(message.content, null, 2)}
-                    </div>
+                    </pre>
                   </details>
                 ) : (
                   <div className="message-content">
-                    {typeof message.content === 'string' ? message.content : JSON.stringify(message.content, null, 2)}
+                    {reportText ? <ReportBody body={reportText} showActions /> :
+                      typeof message.content === 'string' ? <ReplyMarkdown text={message.content} /> :
+                        <pre>{JSON.stringify(message.content, null, 2)}</pre>}
                   </div>
                 )}
                 <ImageStrip images={message.image_ids?.map(id => ({ id })) ?? []} load={loadImage}
@@ -421,19 +476,19 @@ function Chat({ newSession, openModelSettings }: { newSession: () => void; openM
                   context={status?.active_admissions.some(row => message.id === `${row.id}:user` && row.status === 'queued')
                     ? undefined : status?.image_context ?? undefined} />
               </article>
-            ))}
+            })}
           {latest && !conversation?.messages.some(message => message.id === `${latest.id}:user`) && (
             <article className="message user">
               <div className="message-role">当前任务 · {latest.status}</div>
-              <div className="message-content">{latest.text}</div>
+              <div className="message-content"><ReplyMarkdown text={latest.text} /></div>
             </article>
           )}
           {codingReport && (
             <article className="message assistant">
               <div className="message-role">编码执行结果</div>
               <div className="message-content">
-                <p>{codingReport.report_status === 'unavailable'
-                  ? '执行已结束，报告生成失败。' : codingReport.summary}</p>
+                {codingReport.report_status === 'unavailable'
+                  ? <p>执行已结束，报告生成失败。</p> : <ReportBody body={codingReport} />}
                 {codingReport.execution_evidence.verification && (
                   <p>
                     {verificationLabels[codingReport.execution_evidence.verification.status]}
@@ -442,9 +497,13 @@ function Chat({ newSession, openModelSettings }: { newSession: () => void; openM
                     )}
                   </p>
                 )}
-                {codingReport.execution_evidence.workspace && (
+                {codingReport.execution_evidence.workspace &&
+                  codingReport.execution_evidence.workspace.status !== 'unavailable' && (
                   <details>
-                    <summary>本轮工作区差异 · {codingReport.execution_evidence.workspace.files.length} 个文件</summary>
+                    <summary>工作区观测差异 · {codingReport.execution_evidence.workspace.files.length} 个文件</summary>
+                    {!codingReport.execution_evidence.workspace.isolated && (
+                      <p>当前目录的差异可能包含同时发生的外部修改。</p>
+                    )}
                     {codingReport.execution_evidence.workspace.status !== 'observed' && (
                       <p>工作区快照不完整。</p>
                     )}
@@ -473,7 +532,9 @@ function Chat({ newSession, openModelSettings }: { newSession: () => void; openM
                     ))}</ul>
                   </details>
                 )}
-                {!codingReport.execution_evidence.workspace && codingReport.execution_evidence.files.length > 0 && (
+                {(!codingReport.execution_evidence.workspace?.isolated ||
+                  codingReport.execution_evidence.workspace.status === 'unavailable') &&
+                  codingReport.execution_evidence.files.length > 0 && (
                   <ul>{codingReport.execution_evidence.files.map(file => (
                     <li key={file.path}>已修改 <code>{file.path}</code></li>
                   ))}</ul>
@@ -499,7 +560,7 @@ function Chat({ newSession, openModelSettings }: { newSession: () => void; openM
           {running && deltas && (
             <article className="message assistant">
               <div className="message-role">deep-harness · 生成中</div>
-              <div className="message-content">{deltas}</div>
+              <div className="message-content"><ReplyMarkdown text={deltas} /></div>
             </article>
           )}
           {running && commandOutput && (
@@ -509,7 +570,9 @@ function Chat({ newSession, openModelSettings }: { newSession: () => void; openM
             </article>
           )}
           {(paused?.result || (latest?.status !== 'completed' && latest?.result)) && (
-            <p className="notice">{paused?.result || latest?.result}</p>
+            <div className="notice">
+              <ReplyMarkdown text={paused?.result || latest?.result || ''} />
+            </div>
           )}
           {latest?.status === 'completed' && !latest.result && !running && (
             <p className="notice">
@@ -546,13 +609,32 @@ function Chat({ newSession, openModelSettings }: { newSession: () => void; openM
               </button>
             </div>
           )}
+          {latest && (workspaceWaiting || workspacePreparing) && (
+            <div className="notice">
+              <strong>{workspaceWaiting ? '正在等待项目锁' :
+                workspacePhase === 'workspace.baseline' ? '正在记录隔离工作区基线' : '正在准备隔离工作区'}</strong>
+              <button disabled={busy} onClick={() => workspaceAction(latest.id, 'cancel')}>取消</button>
+            </div>
+          )}
           {interrupted && (
             <div className="notice">
-              <strong>任务已停止，请查看上方原因。</strong>
-              <p>模型连接或执行预算问题解决后，可新建会话重试。</p>
-              <button disabled={busy} onClick={newSession}>
-                新建会话
-              </button>
+              <strong>{retrySummary ? '已有项目证据，汇总未完成。' : '任务已停止，请查看上方原因。'}</strong>
+              {retrySummary ? <>
+                <p>只使用已读取的证据重新生成答复。</p>
+                <button disabled={busy} onClick={() => workspaceAction(interrupted.id, 'retry-summary')}>
+                  仅重试汇总
+                </button>
+              </> : retryWorkspace ? <>
+                <p>模型和工具尚未运行。项目可用后，可重试这条输入。</p>
+                <button disabled={busy} onClick={() => workspaceAction(interrupted.id, 'retry-workspace')}>
+                  重试工作区准备
+                </button>
+              </> : <>
+                {interrupted.result?.includes('[workspace_git]') && <p>Git 工作树需要已有提交。可新建会话并选择当前项目或隔离副本。</p>}
+                {interrupted.result?.includes('[workspace_incomplete]') && <p>项目副本超过复制上限或包含无法读取的文件。</p>}
+                {interrupted.result?.includes('[workspace_busy]') && <p>项目正被其他操作占用，等待该操作完成后再试。</p>}
+                <button disabled={busy} onClick={newSession}>新建会话</button>
+              </>}
             </div>
           )}
           <div ref={tail} />

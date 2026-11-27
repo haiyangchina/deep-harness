@@ -17,9 +17,10 @@ def preserve_tool_binding(binding, snapshot):
     """Recognize compatible historical tool schemas without changing their fingerprints."""
     if not binding or binding["fingerprint"] == fingerprint(snapshot):
         return snapshot
-    for old_images, old_patch, old_roles, old_isolation in product((False, True), repeat=4):
-        if not (old_images or old_patch or old_roles or old_isolation):
-            continue
+    saved_tools = {tool["name"]: tool for tool in binding["snapshot"]["tools"]}
+    for old_images, old_patch, old_roles, old_isolation, old_coding_tools in product(
+        (False, True), repeat=5,
+    ):
         legacy = deepcopy(snapshot)
         for tool in legacy["tools"]:
             if tool["name"] == "delegate_task":
@@ -30,6 +31,15 @@ def preserve_tool_binding(binding, snapshot):
                     properties["kind"]["enum"] = ["research", "coding"]
                 if old_isolation:
                     properties.pop("isolate", None)
+            if old_coding_tools and tool["name"] in {"list_files", "bash"}:
+                old_tool = saved_tools.get(tool["name"])
+                if old_tool is not None:
+                    tool["description"] = old_tool["description"]
+                if tool["name"] == "list_files" and old_tool and "recursive" not in (
+                    old_tool["parameters"]["properties"]
+                ):
+                    tool["parameters"]["properties"].pop("recursive", None)
+                    tool["parameters"]["title"] = "ListFilesArgs"
             if old_patch and tool["name"] == "apply_patch":
                 tool["parameters"]["properties"]["files"]["minItems"] = 2
         if binding["fingerprint"] == fingerprint(legacy):

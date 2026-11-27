@@ -60,6 +60,38 @@ class ReceiptLedger:
                     response,
                 )
 
+    async def has_dispatched_effects(self, claim):
+        async with self.store.engine.connect() as conn:
+            return await conn.scalar(
+                select(s.effects.c.id).where(
+                    s.effects.c.admission_id == claim.admission.id,
+                    s.effects.c.status == "dispatched",
+                ).limit(1)
+            ) is not None
+
+    async def latest_non_read_tool_effect(self, claim, local_reads):
+        payload = s.events.c.payload
+        async with self.store.engine.connect() as conn:
+            return (
+                await conn.execute(
+                    select(
+                        s.effects.c.id,
+                        s.effects.c.proposal_hash,
+                        s.effects.c.status,
+                        s.effects.c.result,
+                    )
+                    .join(s.events, payload["effect_id"].as_string() == s.effects.c.id)
+                    .where(
+                        s.effects.c.admission_id == claim.admission.id,
+                        s.events.c.session_id == claim.admission.session_id,
+                        s.events.c.type == "tool.started",
+                        payload["tool"].as_string().not_in(sorted(local_reads)),
+                    )
+                    .order_by(s.events.c.seq.desc())
+                    .limit(1)
+                )
+            ).mappings().first()
+
     async def prepare_effect(self, claim: ExecutionClaim, key: str, digest: str) -> dict | None:
         async with self.store.transaction() as conn:
             await self.executions.assert_claim(conn, claim)

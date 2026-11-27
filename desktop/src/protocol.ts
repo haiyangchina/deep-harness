@@ -27,6 +27,7 @@ export interface DesktopBridge {
   openProject(id: string | null): Promise<RuntimeInfo>
   choose(kind: 'python' | 'workspace' | 'stateDir' | 'configFile'): Promise<string | null>
   request<T = unknown>(request: ApiRequest): Promise<T>
+  openLink(href: string): Promise<void>
 }
 export interface Session {
   id: string

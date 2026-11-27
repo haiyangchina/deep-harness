@@ -3,6 +3,36 @@ import { useState } from 'react'
 import { Json } from './components'
 import { $busy, $conversation, $runtime, api, perform, refreshConversation, refreshInspector, report } from './state'
 
+function eventLabel(event: { type: string; payload: unknown }): string {
+  const payload = event.payload as { tool?: unknown; elapsed_ms?: unknown; phase?: unknown; error_code?: unknown; fallback?: unknown } | null
+  const tool = payload && typeof payload.tool === 'string' ? payload.tool : null
+  if (event.type === 'workspace.waiting') return tool ? `等待项目锁 · ${tool}` : '等待项目锁'
+  if (event.type === 'workspace.preparing') return '正在准备隔离工作区'
+  if (event.type === 'workspace.baseline') return '正在记录隔离工作区基线'
+  if (event.type === 'workspace.ready') {
+    const mode = (event.payload as { mode?: string } | null)?.mode
+    return mode === 'worktree' ? 'Git 工作树已就绪' : '隔离副本已就绪'
+  }
+  if (event.type === 'workspace.retry') return '已重新排队准备工作区'
+  if (event.type === 'summary.retry_started') return '已开始重试汇总'
+  if (event.type === 'model.started') return payload?.phase === 'finalizing' ? '正在汇总证据' : '正在调用模型'
+  if (event.type === 'tool.started') {
+    return tool ? `正在执行工具 · ${tool}` : '正在执行工具'
+  }
+  if (event.type === 'tool.failed') {
+    if (payload?.fallback === 'shallow') return '目录枚举超时 · 已返回浅层结果'
+    const label = payload?.error_code === 'TimeoutError' ? '工具超时' : '工具未完成'
+    return tool ? `${label} · ${tool}` : label
+  }
+  if (event.type === 'tool.completed') {
+    const ms = payload && typeof payload.elapsed_ms === 'number'
+      ? ` · ${(payload.elapsed_ms / 1000).toFixed(1)}s`
+      : ''
+    return tool ? `工具完成 · ${tool}${ms}` : '工具完成'
+  }
+  return event.type
+}
+
 function proposalScope(proposal: unknown): string | null {
   if (proposal && typeof proposal === 'object' && 'scope_key' in proposal) {
     const value = (proposal as { scope_key?: unknown }).scope_key
@@ -148,7 +178,7 @@ export function TaskInspector() {
               <details key={event.seq}>
                 <summary>
                   <span className="event-dot" />
-                  {event.type}
+                  {eventLabel(event)}
                   <small>#{event.seq}</small>
                 </summary>
                 <Json value={event.payload} />

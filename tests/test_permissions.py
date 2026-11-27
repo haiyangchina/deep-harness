@@ -142,7 +142,7 @@ async def test_network_commands_dispatch_only_under_the_selected_policy(
         await host.close()
 
 
-async def test_auto_reuses_command_approval_within_one_admission(tmp_path, monkeypatch):
+async def test_auto_checks_each_command_in_one_admission(tmp_path, monkeypatch):
     dispatched = []
 
     async def command(arguments, path):
@@ -168,13 +168,20 @@ async def test_auto_reuses_command_approval_within_one_admission(tmp_path, monke
         approval = (await app.sessions.status(session.id))["approvals"][0]
         assert approval["proposal"]["arguments"]["command"] == "echo safe"
         assert approval["proposal"]["scope_key"] == "terminal:workspace"
-        assert approval["proposal"]["reusable"] is True
+        assert approval["proposal"]["reusable"] is False
+        await app.approve(session.id, approval["id"], pending.generation, "approve")
+        await app.wait_idle()
+        pending = await app.store.get_admission(admission.id, session.id)
+        assert pending.status == "waiting_approval"
+        assert dispatched == ["echo safe"]
+        approval = (await app.sessions.status(session.id))["approvals"][0]
+        assert approval["proposal"]["arguments"]["command"] == "echo risky > risky.txt"
         await app.approve(session.id, approval["id"], pending.generation, "approve")
         await app.wait_idle()
         assert dispatched == ["echo safe", "echo risky > risky.txt"]
         assert (await app.store.get_admission(admission.id, session.id)).status == "completed"
         events = await app.store.event_history(session.id)
-        assert sum(event["type"] == "approval.reused" for event in events) == 1
+        assert not any(event["type"] == "approval.reused" for event in events)
     finally:
         await host.close()
 
