@@ -1,13 +1,69 @@
 """Authenticated HTTP contract and durable input handling."""
 
+import asyncio
+
 import httpx
 import pytest
 
 from deep_harness.bootstrap import ProjectHost
 from deep_harness.domain.models import DomainError
+from deep_harness.runtime.models import DiagnosticModel
 from deep_harness.transports.api import create_api
 
 TOKEN = "test-local-operator-token-with-32-characters"
+
+
+async def test_first_model_fragment_reaches_waiting_client_before_completion(tmp_path):
+    publish = asyncio.Event()
+    finish = asyncio.Event()
+    model_started = asyncio.Event()
+
+    class StreamingModel(DiagnosticModel):
+        async def stream(self, prompt, messages, tools):
+            model_started.set()
+            await publish.wait()
+            yield {"kind": "delta", "text": "First"}
+            await finish.wait()
+            yield {"kind": "delta", "text": " final"}
+            yield {"kind": "result", "response": {"role": "assistant", "content": "First final"}}
+
+    host = ProjectHost(tmp_path / "state", tmp_path, lambda _: StreamingModel())
+    api = create_api(host, TOKEN, workspace_id="one")
+    prefix = "/api/v1/workspaces/one/sessions"
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=api), base_url="http://local",
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        ) as client:
+            created = await client.post(prefix, json={"request_id": "stream"})
+            route = f"{prefix}/{created.json()['id']}"
+            accepted = await client.post(route + "/runs", json={
+                "submission_id": "stream-run", "text": "Example",
+            })
+            assert accepted.status_code == 202
+            async with asyncio.timeout(3):
+                await model_started.wait()
+                history = (await client.get(route + "/event-history")).json()["events"]
+                cursor = history[-1]["seq"]
+                waiting = asyncio.create_task(client.get(route + "/event-history", params={
+                    "after": cursor, "wait": 3,
+                }))
+                await asyncio.sleep(0)
+                publish.set()
+                page = (await waiting).json()["events"]
+            fragments = [
+                event["payload"]["text"] for event in page if event["type"] == "model.delta"
+            ]
+            assert fragments == ["First"]
+            assert (await client.get(route)).json()["latest_admission"]["status"] == "started"
+            finish.set()
+            await (await host.application("one")).wait_idle()
+            status = (await client.get(route)).json()
+            assert status["latest_admission"]["result"] == "First final"
+    finally:
+        publish.set()
+        finish.set()
+        await host.close()
 
 
 async def test_deep_harness_and_delegation_catalog_are_authentic_session_fields(tmp_path):
@@ -112,6 +168,29 @@ async def test_authenticated_submit_returns_durable_receipt_and_replayable_event
                 {event["seq"] for event in events},
             )
             assert events[-1]["type"] == "execution.completed"
+    finally:
+        await host.close()
+
+
+async def test_versioned_local_api_keeps_the_existing_profile_and_requires_bearer(tmp_path):
+    host = ProjectHost(tmp_path / "state", tmp_path)
+    api = create_api(host, TOKEN, workspace_id="one")
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    root = "/api/v1/workspaces/one"
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=api), base_url="http://local"
+        ) as client:
+            assert (await client.get(root + "/sessions")).status_code == 401
+            foreign = await client.get("/api/v1/workspaces/two/sessions", headers=headers)
+            assert foreign.status_code == 404
+            assert not (tmp_path / "state" / "profiles" / "two").exists()
+            payload = {"request_id": "existing"}
+            old = await client.post("/profiles/one/sessions", headers=headers, json=payload)
+            new = await client.post(root + "/sessions", headers=headers, json=payload)
+            assert new.status_code == 200, new.text
+            assert new.json()["id"] == old.json()["id"]
+            assert new.headers["cache-control"] == "no-store"
     finally:
         await host.close()
 

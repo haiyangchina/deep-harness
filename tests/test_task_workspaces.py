@@ -270,7 +270,8 @@ async def test_development_process_has_live_output_and_durable_stop(tmp_path):
         await host.close()
 
 
-async def test_managed_task_pauses_at_tool_boundary(tmp_path):
+@pytest.mark.parametrize("coding", [True, False])
+async def test_session_pauses_at_tool_boundary(tmp_path, coding):
     started = asyncio.Event()
     release = asyncio.Event()
     project = tmp_path / "project"
@@ -289,8 +290,9 @@ async def test_managed_task_pauses_at_tool_boundary(tmp_path):
     try:
         app = await host.application("default")
         session = await app.create_session(
-            "create", "Pause safely", ("write",), engine="deep", harness="coding",
-            workspace_mode="copy", permission_mode="full", full_access_acknowledged=True,
+            "create", "Pause safely", ("write",), engine="deep" if coding else "standard",
+            harness="coding" if coding else "general", workspace_mode="copy" if coding else None,
+            permission_mode="full", full_access_acknowledged=True,
         )
         admission = await app.submit(session.id, "run", "Write file")
         async with asyncio.timeout(8):
@@ -300,7 +302,7 @@ async def test_managed_task_pauses_at_tool_boundary(tmp_path):
         await app.wait_idle()
         pending = await app.store.get_admission(admission.id, session.id)
         assert pending.status == "job_paused", pending.result
-        target = app.workspaces.home(session.id) / "tree" / "output.txt"
+        target = (app.workspaces.home(session.id) / "tree" if coding else project) / "output.txt"
         assert not target.exists()
         assert not (await app.task_control(session.id, "resume"))["pause_requested"]
         await app.wait_idle()

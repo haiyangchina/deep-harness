@@ -13,6 +13,13 @@ from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import Admission, DomainError, ExecutionClaim, Session
 from deep_harness.infrastructure import schema as s
 from deep_harness.infrastructure.database import initialize_database
+from deep_harness.infrastructure.session_management import (
+    assert_request_available,
+    deleting_sessions,
+)
+from deep_harness.infrastructure.session_management import (
+    metadata as session_management_metadata,
+)
 from deep_harness.server_config import number
 
 LIVE_PAGE_SIZE = number("pagination.live_page_size")
@@ -46,6 +53,7 @@ class BusinessStore:
         async with self.engine.begin() as conn:
             await conn.exec_driver_sql("PRAGMA journal_mode=WAL")
             await conn.exec_driver_sql("PRAGMA foreign_keys=ON")
+            await conn.run_sync(session_management_metadata.create_all)
 
     async def close(self) -> None:
         await self.engine.dispose()
@@ -86,6 +94,7 @@ class BusinessStore:
                     s.sessions.c.profile_id == self.profile_id,
                     s.sessions.c.principal == principal,
                     s.sessions.c.id > after,
+                    s.sessions.c.id.not_in(deleting_sessions()),
                 )
                 .order_by(s.sessions.c.id)
                 .limit(limit + 1)
@@ -232,6 +241,7 @@ class BusinessStore:
         creation["permission_mode"] = permission_mode
         digest = fingerprint(creation)
         async with self.transaction() as conn:
+            await assert_request_available(conn, principal, request_id)
             row = (
                 (
                     await conn.execute(
@@ -319,6 +329,7 @@ class BusinessStore:
                             s.sessions.c.id == session_id,
                             s.sessions.c.profile_id == self.profile_id,
                             s.sessions.c.principal == principal,
+                            s.sessions.c.id.not_in(deleting_sessions()),
                         )
                     )
                 )
@@ -348,6 +359,10 @@ class BusinessStore:
             payload["image_ids"] = image_ids
         digest = fingerprint(payload)
         async with self.transaction() as conn:
+            if await conn.scalar(select(s.sessions.c.id).where(
+                s.sessions.c.id == session.id, s.sessions.c.id.not_in(deleting_sessions()),
+            )) is None:
+                raise DomainError("session_not_found", "Session is not accessible")
             row = (
                 (
                     await conn.execute(
@@ -423,7 +438,10 @@ class BusinessStore:
     async def run_session(self, run_id):
         async with self.engine.connect() as conn:
             session_id = await conn.scalar(
-                select(s.admissions.c.session_id).where(s.admissions.c.id == run_id)
+                select(s.admissions.c.session_id).where(
+                    s.admissions.c.id == run_id,
+                    s.admissions.c.session_id.not_in(deleting_sessions()),
+                )
             )
         if session_id is None:
             raise DomainError("admission_not_found", "Run is not accessible")
@@ -602,7 +620,10 @@ class BusinessStore:
         self, session_id: str, after: int = 0, *, tail=False, run_id=None
     ) -> list[dict]:
         order = s.events.c.seq.desc() if tail else s.events.c.seq
-        query = select(s.events).where(s.events.c.session_id == session_id, s.events.c.seq > after)
+        query = select(s.events).where(
+            s.events.c.session_id == session_id, s.events.c.seq > after,
+            s.events.c.session_id.not_in(deleting_sessions()),
+        )
         if run_id is not None:
             payload = s.events.c.payload
             event_id = payload["id"].as_string()

@@ -119,6 +119,7 @@ class InstanceHost:
             "label": self.registered[name]["label"] if name in self.registered else name,
             "mode": workspace.mode,
             "mcp_tools": list(workspace.mcp_tools),
+            **({"manage_knowledge": True} if workspace.manage_knowledge else {}),
         }
 
     async def add_project(self, path, label, mode):
@@ -240,6 +241,11 @@ class InstanceHost:
 
     async def create_session(self, workspace_id, body):
         app = await self.application(workspace_id)
+        if (
+            body.permission_mode not in {None, "ask"} or body.extensions or body.mcp_tools
+            or body.risk_acknowledged or body.workspace_mode is not None
+        ):
+            raise DomainError("operation_denied", "Session options are outside server policy")
         agent = self.settings.agents.get(body.agent_id)
         if body.agent_id and agent is None:
             raise DomainError("agent_not_found", "Agent is not configured")

@@ -2,7 +2,8 @@ import { useStore } from '@nanostores/react'
 import { useEffect, useState } from 'react'
 import type { CapabilityManifest, CapabilitySpec, Settings, Session, PermissionMode } from './protocol'
 import { PermissionPicker } from './permission-picker'
-import { $busy, $runtime, api, initialize, loadSessions, openSession, perform, report, resetView, storageKey } from './state'
+import { $busy, $runtime, api, initialize, loadSessions, openSession, perform, report, resetView, storageKey, workspaceApi } from './state'
+import { newRequestId } from './workspace-api'
 
 export function Json({ value }: { value: unknown }) {
   return <pre className="json">{JSON.stringify(value, null, 2)}</pre>
@@ -139,14 +140,26 @@ interface CreateRequest {
   risk_acknowledged?: boolean
   workspace_mode?: string
   verification_command?: string
+  model_id?: string
+  agent_id?: string
 }
 
 export function CreateSession({ close }: { close: () => void }) {
+  const runtime = useStore($runtime)!
+  const catalog = runtime.catalog
+  const sandbox = catalog?.workspaces.find(row => row.id === runtime.projectId)?.mode === 'sandbox'
   const [saved, setSaved] = useState<CreateRequest | null>(() => {
     const raw = localStorage.getItem(storageKey('create'))
     return raw ? JSON.parse(raw) : null
   })
-  const [harness, setHarness] = useState(saved?.harness ?? 'coding')
+  const [harness, setHarness] = useState(saved?.harness ?? (catalog ? 'general' : 'coding'))
+  const [model, setModel] = useState(saved?.model_id ?? catalog?.default_model ?? '')
+  const [agent, setAgent] = useState(saved?.agent_id ?? '')
+  const selectedAgent = catalog?.agents.find(row => row.id === agent)
+  const taskHarness = selectedAgent?.harness ?? harness
+  const [useFiles, setUseFiles] = useState(saved?.tools?.includes('read') ?? false)
+  const [useShell, setUseShell] = useState(saved?.tools?.includes('bash') ?? false)
+  const [useWeb, setUseWeb] = useState(saved?.tools?.includes('web_search') ?? false)
   const [workspaceMode, setWorkspaceMode] = useState(saved?.workspace_mode ?? 'in_place')
   const [verification, setVerification] = useState(saved?.verification_command ?? '')
   const [permissionMode, setPermissionMode] = useState<PermissionMode>(saved ? saved.permission_mode : 'ask')
@@ -154,7 +167,7 @@ export function CreateSession({ close }: { close: () => void }) {
   const [showExtensions, setShowExtensions] = useState(Boolean(saved?.extensions?.length))
   const [manifest, setManifest] = useState<CapabilityManifest | null>(null)
   const busy = useStore($busy)
-  const [requestId] = useState(() => saved?.request_id ?? crypto.randomUUID())
+  const [requestId] = useState(() => saved?.request_id ?? newRequestId())
   useEffect(() => {
     void api<CapabilityManifest>('/capabilities').then(setManifest).catch(report)
   }, [])
@@ -178,7 +191,20 @@ export function CreateSession({ close }: { close: () => void }) {
             上次创建的结果未确认。以下配置保持原样，点击创建会话会使用原 request_id 核对同一请求。
           </p>
         )}
-        <label className="field">
+        {catalog && <>
+          <label className="field">模型
+            <select value={model} disabled={busy || Boolean(saved)} onChange={e => setModel(e.target.value)}>
+              {catalog.models.map(row => <option key={row.id} value={row.id} disabled={!row.configured}>{row.label}</option>)}
+            </select>
+          </label>
+          <label className="field">已配置 Agent
+            <select value={agent} disabled={busy || Boolean(saved)} onChange={e => setAgent(e.target.value)}>
+              <option value="">自定义会话</option>
+              {catalog.agents.map(row => <option key={row.id} value={row.id}>{row.label}</option>)}
+            </select>
+          </label>
+        </>}
+        {!selectedAgent && <label className="field">
           任务类型
           <select
             disabled={busy || Boolean(saved)}
@@ -190,10 +216,18 @@ export function CreateSession({ close }: { close: () => void }) {
             <option value="research">研究（只读）</option>
             <option value="research_web">联网深度研究</option>
           </select>
-        </label>
-        {harness === 'coding' && (
+        </label>}
+        {catalog && !selectedAgent && !(sandbox && taskHarness === 'coding') && <>
+          <label><input type="checkbox" checked={useFiles} disabled={busy || Boolean(saved)}
+            onChange={e => setUseFiles(e.target.checked)} />读取工作区文件</label>
+          <label><input type="checkbox" checked={useWeb} disabled={busy || Boolean(saved)}
+            onChange={e => setUseWeb(e.target.checked)} />联网研究</label>
+          {sandbox && !taskHarness.startsWith('research') && <label><input type="checkbox" checked={useShell}
+            disabled={busy || Boolean(saved)} onChange={e => setUseShell(e.target.checked)} />沙箱命令</label>}
+        </>}
+        {taskHarness === 'coding' && (!catalog || sandbox) && (
           <>
-            <label className="field">任务工作区
+            {!catalog && <label className="field">任务工作区
               <select value={workspaceMode} onChange={event => setWorkspaceMode(event.target.value)}
                 disabled={busy || Boolean(saved)}>
                 <option value="in_place">当前项目</option>
@@ -201,15 +235,16 @@ export function CreateSession({ close }: { close: () => void }) {
                 <option value="worktree">Git 工作树（从当前提交）</option>
                 <option value="copy">隔离副本（带入当前文件）</option>
               </select>
-            </label>
-            {workspaceMode === 'worktree' && <p className="muted small">工作树从当前 Git 提交创建，未提交改动留在当前项目。</p>}
+            </label>}
+            {!catalog && workspaceMode === 'worktree' && <p className="muted small">工作树从当前 Git 提交创建，未提交改动留在当前项目。</p>}
             <label className="field">验收命令（可选）
               <input value={verification} maxLength={4096}
                 disabled={busy || Boolean(saved)} onChange={event => setVerification(event.target.value)} />
             </label>
           </>
         )}
-        <p className="muted small">单一执行内核由任务类型自动派生，无需选择引擎。选择 Agent 如何申请批准，批准模式可在空闲时切换，内置能力默认启用。</p>
+        {!catalog && <>
+        <p className="muted small">选择 Agent 如何申请批准，批准模式可在空闲时切换。</p>
         <PermissionPicker value={permissionMode} direction="down" disabled={busy || Boolean(saved)} onChange={setPermissionMode} />
         <p className="muted small">内置能力默认授予，无需勾选；除完全访问外，文件操作、终端命令与访问互联网逐次确认。</p>
         {manifest
@@ -235,6 +270,7 @@ export function CreateSession({ close }: { close: () => void }) {
             {label}
           </label>
         ))}
+        </>}
         {(harness === 'research' || harness === 'research_web') && (
           <p className="muted small">研究模式仅授予只读核心工具（含联网检索），没有写入与命令执行能力。</p>
         )}
@@ -244,10 +280,21 @@ export function CreateSession({ close }: { close: () => void }) {
           </button>
           <button
             className="primary"
-            disabled={busy}
+            disabled={busy || Boolean(catalog && !catalog.models.some(row => row.id === model && row.configured))}
             onClick={() =>
               void perform(async () => {
-                const request = saved ?? {
+                const request: CreateRequest = saved ?? (catalog ? {
+                  request_id: requestId, harness, permission_mode: 'ask', model_id: model,
+                  ...(agent ? { agent_id: agent } : sandbox && taskHarness === 'coding' ? {} : {
+                    tools: [
+                      ...(useFiles ? ['read', 'list_files', 'search_files'] : []),
+                      ...(useWeb ? ['web_search', 'web_fetch', 'web_extract', 'web_research'] : []),
+                      ...(sandbox && useShell && !taskHarness.startsWith('research') ? ['bash'] : [])
+                    ].filter(name => name === 'bash' || catalog.tools.includes(name)),
+                  }),
+                  ...(sandbox && taskHarness === 'coding' && verification.trim()
+                    ? { verification_command: verification.trim() } : {})
+                } : {
                   request_id: requestId,
                   harness,
                   permission_mode: permissionMode,
@@ -256,13 +303,13 @@ export function CreateSession({ close }: { close: () => void }) {
                   extensions: extensions.filter(tool =>
                     visibleExtensions.some(([name]) => name === tool)
                   )
-                }
+                })
                 const payload = request.permission_mode === 'full'
                   ? { ...request, risk_acknowledged: true }
                   : request
                 localStorage.setItem(storageKey('create'), JSON.stringify(request))
                 setSaved(request)
-                const created = await api<Session>('/sessions', 'POST', payload)
+                const created = await workspaceApi<Session>('/sessions', 'POST', payload)
                 localStorage.removeItem(storageKey('create'))
                 const draft = localStorage.getItem(storageKey('draft'))
                 if (draft) {
@@ -362,16 +409,24 @@ export function Capabilities() {
 }
 
 export function Knowledge({ kind }: { kind: 'skills' | 'memories' | 'mcp/tools' }) {
-  const [records, setRecords] = useState<unknown>(null)
+  const [records, setRecords] = useState<Record<string, { id?: string; name?: string; content?: string }[]> | null>(null)
+  const [candidates, setCandidates] = useState<{ id: string; status: string; content: string }[]>([])
   const [text, setText] = useState('')
   const busy = useStore($busy)
   const titles = { skills: '技能库', memories: 'Profile 记忆', 'mcp/tools': 'MCP 工具' }
+  async function refresh() {
+    setRecords(await api(`/${kind}`))
+    if (kind === 'memories') {
+      const result = await api<{ candidates: typeof candidates }>('/memory-candidates')
+      setCandidates(result.candidates)
+    }
+  }
   return (
     <section className="page" key={kind}>
       <div className="eyebrow">DEEP-HARNESS CAPABILITIES</div>
       <h1>{titles[kind]}</h1>
       <p className="muted">从当前 Profile 的真实后端读取。新技能与记忆仅在后续新会话中生效。</p>
-      <button onClick={() => void perform(async () => setRecords(await api(`/${kind}`)))} disabled={busy}>
+      <button onClick={() => void perform(refresh)} disabled={busy}>
         刷新列表
       </button>
       {kind !== 'mcp/tools' && (
@@ -381,7 +436,7 @@ export function Knowledge({ kind }: { kind: 'skills' | 'memories' | 'mcp/tools' 
             void perform(async () => {
               await api(`/${kind}`, 'POST', kind === 'skills' ? { document: text } : { content: text })
               setText('')
-              setRecords(await api(`/${kind}`))
+              await refresh()
             })
           }}
         >
@@ -403,7 +458,29 @@ export function Knowledge({ kind }: { kind: 'skills' | 'memories' | 'mcp/tools' 
       {kind === 'mcp/tools' && (
         <p className="notice">服务器由当前 Profile 的 mcp.toml 配置；变更后重启后端，新会话按工具名授予权限。</p>
       )}
-      {records !== null && <Json value={records} />}
+      {kind === 'mcp/tools' && records && <Json value={records} />}
+      {kind !== 'mcp/tools' && records?.[kind]?.map(row => {
+        const id = kind === 'skills' ? row.name : row.id
+        if (!id) return null
+        const action = kind === 'skills' ? '停用技能' : '删除记忆'
+        return <article key={id}>
+          <Json value={row} />
+          <button disabled={busy} onClick={() => {
+            if (window.confirm(`${action}？`)) void perform(async () => {
+              await api(`/${kind}/${encodeURIComponent(id)}`, 'DELETE')
+              await refresh()
+            })
+          }}>{action}</button>
+        </article>
+      })}
+      {kind === 'memories' && candidates.map(candidate => <article key={candidate.id}>
+        <Json value={candidate} />
+        {candidate.status === 'pending' && (['accept', 'reject'] as const).map(decision =>
+          <button key={decision} disabled={busy} onClick={() => void perform(async () => {
+            await api(`/memory-candidates/${encodeURIComponent(candidate.id)}/decision`, 'POST', { decision })
+            await refresh()
+          })}>{decision === 'accept' ? '接受候选记忆' : '拒绝候选记忆'}</button>)}
+      </article>)}
     </section>
   )
 }

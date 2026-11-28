@@ -1,7 +1,7 @@
 # 单实例服务器部署
 
 1. 在专用 deep-harness Conda 环境准备 Python 3.12 和锁定依赖。
-2. 安装桌面构建依赖并从 desktop 运行 npm run build。构建同时生成 Web 静态资源。
+2. 从 desktop 运行 npm run build，生成 Electron 与 Web 共用的静态资源。Web 在运行时由 Python 提供页面，服务器无需启动 Electron。也可使用已构建的资产，通过 `web --assets` 指定目录。
 3. 复制或调整 [实例配置](../examples/instance.yaml)。配置中的工作路径相对该文件解析。使用云模型时，在服务进程环境中提供相应的密钥。
 4. 用独立状态目录启动单进程服务，再浏览 http://127.0.0.1:8765。
 
@@ -31,7 +31,9 @@ location / {
 
 ## 业务样例
 
-在另一个终端运行 python examples/mock_business.py --database .state/web/demo-business.db。工作流页可执行采购申请与工单登记，观察验证、审批、写入与外部结果查询。
+在另一个终端运行 python examples/mock_business.py --database .state/web/demo-business.db。在「长任务」选择已配置工作流，可执行采购申请与工单登记，观察验证、审批、写入和外部状态查询。自定义长任务可提交只读阶段。
+
+给指定工作区配置 `manage_knowledge: true` 后，访问该工作区的实例用户可以管理技能和记忆。默认关闭。
 
 ## 隔离命令
 

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { api } from './api'
+import { requestJson } from './workspace-api'
 
 export type Workspace = { id: string; label?: string; mode: string }
 type Folders = {
@@ -25,7 +25,9 @@ export function AddProject({ sandbox, onClose, onAdd }: {
     setLoading(true)
     setError('')
     try {
-      const next = await api<Folders>(`/api/v1/project-folders?path=${encodeURIComponent(target)}`)
+      const next = await requestJson<Folders>({
+        method: 'GET', path: `/api/v1/project-folders?path=${encodeURIComponent(target)}`
+      })
       if (sequence !== request.current) return
       setFolders(next)
       setPath(next.path)
@@ -46,7 +48,9 @@ export function AddProject({ sandbox, onClose, onAdd }: {
     setSaving(true)
     setError('')
     try {
-      onAdd(await api<Workspace>('/api/v1/workspaces', { path: path.trim(), label, mode }))
+      onAdd(await requestJson<Workspace>({
+        method: 'POST', path: '/api/v1/workspaces', body: { path: path.trim(), label, mode }
+      }))
     } catch (error) {
       setError(String((error as Error).message))
     } finally {

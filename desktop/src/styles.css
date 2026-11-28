@@ -150,7 +150,8 @@ h3 {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 24px;
+  margin-bottom: 14px;
+  flex-shrink: 0;
 }
 .new-task kbd {
   font-size: 8px;
@@ -203,19 +204,28 @@ nav button span {
 .session-list > p {
   margin: 16px 8px;
 }
-.session-list > button {
+.session-row {
+  display: flex;
+  align-items: center;
+  border-radius: 8px;
+  margin-bottom: 3px;
+}
+.session-open, .session-list > button {
   display: flex;
   align-items: center;
   gap: 10px;
   border: 0;
-  width: 100%;
+  min-width: 0;
+  flex: 1;
   text-align: left;
   background: none;
   margin-bottom: 3px;
   padding: 11px 10px;
   color: #9ba7b5;
 }
-.session-list > button small {
+.session-open > div { min-width: 0; }
+.session-title { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-open small {
   display: block;
   font-size: 9px;
   color: #667180;
@@ -225,6 +235,40 @@ nav button span {
   background: #252c35;
   color: #f0f3f6;
 }
+.session-more {
+  margin-right: 4px;
+  padding: 4px 7px;
+  background: transparent;
+  border-color: transparent;
+  line-height: 1;
+}
+.session-menu {
+  position: fixed;
+  z-index: 25;
+  display: grid;
+  width: 156px;
+  gap: 2px;
+  padding: 5px;
+  border: 1px solid #3c485b;
+  border-radius: 8px;
+  background: #1b222c;
+  box-shadow: 0 10px 24px #0008;
+}
+.session-menu button { min-height: 33px; border: 0; text-align: left; background: transparent; }
+.session-menu button:hover, .session-menu button:focus-visible { background: #303949; }
+.session-danger { color: #ffb1af; }
+.session-dialog {
+  width: min(450px, calc(100vw - 32px));
+  padding: 24px;
+  color: #dce1e8;
+  background: #171d27;
+  border: 1px solid #3c485b;
+  border-radius: 12px;
+}
+.session-dialog::backdrop { background: #0009; }
+.session-dialog .actions { justify-content: flex-end; }
+.session-dialog strong { overflow-wrap: anywhere; }
+.session-cleanup { display: flex; align-items: center; gap: 4px; padding: 6px; }
 .sidebar-bottom > button {
   background: none;
   border: 0;
@@ -232,6 +276,7 @@ nav button span {
   text-align: left;
   color: #a2acb8;
 }
+.sidebar-bottom { margin-top: auto; }
 .connection {
   margin: 17px 8px 0;
   padding-top: 15px;
@@ -424,6 +469,37 @@ nav button span {
 .send {
   font-size: 11px;
 }
+.run-control {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-width: 74px;
+  white-space: nowrap;
+  color: #d2edba;
+  border-color: #48603f;
+  background: #293927;
+}
+.run-control.awaiting { color: #efca8b; border-color: #645639; background: #383024; }
+.run-control-icon {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  font-size: 11px;
+}
+.run-control-icon.spinning::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border: 1.5px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: run-progress-spin .85s linear infinite;
+}
+.run-pause-bars { width: 5px; height: 6px; border-inline: 1.5px solid currentColor; }
+@keyframes run-progress-spin { to { transform: rotate(360deg); } }
 .composer-hint {
   text-align: center;
   color: #56616e;
@@ -854,6 +930,7 @@ button.danger:not(:disabled) {
   }
 }
 @media (prefers-reduced-motion: reduce) {
+  .run-control-icon.spinning::before { animation: none; }
   * {
     transition: none !important;
     scroll-behavior: auto !important;
@@ -917,7 +994,68 @@ button.danger:not(:disabled) {
   white-space: pre;
 }
 .sidebar .project-list {
-  max-height: 10rem;
+  flex: 0 1 auto;
   min-height: 0;
   overflow: auto;
+}
+.sidebar .project-list[hidden], .project-sessions[hidden] { display: none; }
+.project-heading { margin-top: 0; }
+.project-heading .project-group-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding-left: 0;
+  color: #a2acb8;
+  font-size: 13px;
+}
+.project-chevron {
+  width: 6px;
+  height: 6px;
+  border-right: 1px solid currentColor;
+  border-bottom: 1px solid currentColor;
+  transform: rotate(-45deg);
+}
+.project-group-toggle[aria-expanded="true"] .project-chevron { transform: translateY(-2px) rotate(45deg); }
+.project-entry { min-width: 0; }
+.project-toggle { width: 100%; min-width: 0; }
+.project-folder-icon { width: 18px; height: 18px; flex: 0 0 18px; }
+.project-list .project-name {
+  width: auto;
+  min-width: 0;
+  overflow: hidden;
+  font-size: inherit;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.project-sessions { margin: 2px 0 5px 15px; padding-left: 4px; border-left: 1px solid var(--line); }
+.project-sessions .session-list { overflow: visible; }
+.project-sessions .session-open { padding-block: 7px; }
+.project-sessions .session-refresh { font-size: 11px; padding-block: 5px; }
+.project-list + nav { margin-top: 10px; }
+.sidebar > nav:not(.project-list), .sidebar-bottom { flex-shrink: 0; }
+.add-project {
+  width: min(42rem, calc(100% - 2rem));
+  max-height: calc(100vh - 3rem);
+  overflow: auto;
+  background: #171d27;
+  color: #e9edf4;
+  border: 1px solid #3c485b;
+  border-radius: 14px;
+  padding: 24px;
+}
+.add-project::backdrop { background: #0009; }
+.add-project form, .add-project label { display: grid; gap: 10px; }
+.project-directory { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+.project-drives { display: flex; flex-wrap: wrap; gap: 5px; }
+.project-folders { display: grid; gap: 4px; max-height: 14rem; overflow: auto; }
+.project-folders button { text-align: left; overflow-wrap: anywhere; }
+.mobile-nav-toggle { display: none; }
+@media (max-width: 800px) {
+  .app { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+  .app .mobile-nav-toggle { display: block; margin: 4px 8px; justify-self: start; }
+  .app .sidebar { display: none; }
+  .app.mobile-nav-open .sidebar { display: flex; position: absolute; inset: 42px 0 0; z-index: 5; }
+  .app .workspace { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) minmax(0, 29vh); }
+  .app .inspector { min-height: 0; border-left: 0; }
+  .app .starter-grid { grid-template-columns: minmax(0, 1fr); }
 }

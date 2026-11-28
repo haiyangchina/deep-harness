@@ -311,7 +311,7 @@ def main():
     token = token_path.read_text(encoding="utf-8").strip()
     print(f"Operator token file: {token_path.resolve()}")
     uvicorn.run(
-        create_api(build_host(args), token),
+        create_api(build_host(args), token, workspace_id=args.profile),
         host="127.0.0.1",
         port=args.port,
         log_level=setting("transport.cli_log_level"),

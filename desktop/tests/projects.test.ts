@@ -40,7 +40,12 @@ test('desktop adds a folder and switches between project sessions without losing
             await window.webContents.executeJavaScript(\`
               (async () => {
                 const api = window.deepHarness
-                const request = (path, method = 'GET', body) => api.request({ path, method, body })
+                const request = async (path, method = 'GET', body) => {
+                  const profile = (await api.info()).settings.profile
+                  const result = await api.request({ path: '/api/v1/workspaces/' + profile + path, method, body })
+                  if (result.status >= 300) throw Error(JSON.stringify(result))
+                  return result.body
+                }
                 const first = await api.info()
                 const original = await request('/sessions', 'POST', { request_id: 'first' })
                 const second = await api.openProject(null)

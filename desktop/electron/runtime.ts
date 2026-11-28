@@ -112,12 +112,19 @@ export class LocalRuntime {
     if (!this.ready) throw new Error(this.error || '本机后端尚未就绪')
     const path = apiPath(this.profile, request)
     if (request.upload && (
-      request.method !== 'POST' || !/^\/sessions\/[a-z0-9-]+\/images$/.test(request.path)
+      request.method !== 'POST' || !/\/sessions\/[a-z0-9-]+\/(?:images|attachments)$/.test(path)
       || !(request.upload.data instanceof ArrayBuffer)
       || request.upload.data.byteLength > 8 * 1024 * 1024
       || typeof request.upload.name !== 'string' || request.upload.name.length > 255
     )) throw new Error('无效的图片上传请求')
-    return localJson(this.base + path, request.method, this.token, request.body, undefined, request.upload)
+    if (request.response === 'binary' && (request.method !== 'GET' ||
+        !/\/(?:images\/[a-z0-9-]+|artifacts\/[a-z0-9-]+|bundle|diff)(?:\?|$)/.test(path))) {
+      throw new Error('不支持下载此资源')
+    }
+    return localJson(
+      this.base + path, request.method, this.token, request.body, undefined, request.upload,
+      true, request.response === 'binary'
+    )
   }
 
   async stop(): Promise<void> {

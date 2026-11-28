@@ -75,6 +75,7 @@ class WorkspaceSettings(Settings):
     path: Path
     mode: Literal["read_only", "sandbox"] = "read_only"
     mcp_tools: tuple[str, ...] = ()
+    manage_knowledge: bool = False
 
 
 class ModelDefinition(Settings):

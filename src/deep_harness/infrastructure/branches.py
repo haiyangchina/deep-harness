@@ -8,6 +8,7 @@ from deep_harness.domain.identity import fingerprint
 from deep_harness.domain.models import DomainError
 from deep_harness.infrastructure import schema as s
 from deep_harness.infrastructure.artifacts import run_artifacts
+from deep_harness.infrastructure.session_management import assert_request_available
 
 
 class BranchLedger:
@@ -17,6 +18,7 @@ class BranchLedger:
     async def fork(self, source, request_id, snapshot):
         digest = fingerprint({"kind": "fork", "source_id": source.id, "runtime": snapshot})
         async with self.store.transaction() as conn:
+            await assert_request_available(conn, source.principal, request_id)
             previous = (
                 (
                     await conn.execute(

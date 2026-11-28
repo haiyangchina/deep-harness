@@ -17,13 +17,19 @@ void app.whenReady().then(async () => {
       python, workspace: directory, stateDir: path.join(directory, 'agent-state'),
       profile: 'electron-connection', configFile: '', diagnostic: true
     })
-    const session = await runtime.request({
-      method: 'POST', path: '/sessions', body: { request_id: 'probe' }
-    }) as { id: string }
+    const base = '/api/v1/workspaces/electron-connection'
+    const created = await runtime.request({
+      method: 'POST', path: base + '/sessions', body: { request_id: 'probe' }
+    }) as { status: number; body: { id: string } }
+    if (created.status !== 200) throw Error(JSON.stringify(created))
+    const session = created.body
     const paths = ['/sessions', '/skills', '/memories',
-      `/sessions/${session.id}/status`, `/sessions/${session.id}/events?after=0`]
+      `/sessions/${session.id}`, `/sessions/${session.id}/event-history?after=0`]
     for (let index = 0; index < 10; index++) {
-      await Promise.all(paths.map(endpoint => runtime.request({ method: 'GET', path: endpoint })))
+      await Promise.all(paths.map(async endpoint => {
+        const result = await runtime.request({ method: 'GET', path: base + endpoint }) as { status: number }
+        if (result.status !== 200) throw Error(JSON.stringify(result))
+      }))
     }
     console.log('ELECTRON_LOOPBACK_OK: 50 concurrent-group reads completed')
   } catch (error) {

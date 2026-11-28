@@ -35,7 +35,8 @@ async def run(args, token):
                     self.should_exit = True
 
             config = uvicorn.Config(
-                create_api(host, token), log_level=setting("transport.desktop_log_level")
+                create_api(host, token, workspace_id=args.profile),
+                log_level=setting("transport.desktop_log_level"),
             )
             server = DesktopServer(config)
             await server.serve(sockets=[listener])

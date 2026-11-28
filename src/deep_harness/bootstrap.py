@@ -24,6 +24,7 @@ from deep_harness.application.development_processes import DevelopmentProcesses
 from deep_harness.application.jobs import JobService
 from deep_harness.application.lifecycle import drain_tasks, mutation
 from deep_harness.application.scopes import ProfileResolver
+from deep_harness.application.session_deletion import SessionDeletion
 from deep_harness.application.session_runtime import SessionRuntime
 from deep_harness.application.tools import TOOL_ARGUMENTS
 from deep_harness.application.workspace import (
@@ -46,6 +47,7 @@ from deep_harness.infrastructure.leases import acquire_lease
 from deep_harness.infrastructure.permissions import change_permissions
 from deep_harness.infrastructure.receipts import ReceiptLedger
 from deep_harness.infrastructure.reconciliation import reconcile
+from deep_harness.infrastructure.session_management import SessionManagement
 from deep_harness.infrastructure.store import BusinessStore
 from deep_harness.infrastructure.task_workspaces import TaskWorkspaces, finish_io, workspace_lease
 from deep_harness.infrastructure.web import WebClient
@@ -90,6 +92,8 @@ class ProfileApplication:
         self.executor = executor
         self.owner = str(uuid4())
         self.store = BusinessStore(scope.home, scope.profile_id)
+        self.session_management = SessionManagement(self.store)
+        self.session_deletion = SessionDeletion(self, self.session_management)
         self.artifacts = ArtifactStore(self.store, upload_limit) if upload_limit else None
         self.executions = ExecutionLedger(self.store)
         self.jobs = JobService(self)
@@ -144,6 +148,8 @@ class ProfileApplication:
                 AsyncSqliteSaver.from_conn_string(str(self.scope.home / "checkpoints.db"))
             )
             await self.saver.setup()
+            for session_id in await self.session_management.pending():
+                self.session_deletion.schedule(session_id)
             queued = await self.executions.recover()
             await self.delegations.reconcile_background()
             for session_id in queued if self.recover_queued else ():
@@ -474,12 +480,9 @@ class ProfileApplication:
             kwargs["background_launcher"] = self.launch_background
         if runtime_type is HarnessRuntime and coding_task and coding_task["verification_command"]:
             kwargs["verification_command"] = coding_task["verification_command"]
-        if (
-            runtime_type is HarnessRuntime and coding_task
-            and not coding_task.get("owner") and stage_limits is None
-        ):
+        if not (coding_task or {}).get("owner") and stage_limits is None:
             async def pause_requested():
-                return self.workspaces.paused(coding_task.get("owner", session.id))
+                return self.workspaces.paused(session.id)
 
             kwargs["pause_probe"] = pause_requested
         if stage_limits is not None:
@@ -727,7 +730,9 @@ class ProfileApplication:
 
     async def _curate_completed(self, session_id):
         try:
-            await self.curator.propose(session_id)
+            async with self.locks.setdefault(session_id, asyncio.Lock()):
+                await self.store.get_session(session_id, "operator")
+                await self.curator.propose(session_id)
         # Isolate optional curator failures; provider exception text may contain secrets.
         except Exception as exc:  # health: allow BLE001 -- log only the exception class
             logger.warning("Automatic curation for %s failed: %s", session_id, type(exc).__name__)
@@ -787,8 +792,8 @@ class ProfileApplication:
         session = await self.store.get_session(session_id, "operator")
         binding = await self.sessions.policies.get(session.id)
         task = binding["snapshot"].get("coding_task") if binding else None
-        if not task or task.get("owner"):
-            raise DomainError("task_not_found", "The session does not own a managed coding task")
+        if (task or {}).get("owner") or await self.jobs.ledger.owner(session_id) is not None:
+            raise DomainError("task_not_found", "Use the owning task to pause this session")
         if action is not None:
             async with self.control:
                 self.workspaces.set_pause(session.id, action == "pause")
@@ -894,6 +899,14 @@ class ProfileApplication:
                 )
             except OSError as exc:
                 raise DomainError("delivery_conflict", "An imported path is inaccessible") from exc
+
+    @mutation
+    async def change_session_metadata(self, session_id, revision, changes):
+        return await self.session_management.change(session_id, revision, changes)
+
+    @mutation
+    async def delete_session(self, session_id):
+        return await self.session_deletion.start(session_id)
 
     @mutation
     async def fork_session(self, session_id, request_id):
@@ -1031,6 +1044,8 @@ class ProfileApplication:
                 _, pending = await asyncio.wait(running, timeout=max(0, deadline - clock()))
                 if pending:
                     raise DomainError("maintenance_busy", "Profile execution did not drain in time")
+            if await self.session_management.cleanup_queue():
+                raise DomainError("maintenance_busy", "Finish pending session cleanup first")
             archive = asyncio.create_task(
                 asyncio.to_thread(create_archive, self.scope, destination)
             )

@@ -1,4 +1,4 @@
-# deep-harness v1.1.6 架构与技术实现
+# deep-harness v1.1.8 架构与技术实现
 
 deep-harness 是可在本机及服务器运行的通用 Agent 宿主。CLI、Windows 桌面端和同源浏览器工作台共享 Python 应用服务。一次用户输入进入业务库成为一条 admission，随后才交给运行图。模型生成工具提议，宿主决定工具是否获授权、是否需要批准、能否派发，以及结果是否需要人工对账。
 
@@ -11,18 +11,19 @@ deep-harness 是可在本机及服务器运行的通用 Agent 宿主。CLI、Win
 ```mermaid
 flowchart TB
     subgraph Clients["用户入口"]
-        UI["Electron 渲染进程<br/>React · Nanostores"]
+        UI["共享 React 工作台<br/>Electron 或浏览器"]
         Main["Electron 主进程<br/>本机后端生命周期"]
         CLI["CLI<br/>chat · repl · 管理命令"]
         REST["外部本机 API 客户端"]
-        Browser["浏览器工作台 / Web API 客户端"]
+        Browser["浏览器"]
+        Browser --> UI
         UI -->|"受限 preload IPC"| Main
     end
     Main -->|"启动 Python 子进程<br/>回环 HTTP + Bearer"| API
     REST -->|"REST / SSE + Bearer"| API
-    API["FastAPI / Uvicorn"] --> Host
-    Browser -->|"同源 REST / SSE"| WebAPI["免登录 Web /api/v1"]
-    WebAPI --> Instance["InstanceHost<br/>工作区、模型目录、实例并发"]
+    UI -->|"浏览器同源 HTTP"| API
+    API["共享 FastAPI /api/v1"] -->|"本机部署"| Host
+    API -->|"服务器部署"| Instance["InstanceHost<br/>工作区、模型目录、实例并发"]
     Instance --> Host
     CLI --> Host["ProjectHost<br/>按 Profile 装配"]
     Host --> App["ProfileApplication<br/>会话、队列、恢复、审批、任务"]
@@ -216,7 +217,7 @@ flowchart LR
 ## 8. 桌面连接、配置和发布
 
 - Electron 主进程启动选定 Python，生成会话 Bearer token，经 stdin 交给后端，从 stdout 读取回环端口，再通过 `/health` 完成连接验证。渲染进程启用 context isolation、关闭 Node 集成，经 preload 调用限定 IPC。主进程验证调用来源并将路由限制在当前 Profile。
-- 桌面以增量轮询更新会话消息、事件和审批状态。游标与切换代号避免旧请求覆盖新会话。REST 独立提供可续传 SSE。提交响应丢失时可按原 submission ID 查询接收状态。
+- Electron 与 Web 构建同一份 React 工作台。共享状态层以增量轮询更新消息、事件和审批，游标与切换代号避免旧请求覆盖新会话。REST 另外提供可续传 SSE。提交响应丢失时可按原 submission ID 查询接收状态。
 - Python 3.12 使用独立 Conda 环境。Python 直接依赖声明在 `pyproject.toml`，精确版本记录在 `requirements.lock`，Windows Conda 环境另有锁文件。本基线锁定 Deep Agents 0.7.32、LangGraph 1.2.19、LangChain 1.4.7、FastAPI 0.162.0、SQLAlchemy 2.1.6。
 - 包内 `server.yaml` 提供默认值，进程级 `DEEP_HARNESS_SERVER_CONFIG` 合并部署覆盖，`--config` 接受 YAML/TOML 的启动配置，CLI 显式模型参数进一步覆盖模型配置。凭据从环境变量读取。
 - 桌面用 TypeScript、React、Nanostores 和 esbuild，electron-builder 生成 Windows 便携包，内含 Pi 工作进程。运行后端仍依赖选定的 Python 环境和所配置的模型服务。

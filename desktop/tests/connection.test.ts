@@ -53,15 +53,17 @@ test('connection errors identify the local endpoint without retrying uncertain w
         cause: { code: 'ECONNRESET' }
       })
     })
-    await assert.rejects(runtime.request({ method: 'GET', path: '/sessions?after=private-query' }), error => {
+    const workspace = '/api/v1/workspaces/connection-test'
+    await assert.rejects(runtime.request({ method: 'GET', path: workspace + '/sessions?after=private-query' }), error => {
       assert.ok(error instanceof Error)
-      assert.match(error.message, /GET .*127\.0\.0\.1:\d+\/profiles\/connection-test\/sessions/)
+      assert.match(error.message, /GET .*127\.0\.0\.1:\d+\/api\/v1\/workspaces\/connection-test\/sessions/)
       assert.match(error.message, /ECONNRESET/)
       assert.doesNotMatch(error.message, /private-token|private-query/)
       return true
     })
     for (const method of ['POST', 'DELETE'] as const) {
-      await assert.rejects(runtime.request({ method, path: '/sessions', body: { private: 'body' } }), error => {
+      const path = workspace + (method === 'POST' ? '/sessions' : '/skills/example')
+      await assert.rejects(runtime.request({ method, path, body: { private: 'body' } }), error => {
         assert.ok(error instanceof Error)
         assert.match(error.message, /结果未确认/)
         assert.match(error.message, /ECONNRESET/)

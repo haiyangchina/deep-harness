@@ -1,4 +1,4 @@
-# deep-harness v1.1.6
+# deep-harness v1.1.8
 
 deep-harness 是可在本机或服务器运行的 Python Agent 宿主，提供 CLI、Windows 桌面端、免登录浏览器工作台和 REST/SSE API。CLI 默认使用本机 Ollama 的 `qwen3.5:9b`。各入口复用统一的会话授权、审批、回执和恢复机制。
 
@@ -72,7 +72,7 @@ CLI 的 `sessions`、`inspect` 和 `usage` 用于查看状态，`approve` 用于
 
 `src/deep_harness/server.yaml` 提供公共默认值。`DEEP_HARNESS_SERVER_CONFIG` 可加载部署级 YAML，`--config` 可加载启动级 YAML 或 TOML。供应商凭据从环境读取。
 
-`deep-harness --state-dir .state --workspace . serve` 启动回环 REST 服务，Bearer token 保存在状态目录的 `operator.token`，接口见 [API 实现](src/deep_harness/transports/api.py)。会话创建接收 Harness。能力清单位于 `GET /profiles/{profile}/capabilities`，事件支持游标分页及 SSE。
+`deep-harness --state-dir .state --workspace . serve` 启动回环 REST 服务，Bearer token 保存在状态目录的 `operator.token`。桌面与 Web 使用 `/api/v1/workspaces/{workspace_id}`，能力清单位于该前缀下的 `/capabilities`。旧 `/profiles/{profile}` 仍可用于已有本机客户端。事件支持游标分页及 SSE。[接口说明](IMPLEMENTATION_SPEC.md)
 
 ## 免登录 Web 与业务扩展
 
@@ -82,7 +82,7 @@ CLI 的 `sessions`、`inspect` 和 `usage` 用于查看状态，`approve` 用于
 deep-harness --state-dir .state/web web --instance-config examples/instance.yaml
 ```
 
-浏览器访问 `http://127.0.0.1:8765`，选择工作目录、模型和 Agent。该模式使用单进程 SQLite。从本机启动的 CLI 或 Electron 使用自己的状态目录。远程客户端通过可信网络连接 Web 实例，实例可达者共享会话、审批和产物。
+浏览器访问 `http://127.0.0.1:8765`，使用与 Electron 相同的工作台，可选择服务器配置的工作区、模型、Agent 和工作流。服务器实例以单进程运行并使用自己的 SQLite 状态目录。远程客户端通过可信网络连接，访问同一实例的用户共享会话、审批和产物。
 
 本机 Web 工作台可用「新增项目」浏览并选择运行 Web 服务的这台机器上的目录。项目保存在 Web 实例的状态目录，默认以只读模式打开。已有 Docker 沙箱工作区的实例也可为新项目选择沙箱。对外监听的 Web 实例使用部署者配置的工作区。
 

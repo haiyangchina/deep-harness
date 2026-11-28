@@ -29,7 +29,10 @@ async def dispatch_delivery(saver, owner, delivery, action, revision, bundle=Non
     graph.add_edge("dispatch", END)
     compiled = graph.compile(checkpointer=saver)
     key = fingerprint([owner, action, revision, bundle["id"] if bundle else None])
-    config = {"configurable": {"thread_id": "delivery:" + key}}
+    legacy = {"configurable": {"thread_id": "delivery:" + key}}
+    config = {"configurable": {"thread_id": f"delivery:{owner}:{key}"}}
+    if await saver.aget_tuple(legacy) is not None:
+        config = legacy
     checkpoint = await compiled.aget_state(config)
     if checkpoint.values and not checkpoint.next:
         # The current ledger can have moved from applied to undone since this checkpoint.

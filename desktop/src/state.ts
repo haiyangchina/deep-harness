@@ -1,5 +1,6 @@
 import { atom } from 'nanostores'
-import type { RuntimeInfo, Session, SessionStatus, Message, JournalEvent, ApiRequest } from './protocol'
+import type { RuntimeInfo, Session, SessionStatus, Message, JournalEvent, ApiRequest, ServerCatalog } from './protocol'
+import { HttpError, requestJson, workspacePath } from './workspace-api'
 
 interface LiveMessage {
   seq: number
@@ -32,18 +33,34 @@ export const $busy = atom(false)
 let selection = 0
 let refreshVersion = 0
 let timer: ReturnType<typeof setTimeout> | undefined
+let eventRefresh: ReturnType<typeof setTimeout> | undefined
 let inspector = 'activity'
 
 export function resetView() {
-  clearTimeout(timer)
-  selection++
-  $conversation.set(null)
+  closeSession()
   $sessions.set([])
   $sessionCursor.set(null)
 }
 
+export function closeSession() {
+  clearTimeout(timer)
+  clearTimeout(eventRefresh)
+  selection++
+  $conversation.set(null)
+}
+
 export function api<T>(path: string, method: ApiRequest['method'] = 'GET', body?: unknown): Promise<T> {
-  return window.deepHarness.request<T>({ path, method, body })
+  return workspaceApi<T>(path, method, body)
+}
+export function resourcePath(path: string): string {
+  const workspace = $runtime.get()?.settings.profile
+  if (!workspace) throw new Error('工作区尚未就绪')
+  return workspacePath(workspace) + path
+}
+export async function workspaceApi<T>(
+  path: string, method: ApiRequest['method'] = 'GET', body?: unknown, upload?: ApiRequest['upload']
+): Promise<T> {
+  return requestJson({ path: resourcePath(path), method, body, upload })
 }
 export function report(error: unknown) {
   $error.set(error instanceof Error ? error.message : String(error))
@@ -54,7 +71,7 @@ export function storageKey(kind: string, session = '') {
 }
 
 async function sessionPage(cursor: string) {
-  return api<{ sessions: Session[]; next_cursor: string | null }>(
+  return workspaceApi<{ sessions: Session[]; next_cursor: string | null }>(
     `/sessions?limit=100&after=${encodeURIComponent(cursor)}`
   )
 }
@@ -71,7 +88,12 @@ export async function loadMoreSessions() {
   const cursor = $sessionCursor.get()
   if (!cursor) return
   const runtime = $runtime.get()
-  const page = await sessionPage(cursor)
+  const page = await sessionPage(cursor).catch(async error => {
+    if (!(error instanceof HttpError) || error.code !== 'session_list_changed') throw error
+    if ($runtime.get() === runtime) await loadSessions()
+    return null
+  })
+  if (!page) return
   if ($runtime.get() !== runtime || $sessionCursor.get() !== cursor) return
   const sessions = new Map($sessions.get().map(session => [session.id, session]))
   for (const session of page.sessions) sessions.set(session.id, session)
@@ -91,7 +113,7 @@ export async function loadOlderMessages() {
   if (!current?.hasOlderMessages) return
   const generation = selection
   const before = current.messageRows.reduce((min, row) => Math.min(min, row.seq), Infinity)
-  const page = await api<MessagePage>(`/sessions/${current.id}/messages/live?before=${before}`)
+  const page = await workspaceApi<MessagePage>(`/sessions/${current.id}/messages?before=${before}`)
   const latest = $conversation.get()
   if (generation !== selection || !latest) return
   $conversation.set({ ...latest, ...mergeMessages(latest, page), hasOlderMessages: page.has_more })
@@ -104,7 +126,7 @@ export async function refreshInspector(tab: string) {
   const generation = selection
   const route = `/sessions/${current.id}`
   if (tab === 'state') {
-    const status = await api<SessionStatus>(`${route}/status`)
+    const status = await workspaceApi<SessionStatus>(`${route}?include_runtime=true`)
     const latest = $conversation.get()
     if (generation === selection && latest?.status) {
       $conversation.set({ ...latest, status: { ...latest.status, runtime: status.runtime } })
@@ -131,7 +153,6 @@ export async function refreshConversation() {
   const route = `/sessions/${current.id}`
   const first = current.messageCursor === null
   const query = first ? '' : `?after=${current.messageCursor}`
-  const eventQuery = current.eventCursor === null ? 'tail=true' : `after=${current.eventCursor}`
   let backlog = false
   function latest() {
     return selection === generation && version === refreshVersion ? $conversation.get() : null
@@ -140,11 +161,11 @@ export async function refreshConversation() {
     if (latest()) report(error)
   }
   await Promise.all([
-    api<SessionStatus>(`${route}/status?include_runtime=false`).then(status => {
+    workspaceApi<SessionStatus>(route).then(status => {
       const view = latest()
       if (view) $conversation.set({ ...view, status: { ...status, runtime: view.status?.runtime } })
     }).catch(refreshFailed),
-    api<MessagePage>(`${route}/messages/live${query}`).then(page => {
+    workspaceApi<MessagePage>(`${route}/messages${query}`).then(page => {
       const view = latest()
       if (!view) return
       backlog ||= !first && page.has_more
@@ -156,26 +177,51 @@ export async function refreshConversation() {
           hasOlderMessages: first ? page.has_more : view.hasOlderMessages
         })
       }
-    }).catch(refreshFailed),
-    api<{ events: JournalEvent[] }>(`${route}/events?${eventQuery}`).then(({ events }) => {
-      const view = latest()
-      if (!view) return
-      const newEvents = events.filter(event => event.seq > (view.eventCursor ?? 0))
-      backlog ||= newEvents.length >= 500
-      if (newEvents.length || view.eventCursor === null) {
-        $conversation.set({
-          ...view,
-          events: [...view.events, ...newEvents].slice(-2000),
-          eventCursor: newEvents.at(-1)?.seq ?? view.eventCursor ?? 0
-        })
-      }
-      if ((inspector === 'usage' && newEvents.some(e => e.type === 'message.committed')) ||
-          (inspector === 'delegations' && newEvents.some(e => e.type.startsWith('delegation.')))) {
-        void refreshInspector(inspector).catch(refreshFailed)
-      }
     }).catch(refreshFailed)
   ])
   return backlog
+}
+
+async function watchEvents(generation: number, route: string) {
+  while (generation === selection) {
+    const cursor = $conversation.get()?.eventCursor
+    const query = cursor == null ? 'tail=true' : `after=${cursor}&wait=12`
+    const requestedAt = performance.now()
+    try {
+      const { events } = await workspaceApi<{ events: JournalEvent[] }>(`${route}/event-history?${query}`)
+      const view = $conversation.get()
+      if (generation !== selection || !view) return
+      if (!events.length && cursor != null) {
+        const delay = 1000 - (performance.now() - requestedAt)
+        if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay))
+        continue
+      }
+      $conversation.set({
+        ...view,
+        events: [...view.events, ...events].slice(-2000),
+        eventCursor: events.at(-1)?.seq ?? cursor ?? 0
+      })
+      if (events.some(event => event.type === 'admission.accepted' ||
+          event.type === 'message.committed' || event.type.startsWith('execution.') ||
+          event.type.startsWith('approval.') || event.type.startsWith('interaction.') ||
+          event.type === 'artifact.ready')) {
+        if (!eventRefresh) eventRefresh = setTimeout(() => {
+          eventRefresh = undefined
+          if (generation === selection) void refreshConversation()
+        }, 60)
+      }
+      if ((inspector === 'usage' && events.some(e => e.type === 'message.committed')) ||
+          (inspector === 'delegations' && events.some(e => e.type.startsWith('delegation.')))) {
+        void refreshInspector(inspector).catch(error => {
+          if (generation === selection) report(error)
+        })
+      }
+    } catch (error) {
+      if (generation !== selection) return
+      if (error instanceof HttpError && error.status === 404) return
+      await new Promise(resolve => setTimeout(resolve, 1200))
+    }
+  }
 }
 
 async function poll(generation: number) {
@@ -191,20 +237,40 @@ async function poll(generation: number) {
 
 export async function openSession(id: string) {
   clearTimeout(timer)
+  clearTimeout(eventRefresh)
+  eventRefresh = undefined
   const generation = ++selection
   $conversation.set({
     id, messages: [], messageRows: [], messageCursor: null, hasOlderMessages: false,
     status: null, events: [], eventCursor: null, usage: null, delegations: []
   })
   $error.set('')
+  void watchEvents(generation, `/sessions/${id}`)
   await poll(generation)
   if (generation === selection) void refreshInspector(inspector).catch(report)
 }
 
 export async function initialize() {
-  const info = await window.deepHarness.info()
+  const info = window.deepHarness ? await window.deepHarness.info() : await browserRuntime()
   $runtime.set(info)
   if (info.ready) await loadSessions()
+}
+
+export async function browserRuntime(selected?: string): Promise<RuntimeInfo> {
+  const catalog = await requestJson<ServerCatalog>({ method: 'GET', path: '/api/v1/instance' })
+  const preferred = selected ?? localStorage.getItem('deep-harness-web:project')
+  const workspace = catalog.workspaces.find(item => item.id === preferred) ??
+    catalog.workspaces.find(item => item.id === catalog.default_workspace)
+  const id = workspace?.id ?? ''
+  if (id) localStorage.setItem('deep-harness-web:project', id)
+  return {
+    ready: Boolean(id), projectId: id, catalog,
+    projects: catalog.workspaces.map(item => ({
+      id: item.id, name: item.label || item.id, workspace: item.id, profile: item.id
+    })),
+    settings: { python: '', configFile: '', diagnostic: false, stateDir: location.origin,
+      profile: id, workspace: workspace?.label || id }
+  }
 }
 
 /** No write retry is automatic, including durable submissions with an unknown ACK. */

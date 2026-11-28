@@ -1,5 +1,6 @@
 """Bounded inference, durable partial streams and normalized token accounting."""
 
+import asyncio
 import json
 
 from sqlalchemy import func, select
@@ -113,13 +114,20 @@ class Inference:
         pending = ""
         sequence = 0
         response = None
+        clock = asyncio.get_running_loop().time
+        last_publish = clock()
         async for item in runtime.model.stream(
             runtime.session.prompt, messages, runtime.session.tools
         ):
             if item["kind"] == "delta":
                 pending += item["text"]
-                if len(pending) >= number("execution.delta_batch_chars"):
+                now = clock()
+                if pending and (
+                    sequence == 0 or len(pending) >= number("execution.delta_batch_chars")
+                    or now - last_publish >= 0.075
+                ):
                     await self.delta(key, sequence, pending)
+                    last_publish = now
                     sequence += 1
                     pending = ""
             elif item["kind"] == "result":

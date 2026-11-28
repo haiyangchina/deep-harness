@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react'
-import { api, perform, report } from './state'
+import { useStore } from '@nanostores/react'
+import { $runtime, api, perform, report, workspaceApi } from './state'
+import { newRequestId } from './workspace-api'
 
 interface Summary {
   id: string
@@ -39,10 +41,16 @@ const statusLabel: Record<string, string> = {
 }
 
 function newStage(title = '') {
-  return { id: crypto.randomUUID(), title, goal: '', acceptance: '', read_only: false, verify: false, verification_command: '', group: '' }
+  return { id: newRequestId(), title, goal: '', acceptance: '', read_only: false, verify: false, verification_command: '', group: '' }
 }
 
 export function LongTasks({ openStage }: { openStage: (id: string) => void }) {
+  const catalog = useStore($runtime)?.catalog
+  const availableWorkflows = catalog?.agents.filter(agent => agent.workflow) ?? []
+  const [workflowAgent, setWorkflowAgent] = useState(availableWorkflows[0]?.id ?? '')
+  const [workflowGoal, setWorkflowGoal] = useState('')
+  const [workflowModel, setWorkflowModel] = useState('')
+  const [workflowRequest, setWorkflowRequest] = useState(newRequestId)
   const [jobs, setJobs] = useState<Summary[]>([])
   const [selected, setSelected] = useState<string | null>(null)
   const [current, setCurrent] = useState<Details | null>(null)
@@ -51,7 +59,7 @@ export function LongTasks({ openStage }: { openStage: (id: string) => void }) {
   const [defaults, setDefaults] = useState<Defaults | null>(null)
   const [parallel, setParallel] = useState(false)
   const [stages, setStages] = useState(() => ['调研', '实现', '验证'].map(newStage))
-  const [requestId, setRequestId] = useState(() => crypto.randomUUID())
+  const [requestId, setRequestId] = useState(() => newRequestId())
   const [review, setReview] = useState<Record<number, string>>({})
   const [busy, setBusy] = useState(false)
 
@@ -60,10 +68,10 @@ export function LongTasks({ openStage }: { openStage: (id: string) => void }) {
     let timer: ReturnType<typeof setTimeout>
     async function refresh() {
       try {
-        const jobs = await api<Summary[]>('/jobs')
+        const jobs = await workspaceApi<Summary[]>('/jobs')
         if (!disposed) setJobs(jobs)
         if (selected) {
-          const detail = await api<Details>(`/jobs/${selected}`)
+          const detail = await workspaceApi<Details>(`/jobs/${selected}`)
           if (!disposed) setCurrent(detail)
         }
       } catch (error) {
@@ -87,7 +95,7 @@ export function LongTasks({ openStage }: { openStage: (id: string) => void }) {
   const task = current?.id === selected ? current : null
   function updateStage(id: string, changes: Partial<ReturnType<typeof newStage>>) {
     setStages(rows => rows.map(row => row.id === id ? { ...row, ...changes } : row))
-    setRequestId(crypto.randomUUID())
+    setRequestId(newRequestId())
   }
   function create() {
     void perform(async () => {
@@ -97,13 +105,14 @@ export function LongTasks({ openStage }: { openStage: (id: string) => void }) {
           request_id: requestId, goal, parallelism: parallel ? defaults?.parallelism_max : undefined,
           budget: seconds === null ? undefined : { wall_seconds: seconds },
           stages: stages.map(({ id: _id, group, ...row }) => ({
-            ...row, verification_command: row.verify ? row.verification_command.trim() || null : null,
+            ...row, read_only: Boolean(catalog) || row.read_only,
+            verification_command: row.verify ? row.verification_command.trim() || null : null,
             group: !parallel || group === '' ? null : Number(group),
           })),
         })
         setCurrent(created)
         setSelected(created.id)
-        setRequestId(crypto.randomUUID())
+        setRequestId(newRequestId())
       } finally {
         setBusy(false)
       }
@@ -114,9 +123,29 @@ export function LongTasks({ openStage }: { openStage: (id: string) => void }) {
     void perform(async () => {
       setBusy(true)
       try {
-        setCurrent(await api<Details>(`/jobs/${task.id}/commands`, 'POST', {
+        setCurrent(await workspaceApi<Details>(`/jobs/${task.id}/commands`, 'POST', {
           action, position, evidence: position === undefined ? undefined : review[position],
         }))
+      } finally {
+        setBusy(false)
+      }
+    })
+  }
+
+  function startWorkflow() {
+    const agent = availableWorkflows.find(row => row.id === workflowAgent)
+    if (!agent?.workflow) return
+    void perform(async () => {
+      setBusy(true)
+      try {
+        const started = await workspaceApi<Details>(`/workflows/${encodeURIComponent(agent.workflow!)}/runs`, 'POST', {
+          request_id: workflowRequest, agent_id: agent.id, goal: workflowGoal.trim(),
+          model_id: workflowModel || undefined
+        })
+        setCurrent(started)
+        setSelected(started.id)
+        setWorkflowGoal('')
+        setWorkflowRequest(newRequestId())
       } finally {
         setBusy(false)
       }
@@ -133,22 +162,40 @@ export function LongTasks({ openStage }: { openStage: (id: string) => void }) {
         </select>
       </label>}
       {selected && !task && <p>正在加载任务…</p>}
+      {!selected && availableWorkflows.length > 0 && <form onSubmit={event => {
+        event.preventDefault(); startWorkflow()
+      }}>
+        <h3>已配置工作流</h3>
+        <label>Agent<select value={workflowAgent} disabled={busy} onChange={event => {
+          setWorkflowAgent(event.target.value); setWorkflowRequest(newRequestId())
+        }}>{availableWorkflows.map(agent => <option key={agent.id} value={agent.id}>{agent.label}</option>)}</select></label>
+        <label>模型<select value={workflowModel} disabled={busy} onChange={event => {
+          setWorkflowModel(event.target.value); setWorkflowRequest(newRequestId())
+        }}><option value="">使用工作流默认模型</option>
+          {catalog?.models.map(model => <option key={model.id} value={model.id} disabled={!model.configured}>{model.label}</option>)}
+        </select></label>
+        <label>工作流目标<textarea value={workflowGoal} required maxLength={2000} disabled={busy} onChange={event => {
+          setWorkflowGoal(event.target.value); setWorkflowRequest(newRequestId())
+        }} /></label>
+        <button type="submit" disabled={busy || !workflowGoal.trim()}>运行工作流</button>
+      </form>}
       {!selected && <form onSubmit={event => { event.preventDefault(); create() }}>
+        {catalog && <h3>自定义只读长任务</h3>}
         <label>任务目标<textarea required maxLength={2400} value={goal} onChange={event => {
-          setGoal(event.target.value); setRequestId(crypto.randomUUID())
+          setGoal(event.target.value); setRequestId(newRequestId())
         }} /></label>
         <div className="actions">
           <label>主动执行总秒数<input type="number" min={stages.length} max={defaults?.wall_seconds_max} value={seconds ?? defaults?.wall_seconds ?? ''}
-            onChange={event => { setSeconds(Number(event.target.value)); setRequestId(crypto.randomUUID()) }} /></label>
+            onChange={event => { setSeconds(Number(event.target.value)); setRequestId(newRequestId()) }} /></label>
           <label><input type="checkbox" checked={parallel} disabled={(defaults?.parallelism_max ?? 1) <= 1}
-            onChange={event => { setParallel(event.target.checked); setRequestId(crypto.randomUUID()) }} /> 并行处理同组只读阶段</label>
+            onChange={event => { setParallel(event.target.checked); setRequestId(newRequestId()) }} /> 并行处理同组只读阶段</label>
         </div>
         {stages.map((stage, index) => <fieldset key={stage.id}>
           <legend>阶段 {index + 1}</legend>
           <label>名称<input required maxLength={120} value={stage.title} onChange={event => updateStage(stage.id, { title: event.target.value })} /></label>
           <label>要完成的工作<textarea required maxLength={1600} value={stage.goal} onChange={event => updateStage(stage.id, { goal: event.target.value })} /></label>
           <label>验收条件<input required maxLength={600} value={stage.acceptance} onChange={event => updateStage(stage.id, { acceptance: event.target.value })} /></label>
-          <label><input type="checkbox" checked={stage.read_only}
+          {!catalog && <><label><input type="checkbox" checked={stage.read_only}
             onChange={event => updateStage(stage.id, { read_only: event.target.checked, verify: false })} /> 只读</label>
           <label><input type="checkbox" checked={stage.verify} disabled={stage.read_only}
             onChange={event => updateStage(stage.id, { verify: event.target.checked })} /> 要求成功的命令回执</label>
@@ -156,16 +203,16 @@ export function LongTasks({ openStage }: { openStage: (id: string) => void }) {
             <label>指定验收命令（可选）<input value={stage.verification_command}
               onChange={event => updateStage(stage.id, { verification_command: event.target.value })}
               placeholder="留空时使用阶段最后一条命令" /></label>
-          )}
+          )}</>}
           {parallel && <label>组号（相同组号并行，留空顺序执行）<input type="number" min={0} value={stage.group}
             onChange={event => updateStage(stage.id, { group: event.target.value })} /></label>}
           {stages.length > 1 && <button type="button" onClick={() => {
-            setStages(rows => rows.filter(row => row.id !== stage.id)); setRequestId(crypto.randomUUID())
+            setStages(rows => rows.filter(row => row.id !== stage.id)); setRequestId(newRequestId())
           }}>删除阶段</button>}
         </fieldset>)}
         <div className="actions">
           <button type="button" disabled={!defaults || stages.length >= defaults.stages_max} onClick={() => {
-            setStages(rows => [...rows, newStage()]); setRequestId(crypto.randomUUID())
+            setStages(rows => [...rows, newStage()]); setRequestId(newRequestId())
           }}>添加阶段</button>
           <button type="submit" className="primary" disabled={busy || !defaults}>启动长任务</button>
         </div>

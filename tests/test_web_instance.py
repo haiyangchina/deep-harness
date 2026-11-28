@@ -96,6 +96,52 @@ async def session(client, *, request_id="create", model_id="two", tools=()):
     return response.json()["id"]
 
 
+async def test_web_cannot_request_local_session_privileges(tmp_path):
+    host = instance(tmp_path)
+    api = create_web_api(host, assets=None)
+    async with api.router.lifespan_context(api):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=api), base_url="http://localhost"
+        ) as client:
+            for options in (
+                {"permission_mode": "full", "risk_acknowledged": True},
+                {"workspace_mode": "in_place"},
+                {"extensions": ["apply_patch"]},
+            ):
+                response = await client.post(
+                    f"{BASE}/sessions", json={"request_id": "create", **options}
+                )
+                assert response.status_code == 403
+                assert response.json()["code"] == "operation_denied"
+            assert (await client.get(f"{BASE}/skills")).status_code == 403
+            forbidden = await client.post(f"{BASE}/jobs", json={
+                "request_id": "privileged-job", "goal": "Change files",
+                "stages": [{"title": "edit", "goal": "edit a file", "acceptance": "file changed"}],
+            })
+            assert forbidden.status_code == 403
+
+
+async def test_web_knowledge_management_requires_workspace_opt_in(tmp_path):
+    workspace = tmp_path / "reference"
+    workspace.mkdir()
+    host = instance(tmp_path, workspaces={
+        "reference": {"path": workspace, "manage_knowledge": True}
+    })
+    api = create_web_api(host, assets=None)
+    async with api.router.lifespan_context(api):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=api), base_url="http://localhost"
+        ) as client:
+            caps = await client.get(f"{BASE}/capabilities")
+            assert caps.json()["operations"]["manage_knowledge"] is True
+            saved = await client.post(f"{BASE}/memories", json={"content": "Explicit opt-in"})
+            assert saved.status_code == 200, saved.text
+            rows = await client.get(f"{BASE}/memories")
+            assert rows.json()["memories"][0]["content"] == "Explicit opt-in"
+            backup = await client.post(f"{BASE}/backup", json={"path": "example"})
+            assert backup.status_code == 404
+
+
 async def test_local_web_projects_browse_persist_and_keep_sessions_scoped(tmp_path):
     source = tmp_path / "my project"
     source.mkdir()

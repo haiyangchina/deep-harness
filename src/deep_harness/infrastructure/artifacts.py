@@ -16,6 +16,7 @@ from sqlalchemy import Column, Integer, MetaData, String, Table, delete, insert,
 from deep_harness.domain.images import IMAGE_TYPES, MAX_IMAGE_BYTES, MAX_IMAGE_PIXELS
 from deep_harness.domain.models import DomainError
 from deep_harness.infrastructure import schema as s
+from deep_harness.infrastructure.session_management import deleting_sessions
 
 metadata = MetaData()
 artifacts = Table(
@@ -153,7 +154,8 @@ class ArtifactStore:
         if not re.fullmatch(r"[a-f0-9]{32}", artifact_id):
             raise DomainError("artifact_not_found", "Artifact is not accessible")
         query = select(artifacts).where(
-            artifacts.c.id == artifact_id, artifacts.c.status == "ready"
+            artifacts.c.id == artifact_id, artifacts.c.status == "ready",
+            artifacts.c.session_id.not_in(deleting_sessions()),
         )
         if session_id is not None:
             query = query.where(artifacts.c.session_id == session_id)

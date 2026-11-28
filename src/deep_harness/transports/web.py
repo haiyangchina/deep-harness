@@ -8,36 +8,31 @@ from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import unquote
 
-from fastapi import APIRouter, FastAPI, Header, Query, Request, Response
+from fastapi import APIRouter, Header, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from deep_harness.application.capabilities import manifest
 from deep_harness.application.instance_config import is_loopback
+from deep_harness.application.jobs import CreateJob, JobBudget
 from deep_harness.domain.images import MAX_IMAGES
-from deep_harness.domain.models import DomainError, Harness
+from deep_harness.domain.models import DomainError, Harness, WorkspaceMode
 from deep_harness.runtime.inference import usage_totals
-from deep_harness.transports.api import JobCommand, RequestModel
+from deep_harness.server_config import number
 from deep_harness.transports.events import stream_events
-from deep_harness.transports.operations import DevelopmentCommand, EffectDecision, TaskControl
+from deep_harness.transports.http import JobCommand, RequestModel, create_http_app
+from deep_harness.transports.operations import (
+    DevelopmentCommand,
+    EffectDecision,
+    TaskControl,
+    operations_router,
+)
 
 WORKSPACE = "/workspaces/{workspace_id}"
 STATIC = Path(__file__).with_name("web_static")
-NOT_FOUND = {
-    "workspace_not_found",
-    "model_not_found",
-    "agent_not_found",
-    "session_not_found",
-    "admission_not_found",
-    "artifact_not_found",
-    "job_not_found",
-    "workflow_not_found",
-    "effect_not_found",
-    "diff_not_found",
-    "task_not_found",
-}
 
 
 class WebSession(RequestModel):
@@ -48,6 +43,11 @@ class WebSession(RequestModel):
     harness: Harness = "general"
     tools: tuple[str, ...] | None = Field(default=None, max_length=64)
     verification_command: str | None = Field(default=None, min_length=1, max_length=4096)
+    permission_mode: Literal["ask", "auto", "full"] | None = None
+    extensions: tuple[str, ...] = ()
+    mcp_tools: tuple[str, ...] = ()
+    risk_acknowledged: bool = False
+    workspace_mode: WorkspaceMode | None = None
 
 
 class WebProject(RequestModel):
@@ -82,18 +82,24 @@ class WebWorkflow(RequestModel):
     model_id: str | None = Field(default=None, max_length=48)
 
 
-def conflict(exc):
-    if exc.code == "project_registration_denied":
-        return 403
-    if exc.code in NOT_FOUND:
-        return 404
-    if exc.code == "queue_full":
-        return 429
-    if exc.code == "upload_too_large":
-        return 413
-    if exc.code in {"model_secret_missing", "sandbox_unavailable", "draining"}:
-        return 503
-    return 409
+class PermissionChange(RequestModel):
+    permission_mode: Literal["ask", "auto", "full"]
+    expected_revision: int = Field(ge=0, strict=True)
+    risk_acknowledged: bool = False
+
+
+class ForkRequest(RequestModel):
+    request_id: str = Field(min_length=1, max_length=128)
+
+
+class RevokeRequest(RequestModel):
+    admission_id: str = Field(min_length=1, max_length=256)
+
+
+class SessionMetadataRequest(RequestModel):
+    expected_revision: int = Field(ge=0, strict=True)
+    title: str | None = Field(default=None, max_length=160)
+    pinned: bool | None = Field(default=None, strict=True)
 
 
 def run_payload(admission):
@@ -131,7 +137,7 @@ def create_web_api(instance, assets=STATIC):
         finally:
             await instance.close()
 
-    app = FastAPI(title="deep-harness Web", lifespan=lifespan)
+    app = create_http_app(lifespan=lifespan)
     settings = instance.settings.web
     app.add_middleware(
         TrustedHostMiddleware, allowed_hosts=list(settings.trusted_hosts), www_redirect=False
@@ -163,7 +169,10 @@ def create_web_api(instance, assets=STATIC):
             fetch_site = request.headers.get("sec-fetch-site")
             if (origin is not None and origin != public_origin) or fetch_site == "cross-site":
                 return JSONResponse({"code": "origin_denied", "message": "Origin denied"}, 403)
-            if request.url.path.startswith("/api/"):
+            if request.url.path.startswith("/api/") and not (
+                request.method == "DELETE" and request.headers.get("content-length") in {None, "0"}
+                and "transfer-encoding" not in request.headers
+            ):
                 mime = request.headers.get("content-type", "").split(";", 1)[0].lower()
                 allowed = (
                     (
@@ -181,18 +190,12 @@ def create_web_api(instance, assets=STATIC):
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["X-Frame-Options"] = "DENY"
-        if request.url.path.startswith("/api/"):
-            response.headers["Cache-Control"] = "no-store"
-        else:
+        if not request.url.path.startswith("/api/"):
             response.headers["Content-Security-Policy"] = (
                 "default-src 'self'; img-src 'self' blob:; frame-ancestors 'none'; "
                 "object-src 'none'; base-uri 'none'"
             )
         return response
-
-    @app.exception_handler(DomainError)
-    async def domain_error(request, exc):
-        return JSONResponse({"code": exc.code, "message": str(exc)}, conflict(exc))
 
     @app.get("/health")
     async def health():
@@ -242,38 +245,219 @@ def create_web_api(instance, assets=STATIC):
     async def agents():
         return instance.public_catalog()["agents"]
 
+    app.include_router(router)
+    app.include_router(workspace_router(instance))
+
+    async def knowledge_access(profile_id: str):
+        workspace = instance.workspaces.get(profile_id)
+        if workspace is None:
+            raise DomainError("workspace_not_found", "Workspace is not configured")
+        if not workspace.manage_knowledge:
+            raise DomainError("operation_denied", "Knowledge management is disabled")
+
+    app.include_router(operations_router(
+        instance, knowledge_access, versioned=True, knowledge_only=True,
+    ))
+    if assets is not None:
+        app.mount("/", StaticFiles(directory=assets, html=True), name="web-assets")
+    return app
+
+
+def workspace_router(instance, *, dependencies=(), local=False):
+    """The versioned workspace contract used by both server and desktop launchers."""
+    router = APIRouter(prefix="/api/v1", dependencies=list(dependencies))
+
+    @router.get(WORKSPACE + "/capabilities")
+    async def capabilities(workspace_id: str):
+        service = await instance.application(workspace_id)
+        return {
+            **manifest(),
+            "operations": {
+                "manage_permissions": local,
+                "manage_knowledge": local or instance.workspaces[workspace_id].manage_knowledge,
+                "manage_delivery": local,
+                "native_commands": local,
+                "sandbox_commands": service.scope.server_mode == "sandbox",
+                "connector_status": not local,
+            },
+        }
+
+    @router.get(WORKSPACE + "/mcp/tools")
+    async def mcp_tools(workspace_id: str):
+        service = await instance.application(workspace_id)
+        if not local:
+            raise DomainError("operation_denied", "MCP is managed in the instance configuration")
+        return {"tools": await service.mcp.discover()}
+
     @router.post(WORKSPACE + "/sessions")
     async def create_session(workspace_id: str, body: WebSession):
         return asdict(await instance.create_session(workspace_id, body))
 
     @router.get(WORKSPACE + "/sessions")
-    async def sessions(workspace_id: str, after: str = "", limit: int = Query(50, ge=1, le=100)):
+    async def sessions(
+        workspace_id: str, after: str = Query("", max_length=256),
+        limit: int = Query(50, ge=1, le=100),
+    ):
         service = await instance.application(workspace_id)
-        return jsonable_encoder(
-            await service.store.list_sessions("operator", after=after, limit=limit)
-        )
+        return await service.session_management.page("operator", after, limit)
+
+    @router.get(WORKSPACE + "/session-deletions")
+    async def session_deletions(workspace_id: str):
+        service = await instance.application(workspace_id)
+        return {"deletions": await service.session_management.cleanup_queue()}
+
+    @router.patch(WORKSPACE + "/sessions/{session_id}")
+    async def session_metadata(workspace_id: str, session_id: str, body: SessionMetadataRequest):
+        service = await instance.application(workspace_id)
+        changes = body.model_dump(exclude={"expected_revision"}, exclude_none=True)
+        if not changes:
+            raise DomainError("session_metadata_invalid", "Provide a title or pin state")
+        if "title" in changes:
+            title = changes["title"].strip()
+            if not 1 <= len(title) <= 80 or any(ord(letter) < 32 for letter in title):
+                raise DomainError("session_metadata_invalid", "Enter a title of 1 to 80 characters")
+            changes["title"] = title
+        return await service.change_session_metadata(session_id, body.expected_revision, changes)
+
+    @router.delete(WORKSPACE + "/sessions/{session_id}", status_code=202)
+    async def delete_session(
+        workspace_id: str, session_id: str, request: Request, response: Response,
+    ):
+        service = await instance.application(workspace_id)
+        result = await service.delete_session(session_id)
+        response.headers["Location"] = request.url_for(
+            "session_deletion_status", workspace_id=workspace_id, session_id=session_id,
+        ).path
+        return result
+
+    @router.get(WORKSPACE + "/sessions/{session_id}/deletion")
+    async def session_deletion_status(workspace_id: str, session_id: str):
+        service = await instance.application(workspace_id)
+        return await service.session_deletion.status(session_id)
 
     @router.get(WORKSPACE + "/sessions/{session_id}")
-    async def session(workspace_id: str, session_id: str):
+    async def session(workspace_id: str, session_id: str, include_runtime: bool = False):
         service = await instance.application(workspace_id)
-        status = await service.store.session_status(session_id, "operator")
+        if local and include_runtime:
+            status = await service.sessions.status(session_id)
+        else:
+            status = await service.store.session_status(session_id, "operator")
         binding = await service.sessions.policies.get(session_id)
         # Keep frozen prompts and connector connection configuration out of runtime diagnostics.
         snapshot = binding["snapshot"] if binding else {}
+        coding_task = snapshot.get("coding_task")
+        status["managed_task"] = bool(coding_task and not coding_task.get("owner"))
         status["model_id"] = snapshot.get("model_id")
         status["vision"] = service.sessions.supports_vision(status["model_id"])
         status["model_revision"] = snapshot.get("model_revision")
-        return jsonable_encoder(status)
+        stage = await service.jobs.ledger.owner(session_id)
+        status["pause_supported"] = stage is None and not (coding_task or {}).get("owner")
+        status["pause_requested"] = service.workspaces.paused(session_id)
+        if stage:
+            status["job_id"] = stage["job_id"]
+        encoded = jsonable_encoder(status)
+        encoded["session"].update(await service.session_management.presentation(session_id))
+        return encoded
 
     @router.get(WORKSPACE + "/sessions/{session_id}/messages")
     async def messages(
         workspace_id: str,
         session_id: str,
         before: int | None = Query(None, ge=0),
+        after: int | None = Query(None, ge=0, le=2**53 - 1),
     ):
         service = await instance.application(workspace_id)
         await service.store.get_session(session_id, "operator")
-        return public_messages(await service.store.live_history(session_id, before=before))
+        page = await service.store.live_history(session_id, before=before, after=after)
+        return page if local else public_messages(page)
+
+    @router.get(WORKSPACE + "/sessions/{session_id}/messages/search")
+    async def search_messages(
+        workspace_id: str, session_id: str,
+        q: str = Query(min_length=1, max_length=number("pagination.search_query_chars")),
+    ):
+        service = await instance.application(workspace_id)
+        await service.store.get_session(session_id, "operator")
+        rows = await service.store.search_history(session_id, q)
+        if not local:
+            rows = [item["message"] for item in public_messages(
+                {"items": [{"message": row} for row in rows]}
+            )["items"]]
+        return {"messages": rows}
+
+    @router.get(WORKSPACE + "/sessions/{session_id}/usage")
+    async def session_usage(workspace_id: str, session_id: str):
+        service = await instance.application(workspace_id)
+        await service.store.get_session(session_id, "operator")
+        return await usage_totals(service.store, session_id)
+
+    @router.get(WORKSPACE + "/sessions/{session_id}/delegations")
+    async def delegations(workspace_id: str, session_id: str):
+        service = await instance.application(workspace_id)
+        return {"delegations": await service.list_delegations(session_id)}
+
+    @router.post(
+        WORKSPACE + "/sessions/{session_id}/delegations/{delegation_id}/steers", status_code=202,
+    )
+    async def steer_delegation(
+        workspace_id: str, session_id: str, delegation_id: str, body: WebInput,
+    ):
+        service = await instance.application(workspace_id)
+        return await service.steer_delegation(
+            session_id, delegation_id, body.submission_id, body.text,
+        )
+
+    @router.post(WORKSPACE + "/sessions/{session_id}/delegations/{delegation_id}/stop")
+    async def stop_delegation(workspace_id: str, session_id: str, delegation_id: str):
+        service = await instance.application(workspace_id)
+        return await service.stop_delegation(session_id, delegation_id)
+
+    @router.post(WORKSPACE + "/sessions/{session_id}/forks")
+    async def fork(workspace_id: str, session_id: str, body: ForkRequest):
+        service = await instance.application(workspace_id)
+        return await service.fork_session(session_id, body.request_id)
+
+    @router.post(WORKSPACE + "/sessions/{session_id}/permissions")
+    async def permissions(workspace_id: str, session_id: str, body: PermissionChange):
+        service = await instance.application(workspace_id)
+        if not local:
+            raise DomainError("operation_denied", "Server sessions use explicit approval")
+        return await service.set_permissions(
+            session_id, body.permission_mode, body.expected_revision, body.risk_acknowledged,
+        )
+
+    @router.post(WORKSPACE + "/sessions/{session_id}/revoke-reuse")
+    async def revoke_reuse(workspace_id: str, session_id: str, body: RevokeRequest):
+        service = await instance.application(workspace_id)
+        if not local:
+            raise DomainError("operation_denied", "Server sessions use explicit approval")
+        return await service.revoke_reuse(session_id, body.admission_id)
+
+    @router.get(WORKSPACE + "/sessions/{session_id}/event-history")
+    async def event_history(
+        workspace_id: str,
+        session_id: str,
+        after: int = Query(0, ge=0, le=2**53 - 1),
+        tail: bool = False,
+        wait: float = Query(0, ge=0, le=12),
+    ):
+        service = await instance.application(workspace_id)
+        await service.store.get_session(session_id, "operator")
+        store = service.store
+        clock = asyncio.get_running_loop().time
+        deadline = clock() + wait
+        while True:
+            revision = store.revision
+            events = await store.event_history(session_id, after, tail=tail)
+            remaining = deadline - clock()
+            if events or tail or remaining <= 0:
+                return {"events": events}
+            try:
+                async with asyncio.timeout(remaining):
+                    await store.wait_for_change(revision)
+            except TimeoutError:
+                pass
+            await store.get_session(session_id, "operator")
 
     @router.post(WORKSPACE + "/sessions/{session_id}/runs", status_code=202)
     async def submit(workspace_id: str, session_id: str, body: WebInput):
@@ -405,6 +589,16 @@ def create_web_api(instance, assets=STATIC):
         session_id = await service.store.run_session(run_id)
         return jsonable_encoder(await service.cancel(session_id, run_id))
 
+    @router.post(WORKSPACE + "/runs/{run_id}/retry-workspace")
+    async def retry_workspace(workspace_id: str, run_id: str):
+        service = await instance.application(workspace_id)
+        return await service.retry_workspace(await service.store.run_session(run_id), run_id)
+
+    @router.post(WORKSPACE + "/runs/{run_id}/retry-summary")
+    async def retry_summary(workspace_id: str, run_id: str):
+        service = await instance.application(workspace_id)
+        return await service.retry_summary(await service.store.run_session(run_id), run_id)
+
     @router.post(WORKSPACE + "/runs/{run_id}/reconciliation")
     async def reconcile(workspace_id: str, run_id: str, body: WebReconciliation):
         service = await instance.application(workspace_id)
@@ -423,7 +617,7 @@ def create_web_api(instance, assets=STATIC):
     async def effect_status(workspace_id: str, run_id: str, effect_id: str):
         service = await instance.application(workspace_id)
         tool = await service.receipts.dispatched_tool(run_id, effect_id)
-        if tool not in instance.connectors.definitions:
+        if instance.connectors is None or tool not in instance.connectors.definitions:
             raise DomainError("connector_reconcile", "This effect requires manual reconciliation")
         return await instance.connectors.reconcile(tool, effect_id)
 
@@ -476,6 +670,24 @@ def create_web_api(instance, assets=STATIC):
     async def start_workflow(workspace_id: str, workflow_id: str, body: WebWorkflow):
         return await instance.start_workflow(workspace_id, workflow_id, body)
 
+    @router.get(WORKSPACE + "/jobs/defaults")
+    async def job_defaults(workspace_id: str):
+        await instance.application(workspace_id)
+        return {
+            "wall_seconds": JobBudget().wall_seconds,
+            "wall_seconds_max": number("job_budget.wall_seconds_max"),
+            "stages_max": number("jobs.stages_max_length"),
+            "parallelism_max": number("jobs.parallelism_max"),
+        }
+
+    @router.post(WORKSPACE + "/jobs")
+    async def create_job(workspace_id: str, body: CreateJob):
+        service = await instance.application(workspace_id)
+        if any(stage.step or (not local and (not stage.read_only or stage.verify))
+               for stage in body.stages):
+            raise DomainError("operation_denied", "Use the configured workflow for these stages")
+        return await service.create_job(body)
+
     @router.get(WORKSPACE + "/jobs/{job_id}")
     async def job(workspace_id: str, job_id: str):
         service = await instance.application(workspace_id)
@@ -493,7 +705,4 @@ def create_web_api(instance, assets=STATIC):
             job_id, body.action, position=body.position, evidence=body.evidence
         )
 
-    app.include_router(router)
-    if assets is not None:
-        app.mount("/", StaticFiles(directory=assets, html=True), name="web-assets")
-    return app
+    return router

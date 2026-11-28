@@ -14,7 +14,9 @@ export async function localJson(
   token: string,
   body?: unknown,
   timeoutMs = 20_000,
-  upload?: { name: string; data: ArrayBuffer }
+  upload?: { name: string; data: ArrayBuffer },
+  structured = false,
+  binary = false
 ): Promise<unknown> {
   let response: Response
   let result: unknown
@@ -24,17 +26,20 @@ export async function localJson(
       headers: {
         Authorization: `Bearer ${token}`,
         'Content-Type': upload ? 'application/octet-stream' : 'application/json',
-        ...(upload ? { 'X-Filename': encodeURIComponent(upload.name) } : {})
+        ...(upload ? { 'X-Filename': encodeURIComponent(upload.name), 'X-Harness-Upload': '1' } : {})
       },
       body: upload?.data ?? (body === undefined ? undefined : JSON.stringify(body)),
       signal: AbortSignal.timeout(timeoutMs)
     })
-    result = await response.json()
+    result = binary && response.ok
+      ? { data: await response.arrayBuffer(), media_type: response.headers.get('content-type') }
+      : await response.json()
   } catch (error) {
     const url = new URL(endpoint)
     const outcome = method === 'GET' ? '读取失败' : '请求结果未确认；先核对状态，不要自动重发'
     throw new Error(`${outcome}（${errorCode(error)}）：${method} ${url.origin}${url.pathname}`)
   }
+  if (structured) return { status: response.status, body: result }
   if (!response.ok) throw new Error(`本机 API 返回 HTTP ${response.status}：${JSON.stringify(result)}`)
   return result
 }

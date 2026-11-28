@@ -9,8 +9,8 @@ from urllib.parse import unquote
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field
+from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import Field
 
 from deep_harness.application.capabilities import manifest
 from deep_harness.application.jobs import CreateJob, JobBudget
@@ -20,11 +20,9 @@ from deep_harness.domain.models import DomainError, Harness, WorkspaceMode
 from deep_harness.runtime.inference import usage_totals
 from deep_harness.server_config import number
 from deep_harness.transports.events import stream_events
+from deep_harness.transports.http import JobCommand, RequestModel, create_http_app
 from deep_harness.transports.operations import operations_router
-
-
-class RequestModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+from deep_harness.transports.web import workspace_router
 
 
 class CreateSession(RequestModel):
@@ -62,17 +60,60 @@ class ApprovalResponse(RequestModel):
     decision: Literal["approve", "deny"]
 
 
-class JobCommand(RequestModel):
-    action: Literal["pause", "resume", "cancel", "accept"]
-    position: int | None = Field(default=None, ge=0)
-    evidence: str | None = Field(default=None, max_length=number("api.evidence_max_length"))
-
-
 class ForkSession(RequestModel):
     request_id: str = Field(min_length=1, max_length=number("api.request_id_max_length"))
 
 
-def create_api(host, token: str) -> FastAPI:
+async def create_local_session(service, body):
+    return await service.create_session(
+        body.request_id,
+        body.prompt,
+        body.tools,
+        engine="deep" if body.harness != "general" else "standard",
+        harness=body.harness,
+        permission_mode=body.permission_mode or "ask",
+        extensions=body.extensions,
+        mcp_tools=body.mcp_tools,
+        full_access_acknowledged=body.risk_acknowledged,
+        workspace_mode=body.workspace_mode,
+        verification_command=body.verification_command,
+    )
+
+
+class LocalWorkspace:
+    connectors = None
+
+    def __init__(self, host, profile_id):
+        self.host = host
+        self.profile_id = profile_id
+
+    async def application(self, workspace_id):
+        if workspace_id != self.profile_id:
+            raise DomainError("workspace_not_found", "Workspace is outside the launch profile")
+        return await self.host.application(self.profile_id)
+
+    async def create_session(self, workspace_id, body):
+        service = await self.application(workspace_id)
+        if body.agent_id is not None:
+            raise DomainError("agent_not_found", "This backend uses its launch configuration")
+        if body.model_id is not None:
+            raise DomainError("model_not_found", "This backend uses its launch model")
+        if "prompt" not in body.model_fields_set:
+            body = body.model_copy(update={"prompt": PROJECT_PROMPT})
+        return await create_local_session(service, body)
+
+    async def submit(self, workspace_id, session_id, submission_id, text, artifact_ids, image_ids):
+        service = await self.application(workspace_id)
+        return await service.submit(
+            session_id, submission_id, text, artifact_ids=artifact_ids, image_ids=image_ids
+        )
+
+    async def start_workflow(self, workspace_id, workflow_id, body):
+        await self.application(workspace_id)
+        raise DomainError("workflow_not_found", "No workflow is configured in this backend")
+
+
+def create_api(host, token: str, *, workspace_id=None) -> FastAPI:
     if len(token) < number("transport.min_operator_token_chars"):
         raise ValueError("Local operator token must contain at least 32 characters")
 
@@ -81,20 +122,24 @@ def create_api(host, token: str) -> FastAPI:
         yield
         await host.close()
 
-    app = FastAPI(title="deep-harness development API", lifespan=lifespan)
+    def legacy_error_status(exc):
+        if exc.code == "upload_too_large":
+            return 413
+        return 404 if exc.code.endswith("_not_found") else 409
+
+    app = create_http_app(lifespan=lifespan, legacy_error_status=legacy_error_status)
 
     async def authenticate(authorization: Annotated[str | None, Header()] = None):
         if authorization is None or not secrets.compare_digest(authorization, f"Bearer {token}"):
             raise HTTPException(401, "A local operator token is required")
 
     app.include_router(operations_router(host, authenticate))
-
-    @app.exception_handler(DomainError)
-    async def domain_error(request, exc):
-        status = 404 if exc.code.endswith("_not_found") else 409
-        if exc.code == "upload_too_large":
-            status = 413
-        return JSONResponse(status_code=status, content={"code": exc.code, "message": str(exc)})
+    if workspace_id is not None:
+        workspace = LocalWorkspace(host, workspace_id)
+        app.include_router(workspace_router(
+            workspace, dependencies=[Depends(authenticate)], local=True,
+        ))
+        app.include_router(operations_router(workspace, authenticate, versioned=True))
 
     @app.get("/health")
     async def health():
@@ -141,21 +186,7 @@ def create_api(host, token: str) -> FastAPI:
     @app.post("/profiles/{profile_id}/sessions", dependencies=[Depends(authenticate)])
     async def create(profile_id: str, body: CreateSession):
         service = await host.application(profile_id)
-        engine = "deep" if body.harness != "general" else "standard"
-        session = await service.create_session(
-            body.request_id,
-            body.prompt,
-            body.tools,
-            engine=engine,
-            harness=body.harness,
-            permission_mode=body.permission_mode or "ask",
-            extensions=body.extensions,
-            mcp_tools=body.mcp_tools,
-            full_access_acknowledged=body.risk_acknowledged,
-            workspace_mode=body.workspace_mode,
-            verification_command=body.verification_command,
-        )
-        return asdict(session)
+        return asdict(await create_local_session(service, body))
 
     @app.post(
         "/profiles/{profile_id}/sessions/{session_id}/permissions",

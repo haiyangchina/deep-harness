@@ -12,13 +12,26 @@ export interface RuntimeInfo {
   error?: string
   projects?: DesktopProject[]
   projectId?: string
+  catalog?: ServerCatalog
+}
+export interface ServerWorkspace { id: string; label?: string; mode: string; manage_knowledge?: boolean }
+export interface ServerCatalog {
+  default_workspace: string
+  default_model: string
+  workspaces: ServerWorkspace[]
+  models: { id: string; label: string; configured: boolean }[]
+  agents: { id: string; label: string; harness: string; workflow: string | null }[]
+  tools: string[]
+  local_projects: boolean
+  project_sandbox: boolean
 }
 export interface DesktopProject { id: string; name: string; workspace: string; profile: string }
 export interface ApiRequest {
-  method: 'GET' | 'POST' | 'DELETE'
+  method: 'GET' | 'POST' | 'PATCH' | 'DELETE'
   path: string
   body?: unknown
   upload?: { name: string; data: ArrayBuffer }
+  response?: 'binary'
 }
 export interface DesktopBridge {
   info(): Promise<RuntimeInfo>
@@ -31,6 +44,10 @@ export interface DesktopBridge {
 }
 export interface Session {
   id: string
+  title?: string | null
+  pinned?: boolean
+  pinned_at?: string | null
+  metadata_revision?: number
   engine: string
   harness: string
   tools: string[]
@@ -92,19 +109,26 @@ export interface Admission {
 }
 export interface Approval {
   id: string
+  admission_id: string
+  proposal_hash: string
   generation: number
   proposal: unknown
 }
+export interface RunEffect { id: string; admission_id: string; proposal_hash: string; status: string }
 export interface SessionStatus {
   job_id?: string
   session: Session
   latest_admission: Admission | null
   image_context?: string[] | null
   vision?: boolean
+  model_id?: string
+  managed_task?: boolean
+  pause_supported?: boolean
+  pause_requested?: boolean
   active_admissions: Admission[]
   approvals: Approval[]
   runtime?: { compatible: boolean; current_fingerprint: string; changed_fields?: string[] }
-  active_effects: unknown[]
+  active_effects: RunEffect[]
 }
 export interface JournalEvent {
   seq: number

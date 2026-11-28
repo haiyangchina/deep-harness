@@ -8,11 +8,15 @@ const maxImages = 4
 const maxBytes = 8 * 1024 * 1024
 const formats = ['image/png', 'image/jpeg']
 
+export function isSupportedImage(file: File) {
+  return formats.includes(file.type) || /\.(png|jpe?g)$/i.test(file.name)
+}
+
 export function appendImages(current: ImageDraft[], items: ImageDraft[]) {
   const added: ImageDraft[] = []
   let error = ''
   for (const item of items) {
-    if ('file' in item && !formats.includes(item.file.type) && !/\.(png|jpe?g)$/i.test(item.file.name)) {
+    if ('file' in item && !isSupportedImage(item.file)) {
       error = '请选择 PNG 或 JPEG 图片。'
     } else if ('file' in item && item.file.size > maxBytes) {
       error = '单张图片最大 8 MiB。'
@@ -32,20 +36,19 @@ export function pasteImages(event: ClipboardEvent, add: (files: File[]) => void)
   add(images)
 }
 
-export function dropImages(event: DragEvent, add: (files: File[]) => void, disabled: boolean) {
+export function dropFiles(event: DragEvent, add: (files: File[]) => void, disabled: boolean) {
   if (!event.dataTransfer.types.includes('Files')) return
   event.preventDefault()
   if (!disabled) add(Array.from(event.dataTransfer.files))
 }
 
-export function ImagePicker({ add, disabled, iconOnly = false }: {
+export function FilePicker({ add, disabled }: {
   add: (files: File[]) => void
   disabled: boolean
-  iconOnly?: boolean
 }) {
-  return <label className={iconOnly ? 'image-picker image-picker-icon' : 'image-picker'} title="添加图片">
-    {iconOnly ? <span className="image-picker-plus" aria-hidden="true" /> : '图片'}
-    <input type="file" aria-label="选择图片" multiple accept="image/png,image/jpeg"
+  return <label className="image-picker image-picker-icon" title="添加图片或附件">
+    <span className="image-picker-plus" aria-hidden="true" />
+    <input type="file" aria-label="选择图片或附件" multiple
       disabled={disabled} onChange={event => {
         add(Array.from(event.currentTarget.files ?? []))
         event.currentTarget.value = ''
@@ -68,12 +71,15 @@ function useImageSource(image: ImageDraft, load: ImageSource, full = false, enab
       return () => URL.revokeObjectURL(url)
     }
     let active = true
+    let ownedUrl = ''
     if (id) Promise.resolve().then(() => load(id, full)).then(url => {
+      if (url.startsWith('blob:')) ownedUrl = url
       if (active) setSrc(url)
+      else if (ownedUrl) URL.revokeObjectURL(ownedUrl)
     }).catch(() => {
       if (active) setUnavailable(true)
     })
-    return () => { active = false }
+    return () => { active = false; if (ownedUrl) URL.revokeObjectURL(ownedUrl) }
   }, [file, id, load, enabled, full])
   return { src, unavailable }
 }

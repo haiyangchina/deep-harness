@@ -1,7 +1,7 @@
 import { build } from 'esbuild'
 import { mkdir, copyFile, readFile } from 'node:fs/promises'
 
-// Both renderers display the package version.
+// Both deployments ship the same workbench bundle.
 const { version } = JSON.parse(await readFile('package.json', 'utf8'))
 await mkdir('dist', { recursive: true })
 await build({
@@ -30,11 +30,6 @@ await copyFile('src/index.html', 'dist/index.html')
 
 const webOutput = '../src/deep_harness/transports/web_static'
 await mkdir(webOutput, { recursive: true })
-await build({
-  entryPoints: ['src/web/main.tsx'],
-  outfile: `${webOutput}/app.js`,
-  bundle: true,
-  platform: 'browser',
-  define: { __APP_VERSION__: JSON.stringify(version) }
-})
-await copyFile('src/web/index.html', `${webOutput}/index.html`)
+await Promise.all(['index.html', 'app.js', 'app.css'].map(
+  name => copyFile(`dist/${name}`, `${webOutput}/${name}`)
+))

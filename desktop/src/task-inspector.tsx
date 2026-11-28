@@ -1,7 +1,8 @@
 import { useStore } from '@nanostores/react'
 import { useState } from 'react'
 import { Json } from './components'
-import { $busy, $conversation, $runtime, api, perform, refreshConversation, refreshInspector, report } from './state'
+import { $busy, $conversation, $runtime, api, perform, refreshConversation, refreshInspector, report, workspaceApi } from './state'
+import { newRequestId } from './workspace-api'
 
 function eventLabel(event: { type: string; payload: unknown }): string {
   const payload = event.payload as { tool?: unknown; elapsed_ms?: unknown; phase?: unknown; error_code?: unknown; fallback?: unknown } | null
@@ -62,6 +63,37 @@ function PatchPreview({ proposal }: { proposal: unknown }) {
   )
 }
 
+function Delegation({ sessionId, item }: { sessionId: string; item: {
+  id: string; mode: string; status: string; kind: string
+} }) {
+  const busy = useStore($busy)
+  const [text, setText] = useState('')
+  const [id, setId] = useState(newRequestId)
+  const active = item.mode === 'background' &&
+    ['queued', 'running', 'waiting_approval'].includes(item.status)
+  const path = `/sessions/${sessionId}/delegations/${encodeURIComponent(item.id)}`
+  return <details><summary>{item.kind} · {item.status}</summary>
+    <Json value={item} />
+    {active && <form onSubmit={event => {
+      event.preventDefault()
+      void perform(async () => {
+        await workspaceApi(path + '/steers', 'POST', { text: text.trim(), submission_id: id })
+        setText('')
+        setId(newRequestId())
+        await refreshInspector('delegations')
+      })
+    }}>
+      <input aria-label="补充子任务要求" value={text} maxLength={4000} disabled={busy}
+        onChange={event => { setText(event.target.value); setId(newRequestId()) }} />
+      <button type="submit" disabled={busy || !text.trim()}>追加指令</button>
+      <button type="button" disabled={busy} onClick={() => void perform(async () => {
+        await workspaceApi(path + '/stop', 'POST')
+        await refreshInspector('delegations')
+      })}>停止子任务</button>
+    </form>}
+  </details>
+}
+
 export function TaskInspector() {
   const conversation = useStore($conversation)
   const busy = useStore($busy)
@@ -112,8 +144,8 @@ export function TaskInspector() {
                 disabled={busy}
                 onClick={() =>
                   void perform(async () => {
-                    await api(`/sessions/${sessionId}/approvals`, 'POST', {
-                      interaction_id: approval.id,
+                    await workspaceApi(`/runs/${approval.admission_id}/approvals/${encodeURIComponent(approval.id)}/decision`, 'POST', {
+                      proposal_hash: approval.proposal_hash,
                       generation: approval.generation,
                       decision
                     })
@@ -187,11 +219,16 @@ export function TaskInspector() {
         </div>
       )}
       {tab === 'usage' && <Json value={conversation?.usage ?? { info: '尚无用量' }} />}
-      {tab === 'delegations' && <Json value={conversation?.delegations ?? []} />}
+      {tab === 'delegations' && (conversation?.delegations.length
+        ? conversation.delegations.map(value => {
+          const item = value as { id: string; mode: string; status: string; kind: string }
+          return <Delegation key={item.id} item={item} sessionId={sessionId} />
+        })
+        : <p className="muted small">没有子任务。</p>)}
       {tab === 'state' && <Json value={status ?? { info: '尚未创建会话' }} />}
       <div className="inspector-footer">
         <span className="dot" />
-        本机 API · 私有连接
+        {runtime.catalog ? '服务器 API' : '本机 API · 私有连接'}
       </div>
     </aside>
   )
